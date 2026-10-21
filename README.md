@@ -24,8 +24,9 @@ GPU:
 | Virtual monitor capture over PipeWire (Mutter `RecordVirtual`) | works, system-memory frames |
 | Live resize of the virtual monitor | works |
 | NVENC H.264 / HEVC encoding | works |
-| RDP front end (IronRDP, EGFX AVC420) | in progress |
-| Zero-copy DMA-BUF → CUDA → NVENC, AVC444, input | planned |
+| RDP front end (IronRDP, NLA, EGFX AVC420, Display Control) | works with `mstsc`, first version |
+| Keyboard and mouse through Mutter RemoteDesktop | works |
+| Zero-copy DMA-BUF → CUDA → NVENC, AVC444, client-side cursor | planned |
 
 ## Try the pieces
 
@@ -37,7 +38,12 @@ cargo build --release
 # A private headless GNOME Shell on its own D-Bus session, plus a capture + encode test:
 scripts/dev-session.sh -- target/release/glidedesk-host capture-test
 scripts/dev-session.sh -- target/release/glidedesk-host encode-test --hevc
+# RDP server in the background (log in $XDG_RUNTIME_DIR/glidedesk-serve.log):
+GLIDEDESK_PASSWORD=... scripts/dev-serve.sh
 ```
+
+Then connect with `mstsc /v:<host>` as your Linux user name and that password. The
+certificate is self-signed (created in `~/.config/glidedesk/`).
 
 `dev-session.sh` starts its own session bus, so it does not interfere with a desktop that is
 already running.

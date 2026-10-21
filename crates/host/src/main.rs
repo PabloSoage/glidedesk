@@ -1,6 +1,8 @@
 mod capture;
+mod input;
 mod mutter;
 mod nvenc;
+mod rdp;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -18,6 +20,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve the session over RDP.
+    Serve {
+        #[arg(long, default_value = "0.0.0.0:3389")]
+        bind: std::net::SocketAddr,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        /// Video bitrate in bits per second.
+        #[arg(long, default_value_t = 30_000_000)]
+        bitrate: u32,
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
+        /// Size before the client says what it wants.
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        /// RDP user name (defaults to $USER).
+        #[arg(long)]
+        user: Option<String>,
+        /// RDP password; read from GLIDEDESK_PASSWORD when not given.
+        #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
+        password: String,
+    },
     /// Capture the session for a few seconds, resize half way, and report frame rates.
     CaptureTest {
         #[arg(long, default_value_t = 1920)]
@@ -59,6 +84,38 @@ async fn main() -> Result<()> {
         )
         .init();
     match Cli::parse().command {
+        Command::Serve {
+            bind,
+            gpu,
+            bitrate,
+            fps,
+            width,
+            height,
+            user,
+            password,
+        } => {
+            let state_dir = std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+                })
+                .unwrap_or_else(|| ".".into())
+                .join("glidedesk");
+            rdp::serve(rdp::ServeOptions {
+                bind,
+                gpu,
+                bitrate,
+                fps,
+                width,
+                height,
+                username: user
+                    .or_else(|| std::env::var("USER").ok())
+                    .unwrap_or_default(),
+                password,
+                state_dir,
+            })
+            .await
+        }
         Command::CaptureTest {
             width,
             height,
