@@ -24,6 +24,10 @@ struct Cli {
 enum Command {
     /// Serve the session over RDP.
     Serve {
+        /// Refresh rate of the virtual monitor (Hz). Higher means fresher frames and lower
+        /// latency at the cost of more encoding while things move.
+        #[arg(long, env = "GLIDEDESK_REFRESH", default_value_t = 120)]
+        refresh: u32,
         #[arg(long, default_value = "0.0.0.0:3389")]
         bind: std::net::SocketAddr,
         #[arg(long, default_value_t = 0)]
@@ -47,6 +51,13 @@ enum Command {
         /// Send 4:2:0 only (AVC420) even to clients that support AVC444.
         #[arg(long)]
         no_avc444: bool,
+        /// With AVC444, always send both views (no luma-only frames during motion).
+        #[arg(long)]
+        no_hybrid: bool,
+        /// Frames sent and not yet acknowledged by the client. Low values keep the client's
+        /// queue short (lower latency); higher ones absorb network jitter.
+        #[arg(long, default_value_t = 2)]
+        max_in_flight: u32,
     },
     /// Capture the session for a few seconds, resize half way, and report frame rates.
     CaptureTest {
@@ -90,6 +101,7 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().command {
         Command::Serve {
+            refresh,
             bind,
             gpu,
             bitrate,
@@ -99,7 +111,10 @@ async fn main() -> Result<()> {
             user,
             password,
             no_avc444,
+            no_hybrid,
+            max_in_flight,
         } => {
+            capture::set_refresh_rate(refresh);
             let state_dir = std::env::var_os("XDG_CONFIG_HOME")
                 .map(std::path::PathBuf::from)
                 .or_else(|| {
@@ -109,10 +124,12 @@ async fn main() -> Result<()> {
                 .join("glidedesk");
             rdp::serve(rdp::ServeOptions {
                 avc444: !no_avc444,
+                hybrid: !no_hybrid,
+                max_in_flight,
                 bind,
                 gpu,
                 bitrate,
-                fps,
+                fps: fps.max(refresh),
                 width,
                 height,
                 username: user
@@ -152,6 +169,12 @@ async fn encode_test(
     out: std::path::PathBuf,
 ) -> Result<()> {
     use std::io::Write;
+    if let Some(hz) = std::env::var("GLIDEDESK_REFRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        capture::set_refresh_rate(hz);
+    }
     let conn = zbus::Connection::session().await?;
     let session = mutter::Session::start(&conn, mutter::CursorMode::Embedded).await?;
     let (tx, rx) = mpsc::sync_channel(1);

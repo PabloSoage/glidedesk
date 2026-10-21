@@ -24,9 +24,17 @@ struct Args {
     x: i32,
     #[arg(long, default_value_t = 40)]
     y: i32,
+    /// Pixel read this far right and down of the click point (inside the 160 px square),
+    /// so the pointer drawn at the click point does not affect the reading.
+    #[arg(long, default_value_t = 80)]
+    read_offset: i32,
     /// Give up on a sample after this many milliseconds.
     #[arg(long, default_value_t = 1000)]
     timeout_ms: u64,
+    /// Move the window's top-left corner here first (screen coordinates), so runs share a
+    /// monitor.
+    #[arg(long, num_args = 2, value_names = ["X", "Y"], allow_negative_numbers = true)]
+    place: Option<Vec<i32>>,
     /// Write every sample (milliseconds) to this CSV file.
     #[arg(long)]
     csv: Option<std::path::PathBuf>,
@@ -55,6 +63,10 @@ mod win {
         BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
         GetDC, GetPixel, ReleaseDC, SRCCOPY, SelectObject,
     };
+    use windows::Win32::Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW,
+        MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
+    };
     use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -64,8 +76,8 @@ mod win {
         SendInput,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClientRect, GetWindowTextW, IsWindowVisible, SetCursorPos,
-        SetForegroundWindow,
+        EnumWindows, GA_ROOT, GetAncestor, GetClientRect, GetWindowTextW, IsWindowVisible,
+        SWP_NOSIZE, SWP_NOZORDER, SetCursorPos, SetForegroundWindow, SetWindowPos, WindowFromPoint,
     };
     use windows::core::BOOL;
 
@@ -169,6 +181,38 @@ mod win {
         unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
     }
 
+    /// Whether the top-level window under `p` is `hwnd`.
+    fn owns_point(hwnd: HWND, p: POINT) -> bool {
+        // SAFETY: plain window queries.
+        unsafe {
+            let w = WindowFromPoint(p);
+            !w.is_invalid() && GetAncestor(w, GA_ROOT) == hwnd
+        }
+    }
+
+    /// Refresh rate of the monitor showing `hwnd`.
+    fn monitor_refresh(hwnd: HWND) -> u32 {
+        // SAFETY: plain queries with correctly sized structures.
+        unsafe {
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+            if !GetMonitorInfoW(mon, &mut info as *mut _ as *mut _).as_bool() {
+                return 0;
+            }
+            let mut dm = DEVMODEW {
+                dmSize: size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            let name = windows::core::PCWSTR(info.szDevice.as_ptr());
+            if EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+                dm.dmDisplayFrequency
+            } else {
+                0
+            }
+        }
+    }
+
     fn wait_for(px: &Pixel, white: bool, timeout: Duration) -> Option<Duration> {
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -189,6 +233,13 @@ mod win {
         }
         let hwnd = find_window(&args.window)
             .with_context(|| format!("no visible window with \"{}\"", args.window))?;
+        if let Some(p) = &args.place {
+            // SAFETY: valid window; keeps its size and z-order.
+            unsafe {
+                SetWindowPos(hwnd, None, p[0], p[1], 0, 0, SWP_NOSIZE | SWP_NOZORDER)?;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
         let mut rect = RECT::default();
         let mut origin = POINT::default();
         // SAFETY: valid window handle.
@@ -201,17 +252,25 @@ mod win {
             x: origin.x + args.x,
             y: origin.y + args.y,
         };
+        let hz = monitor_refresh(hwnd);
         println!(
-            "window client {}x{} at {},{}; probing {},{}",
+            "window client {}x{} at {},{}; probing {},{}; monitor {hz} Hz",
             rect.right, rect.bottom, origin.x, origin.y, at.x, at.y
         );
+        if !owns_point(hwnd, at) {
+            bail!("another window covers the probe point; not touching the mouse");
+        }
         // SAFETY: moves the pointer over the probe square.
         unsafe { SetCursorPos(at.x, at.y)? };
         std::thread::sleep(Duration::from_millis(500));
-        let px = Pixel::new(at);
+        // Read away from the click point: the pointer itself is drawn there.
+        let px = Pixel::new(POINT {
+            x: at.x + args.read_offset,
+            y: at.y + args.read_offset,
+        });
         if px.brightness() > 55 {
             mouse(MOUSEEVENTF_LEFTUP);
-            if wait_for(&px, false, Duration::from_secs(2)).is_none() {
+            if wait_for(&px, false, Duration::from_secs(10)).is_none() {
                 bail!(
                     "the probe square is not black: is tools/flash.py full screen in the session?"
                 );
@@ -222,6 +281,10 @@ mod win {
         let mut samples = Vec::with_capacity(args.samples);
         let mut lost = 0;
         for i in 0..args.samples {
+            // Never click anything but the client window: other windows may be on top.
+            if !owns_point(hwnd, at) {
+                bail!("another window covers the probe point; stopping without clicking");
+            }
             mouse(MOUSEEVENTF_LEFTDOWN);
             let down = wait_for(&px, true, timeout);
             mouse(MOUSEEVENTF_LEFTUP);

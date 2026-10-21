@@ -218,16 +218,12 @@ fn format_object(width: u32, height: u32) -> Object {
             Fraction,
             spa::utils::Fraction { num: 0, denom: 1 }
         ),
+        // A fixed value, not a range: Mutter offers 1..1000 with 60 as default, and a range
+        // here would settle on its default. Mutter creates the virtual monitor at the
+        // negotiated maximum frame rate, so this is the monitor's refresh rate.
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoMaxFramerate,
-            Choice,
-            Range,
             Fraction,
-            spa::utils::Fraction {
-                num: refresh_rate(),
-                denom: 1
-            },
-            spa::utils::Fraction { num: 1, denom: 1 },
             spa::utils::Fraction {
                 num: refresh_rate(),
                 denom: 1
@@ -236,12 +232,15 @@ fn format_object(width: u32, height: u32) -> Object {
     )
 }
 
-/// Frame rate asked of the virtual monitor (GLIDEDESK_REFRESH, default 60).
+/// Refresh rate of the virtual monitor, set once at start ([`set_refresh_rate`]).
+static REFRESH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+
+pub fn set_refresh_rate(hz: u32) {
+    REFRESH.store(hz.clamp(1, 1000), std::sync::atomic::Ordering::Relaxed);
+}
+
 fn refresh_rate() -> u32 {
-    std::env::var("GLIDEDESK_REFRESH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60)
+    REFRESH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `SPA_PARAM_Buffers` acknowledging the buffer type for the negotiated format.
@@ -433,6 +432,7 @@ fn run(
                     height = s.height,
                     format = ?st.format.format(),
                     dmabuf = st.dmabuf,
+                    max_fps = format!("{}/{}", st.format.max_framerate().num, st.format.max_framerate().denom),
                     modifier = format!("0x{:x}", st.format.modifier()),
                     "Negotiated capture format"
                 );

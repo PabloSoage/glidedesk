@@ -36,6 +36,10 @@ use crate::nvenc::{Codec, Encoder, EncoderConfig};
 pub struct ServeOptions {
     /// Use AVC444v2 (full chroma) when the client supports it.
     pub avc444: bool,
+    /// AVC444 sends luma-only frames during motion and the chroma once the image is still.
+    pub hybrid: bool,
+    /// Unacknowledged frames allowed; more frames than the client can show only queue up.
+    pub max_in_flight: u32,
     pub bind: SocketAddr,
     pub gpu: usize,
     pub bitrate: u32,
@@ -236,6 +240,10 @@ struct Pipeline {
     upload: crate::gpu::Pool,
     /// Send AVC444v2 (4:4:4) when the client supports it.
     avc444: bool,
+    /// H-002: luma-only frames while things move, chroma once still.
+    hybrid: bool,
+    /// Frames sent and not yet acknowledged; beyond this the newest frame waits.
+    max_in_flight: u32,
     ctx: Arc<CudaContext>,
     bitrate: u32,
     fps: u32,
@@ -244,6 +252,13 @@ struct Pipeline {
     last_frame: Option<Frame>,
     /// The newest frame could not be sent (back pressure) and is waiting for a slot.
     pending: bool,
+    /// When the last new frame arrived from the compositor.
+    last_new_frame: Instant,
+    /// Frames went out luma-only (AVC444 LC=1) while things moved; the chroma of the
+    /// still image is owed (LC=2).
+    chroma_owed: bool,
+    /// The next AVC444 frame must carry both views (after a new surface).
+    need_full: bool,
     start: Instant,
     sent: u64,
     stats_at: Instant,
@@ -273,9 +288,23 @@ impl Pipeline {
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            let mut mode = Mode::Full;
             if let Some(f) = frame {
+                // H-002: frames closer than this are motion; they go luma-only and the
+                // full chroma follows once the image is still.
+                if self.hybrid && self.last_new_frame.elapsed() < MOTION_GAP {
+                    mode = Mode::LumaOnly;
+                }
+                self.last_new_frame = Instant::now();
                 self.last_frame = Some(f);
-            } else if !new_client && !self.pending {
+            } else if self.pending {
+                // Retrying a frame held back by back pressure: same choice as when it came in.
+                if self.hybrid && self.last_new_frame.elapsed() < MOTION_GAP {
+                    mode = Mode::LumaOnly;
+                }
+            } else if self.chroma_owed && self.last_new_frame.elapsed() >= STILL_AFTER {
+                mode = Mode::ChromaOnly;
+            } else if !new_client {
                 continue;
             }
             // Mutter only sends frames on damage: a client that connects to an idle
@@ -286,8 +315,9 @@ impl Pipeline {
             if new_client {
                 self.generation = generation;
                 self.surface = None;
+                mode = Mode::Full;
             }
-            if let Err(e) = self.send(&frame) {
+            if let Err(e) = self.send(&frame, mode) {
                 warn!(%e, "Sending a frame failed");
             }
             self.last_frame = Some(frame);
@@ -295,7 +325,7 @@ impl Pipeline {
         Ok(())
     }
 
-    fn send(&mut self, frame: &Frame) -> Result<()> {
+    fn send(&mut self, frame: &Frame, mode: Mode) -> Result<()> {
         let Some(gfx) = self.shared.gfx.lock().unwrap().clone() else {
             return Ok(());
         };
@@ -328,11 +358,13 @@ impl Pipeline {
                 self.surface = None;
             }
             if self.surface.is_none() {
+                g.set_max_frames_in_flight(self.max_in_flight);
                 let id = g
                     .create_surface(w as u16, h as u16)
                     .context("creating the EGFX surface")?;
                 g.map_surface_to_output(id, 0, 0);
                 self.surface = Some((id, w, h));
+                self.need_full = true;
                 if let Some(e) = self.encoders.as_mut() {
                     e.encoder.request_keyframe();
                 }
@@ -377,12 +409,25 @@ impl Pipeline {
             });
             info!(w, h, cw, ch, avc444, "Encoder ready");
         }
+        // Which AVC444 views this frame carries (H-002): luma-only while things move,
+        // chroma-only once still, both otherwise. The first frame on a surface has both.
+        let mode = if !avc444 || self.need_full {
+            Mode::Full
+        } else {
+            mode
+        };
         let encoders = self.encoders.as_mut().expect("created above");
         let t = Instant::now();
-        let (main, aux) = self.converter.convert(&src, avc444)?;
+        let (main, aux) = self
+            .converter
+            .convert(&src, avc444 && mode != Mode::LumaOnly)?;
         // Both views go through the same encoder as consecutive pictures: clients decode
         // AVC444 with a single H.264 decoder (FreeRDP does; so does its server).
-        let out_main = encoders.encoder.encode_nv12(main)?;
+        let out_main = if mode == Mode::ChromaOnly {
+            Default::default()
+        } else {
+            encoders.encoder.encode_nv12(main)?
+        };
         let out_aux = match aux {
             Some(aux) => encoders.encoder.encode_nv12(aux)?,
             None => Default::default(),
@@ -404,21 +449,43 @@ impl Pipeline {
         let messages = {
             let mut g = gfx.lock().unwrap();
             let queued = if avc444 {
-                g.send_avc444v2_frame(
-                    surface_id,
-                    Encoding::LUMA_AND_CHROMA,
-                    &out_main.data,
-                    &regions,
-                    Some(&out_aux.data),
-                    Some(&regions),
-                    ts,
-                )
+                match mode {
+                    Mode::Full => g.send_avc444v2_frame(
+                        surface_id,
+                        Encoding::LUMA_AND_CHROMA,
+                        &out_main.data,
+                        &regions,
+                        Some(&out_aux.data),
+                        Some(&regions),
+                        ts,
+                    ),
+                    Mode::LumaOnly => g.send_avc444v2_frame(
+                        surface_id,
+                        Encoding::LUMA,
+                        &out_main.data,
+                        &regions,
+                        None,
+                        None,
+                        ts,
+                    ),
+                    Mode::ChromaOnly => g.send_avc444v2_frame(
+                        surface_id,
+                        Encoding::CHROMA,
+                        &out_aux.data,
+                        &regions,
+                        None,
+                        None,
+                        ts,
+                    ),
+                }
             } else {
                 g.send_avc420_frame(surface_id, &out_main.data, &regions, ts)
             };
             if queued.is_none() {
                 return Ok(());
             }
+            self.need_full = false;
+            self.chroma_owed = avc444 && mode == Mode::LumaOnly;
             let channel_id = g.channel_id().context("EGFX channel has no id")?;
             ironrdp_dvc::encode_dvc_messages(
                 channel_id,
@@ -521,6 +588,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         converter: color::Converter::new(Arc::clone(&ctx))?,
         upload: crate::gpu::Pool::new(Arc::clone(&ctx)),
         avc444: opts.avc444,
+        hybrid: opts.hybrid,
+        max_in_flight: opts.max_in_flight,
         ctx: Arc::clone(&ctx),
         bitrate: opts.bitrate,
         fps: opts.fps,
@@ -528,6 +597,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         surface: None,
         last_frame: None,
         pending: false,
+        last_new_frame: Instant::now(),
+        chroma_owed: false,
+        need_full: true,
         start: Instant::now(),
         sent: 0,
         stats_at: Instant::now(),
@@ -598,4 +670,21 @@ impl ConnectionHandler for Connections {
         info!(%peer, seconds = duration.as_secs(), error = ?error.map(|e| e.to_string()), "Client disconnected");
         PostConnectionAction::Continue
     }
+}
+
+/// Frames that arrive closer together than this count as motion (H-002).
+const MOTION_GAP: Duration = Duration::from_millis(50);
+/// After this long without a new frame, the image counts as still and its full chroma is
+/// sent.
+const STILL_AFTER: Duration = Duration::from_millis(60);
+
+/// What an AVC444v2 frame carries (MS-RDPEGFX 2.2.4.5, the LC field).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Both views (LC=0).
+    Full,
+    /// Main view only (LC=1): luma and 4:2:0 chroma, half the encoding work.
+    LumaOnly,
+    /// Auxiliary view only (LC=2): the rest of the chroma, for a still image.
+    ChromaOnly,
 }
