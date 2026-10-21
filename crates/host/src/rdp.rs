@@ -398,6 +398,7 @@ impl Pipeline {
             quantization_parameter: 22,
             quality: 100,
         };
+        let regions = [region];
         let ts = self.start.elapsed().as_millis() as u32;
         let bytes = out_main.data.len() + out_aux.data.len();
         let messages = {
@@ -407,13 +408,13 @@ impl Pipeline {
                     surface_id,
                     Encoding::LUMA_AND_CHROMA,
                     &out_main.data,
-                    std::slice::from_ref(&region),
+                    &regions,
                     Some(&out_aux.data),
-                    Some(&[region]),
+                    Some(&regions),
                     ts,
                 )
             } else {
-                g.send_avc420_frame(surface_id, &out_main.data, &[region], ts)
+                g.send_avc420_frame(surface_id, &out_main.data, &regions, ts)
             };
             if queued.is_none() {
                 return Ok(());

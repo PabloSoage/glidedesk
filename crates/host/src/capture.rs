@@ -223,11 +223,25 @@ fn format_object(width: u32, height: u32) -> Object {
             Choice,
             Range,
             Fraction,
-            spa::utils::Fraction { num: 240, denom: 1 },
+            spa::utils::Fraction {
+                num: refresh_rate(),
+                denom: 1
+            },
             spa::utils::Fraction { num: 1, denom: 1 },
-            spa::utils::Fraction { num: 240, denom: 1 }
+            spa::utils::Fraction {
+                num: refresh_rate(),
+                denom: 1
+            }
         ),
     )
+}
+
+/// Frame rate asked of the virtual monitor (GLIDEDESK_REFRESH, default 60).
+fn refresh_rate() -> u32 {
+    std::env::var("GLIDEDESK_REFRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
 }
 
 /// `SPA_PARAM_Buffers` acknowledging the buffer type for the negotiated format.
