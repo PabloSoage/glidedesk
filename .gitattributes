@@ -1,2 +1,4 @@
 * text=auto eol=lf
 *.h linguist-vendored
+*.bat text eol=crlf
+*.jar binary
