@@ -32,11 +32,20 @@ pub trait RemoteDesktopSession {
     #[zbus(property)]
     fn session_id(&self) -> zbus::Result<String>;
 
+    // Input goes without waiting for replies: Mutter answers each call from its main loop,
+    // often a frame later, and waiting would queue every event behind the previous one.
+    // D-Bus keeps the order of messages on one connection.
+    #[zbus(no_reply)]
     fn notify_keyboard_keycode(&self, keycode: u32, state: bool) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_keyboard_keysym(&self, keysym: u32, state: bool) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_pointer_motion_absolute(&self, stream: &str, x: f64, y: f64) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_pointer_button(&self, button: i32, state: bool) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_pointer_axis(&self, dx: f64, dy: f64, flags: u32) -> zbus::Result<()>;
+    #[zbus(no_reply)]
     fn notify_pointer_axis_discrete(&self, axis: u32, steps: i32) -> zbus::Result<()>;
 
     fn enable_clipboard(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
@@ -178,16 +187,25 @@ pub trait Shell {
 
 /// GNOME Shell opens the activities overview when the first monitor appears (its startup
 /// animation), which for a remote session is our virtual monitor. Close it once it shows up,
-/// so a session starts on the desktop like a normal login.
+/// so a session starts on the desktop like a normal login. A request during the startup
+/// animation can be undone by it (slow, software-rendered shells), so keep closing it until it
+/// has stayed closed for a while.
 pub async fn leave_startup_overview(conn: &zbus::Connection) {
     let Ok(shell) = ShellProxy::new(conn).await else {
         return;
     };
-    for _ in 0..20 {
+    let (mut closed_once, mut quiet) = (false, 0);
+    for _ in 0..80 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         if shell.overview_active().await.unwrap_or(false) {
             let _ = shell.set_overview_active(false).await;
-            return;
+            closed_once = true;
+            quiet = 0;
+        } else if closed_once {
+            quiet += 1;
+            if quiet >= 12 {
+                return;
+            }
         }
     }
 }

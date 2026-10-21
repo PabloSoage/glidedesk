@@ -2,3 +2,4 @@
 *.h linguist-vendored
 *.bat text eol=crlf
 *.jar binary
+*.ptx linguist-generated

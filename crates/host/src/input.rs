@@ -93,11 +93,33 @@ impl InputForwarder {
     pub fn spawn(remote: RemoteDesktopSessionProxy<'static>, stream_path: String) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
         tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
+            let mut last_pos = None;
+            let mut next = None;
+            while let Some(mut ev) = match next.take() {
+                Some(ev) => Some(ev),
+                None => rx.recv().await,
+            } {
+                // Only the newest of several queued pointer positions matters.
+                if matches!(ev, Input::Motion(..)) {
+                    while let Ok(e) = rx.try_recv() {
+                        if matches!(e, Input::Motion(..)) {
+                            ev = e;
+                        } else {
+                            next = Some(e);
+                            break;
+                        }
+                    }
+                }
+                debug!(?ev, queued = rx.len(), "Input");
                 let r = match ev {
                     Input::Key(code, down) => remote.notify_keyboard_keycode(code, down).await,
                     Input::Keysym(sym, down) => remote.notify_keyboard_keysym(sym, down).await,
                     Input::Motion(x, y) => {
+                        // Clients repeat the position with every button event.
+                        if last_pos == Some((x, y)) {
+                            continue;
+                        }
+                        last_pos = Some((x, y));
                         remote
                             .notify_pointer_motion_absolute(&stream_path, x, y)
                             .await
