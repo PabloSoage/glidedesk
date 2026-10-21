@@ -1,0 +1,202 @@
+mod capture;
+mod mutter;
+mod nvenc;
+
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use tracing::info;
+
+#[derive(Parser)]
+#[command(version, about = "glidedesk session host")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Capture the session for a few seconds, resize half way, and report frame rates.
+    CaptureTest {
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        /// Size to switch to half way through.
+        #[arg(long, default_value_t = 1280)]
+        resize_width: u32,
+        #[arg(long, default_value_t = 800)]
+        resize_height: u32,
+        #[arg(long, default_value_t = 6)]
+        seconds: u64,
+    },
+    /// Capture and encode with NVENC, write the elementary stream and report timings.
+    EncodeTest {
+        #[arg(long, default_value_t = 1920)]
+        width: u32,
+        #[arg(long, default_value_t = 1080)]
+        height: u32,
+        #[arg(long, default_value_t = 0)]
+        gpu: usize,
+        #[arg(long)]
+        hevc: bool,
+        #[arg(long, default_value_t = 20_000_000)]
+        bitrate: u32,
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+        #[arg(long, default_value = "/tmp/glidedesk-test.bin")]
+        out: std::path::PathBuf,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    match Cli::parse().command {
+        Command::CaptureTest {
+            width,
+            height,
+            resize_width,
+            resize_height,
+            seconds,
+        } => capture_test(width, height, resize_width, resize_height, seconds).await,
+        Command::EncodeTest {
+            width,
+            height,
+            gpu,
+            hevc,
+            bitrate,
+            seconds,
+            out,
+        } => encode_test(width, height, gpu, hevc, bitrate, seconds, out).await,
+    }
+}
+
+async fn encode_test(
+    w: u32,
+    h: u32,
+    gpu: usize,
+    hevc: bool,
+    bitrate: u32,
+    seconds: u64,
+    out: std::path::PathBuf,
+) -> Result<()> {
+    use std::io::Write;
+    let conn = zbus::Connection::session().await?;
+    let session = mutter::Session::start(&conn, mutter::CursorMode::Embedded).await?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    let cap = capture::Capture::start(session.node_id, w, h, tx)?;
+    let codec = if hevc {
+        nvenc::Codec::Hevc
+    } else {
+        nvenc::Codec::H264
+    };
+    let worker = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut enc = nvenc::Encoder::new(
+            gpu,
+            nvenc::EncoderConfig {
+                codec,
+                width: w,
+                height: h,
+                fps: 60,
+                bitrate,
+            },
+        )?;
+        let mut file = std::fs::File::create(&out)?;
+        let start = Instant::now();
+        let (mut n, mut bytes, mut total_us, mut max_us) = (0u64, 0usize, 0u128, 0u128);
+        while start.elapsed() < Duration::from_secs(seconds) {
+            let Ok(f) = rx.recv_timeout(Duration::from_millis(200)) else {
+                continue;
+            };
+            if (f.width, f.height) != enc.size() {
+                enc.resize(f.width, f.height)?;
+            }
+            let t = Instant::now();
+            let e = enc.encode_host(&f.data, f.stride as usize)?;
+            let us = t.elapsed().as_micros();
+            total_us += us;
+            max_us = max_us.max(us);
+            n += 1;
+            bytes += e.data.len();
+            file.write_all(&e.data)?;
+            if n <= 3 || n % 60 == 0 {
+                info!(
+                    n,
+                    kb = e.data.len() / 1024,
+                    key = e.keyframe,
+                    encode_us = us as u64,
+                    capture_to_bitstream_us = f.captured.elapsed().as_micros() as u64,
+                    "Encoded"
+                );
+            }
+        }
+        if n > 0 {
+            info!(
+                frames = n,
+                avg_encode_us = (total_us / n as u128) as u64,
+                max_encode_us = max_us as u64,
+                avg_kb = bytes as u64 / n / 1024,
+                out = %out.display(),
+                "Encode test done"
+            );
+        }
+        Ok(())
+    });
+    let r = worker.await?;
+    drop(cap);
+    session.remote.stop().await.ok();
+    r
+}
+
+async fn capture_test(w: u32, h: u32, rw: u32, rh: u32, seconds: u64) -> Result<()> {
+    let conn = zbus::Connection::session().await?;
+    let session = mutter::Session::start(&conn, mutter::CursorMode::Metadata).await?;
+    info!(node = session.node_id, "Virtual monitor stream ready");
+    let (tx, rx) = mpsc::sync_channel(1);
+    let cap = capture::Capture::start(session.node_id, w, h, tx)?;
+
+    let total = Duration::from_secs(seconds);
+    let start = Instant::now();
+    let mut resized = false;
+    let mut last = (0u32, 0u32);
+    let mut count = 0u32;
+    let mut window = Instant::now();
+    while start.elapsed() < total {
+        if !resized && start.elapsed() > total / 2 {
+            cap.resize(rw, rh);
+            resized = true;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(f) => {
+                if (f.width, f.height) != last {
+                    info!(
+                        width = f.width,
+                        height = f.height,
+                        stride = f.stride,
+                        t_ms = start.elapsed().as_millis() as u64,
+                        "Frame size"
+                    );
+                    last = (f.width, f.height);
+                }
+                count += 1;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if window.elapsed() >= Duration::from_secs(1) {
+            info!(fps = count, "Frames in the last second");
+            count = 0;
+            window = Instant::now();
+        }
+    }
+    drop(cap);
+    session.remote.stop().await.ok();
+    Ok(())
+}

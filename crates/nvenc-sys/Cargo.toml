@@ -1,0 +1,10 @@
+[package]
+name = "nvenc-sys"
+description = "Raw bindings to the NVIDIA Video Codec SDK encode API (nvEncodeAPI.h 13.0)"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later AND MIT"
+repository.workspace = true
+
+[build-dependencies]
+bindgen = { version = "0.73", features = ["prettyplease"] }

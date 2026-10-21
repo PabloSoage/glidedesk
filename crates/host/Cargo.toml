@@ -1,0 +1,20 @@
+[package]
+name = "glidedesk-host"
+description = "glidedesk session host: captures a headless GNOME session and serves it over RDP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+pipewire = "0.10"
+futures-util = "0.3"
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12080", "dynamic-loading"] }
+libloading = "0.9"
+nvenc-sys = { path = "../nvenc-sys" }
