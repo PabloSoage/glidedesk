@@ -251,8 +251,10 @@ impl RdpsndServerHandler for Sound {
                     Ok(block) => {
                         blocks += 1;
                         if block
-                            .chunks_exact(2)
-                            .any(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs() > 256)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .any(|s| i16::from_le_bytes(*s).unsigned_abs() > 256)
                         {
                             loud += 1;
                         }
