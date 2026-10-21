@@ -1,0 +1,34 @@
+[package]
+name = "glidedesk-client"
+description = "glidedesk client core: RDP connection, H.264 graphics pipeline passthrough to a platform decoder, input and resize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "glidedesk-dump"
+path = "src/bin/dump.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-session = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-async = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-tokio = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-tls = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e", features = ["rustls-ring"] }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-input = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }

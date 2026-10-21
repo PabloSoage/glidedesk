@@ -1203,6 +1203,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "glidedesk-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ironrdp-async",
+ "ironrdp-connector",
+ "ironrdp-core",
+ "ironrdp-displaycontrol",
+ "ironrdp-dvc",
+ "ironrdp-egfx",
+ "ironrdp-graphics",
+ "ironrdp-input",
+ "ironrdp-pdu",
+ "ironrdp-session",
+ "ironrdp-svc",
+ "ironrdp-tls",
+ "ironrdp-tokio",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "glidedesk-host"
 version = "0.1.0"
 dependencies = [
@@ -1626,6 +1650,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-bulk"
+version = "0.1.1"
+source = "git+https://github.com/Devolutions/IronRDP?rev=579979e#579979ead4406455da1aff3a28d63feee6f35929"
+
+[[package]]
 name = "ironrdp-cliprdr"
 version = "0.7.0"
 source = "git+https://github.com/Devolutions/IronRDP?rev=579979e#579979ead4406455da1aff3a28d63feee6f35929"
@@ -1731,6 +1760,16 @@ dependencies = [
  "num-traits",
  "wide",
  "yuv",
+]
+
+[[package]]
+name = "ironrdp-input"
+version = "0.7.0"
+source = "git+https://github.com/Devolutions/IronRDP?rev=579979e#579979ead4406455da1aff3a28d63feee6f35929"
+dependencies = [
+ "bitvec",
+ "ironrdp-pdu",
+ "smallvec",
 ]
 
 [[package]]
@@ -1890,6 +1929,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-session"
+version = "0.11.0"
+source = "git+https://github.com/Devolutions/IronRDP?rev=579979e#579979ead4406455da1aff3a28d63feee6f35929"
+dependencies = [
+ "ironrdp-bulk",
+ "ironrdp-core",
+ "ironrdp-displaycontrol",
+ "ironrdp-dvc",
+ "ironrdp-egfx",
+ "ironrdp-error",
+ "ironrdp-graphics",
+ "ironrdp-pdu",
+ "ironrdp-rdpei",
+ "ironrdp-svc",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-svc"
 version = "0.8.0"
 source = "git+https://github.com/Devolutions/IronRDP?rev=579979e#579979ead4406455da1aff3a28d63feee6f35929"
@@ -1907,6 +1964,7 @@ dependencies = [
  "rustls-native-certs",
  "tokio",
  "tokio-rustls",
+ "x509-cert",
 ]
 
 [[package]]
@@ -2955,6 +3013,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
