@@ -626,6 +626,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             cursor: cursor_rx,
         })
         .with_gfx_factory(Some(Box::new(GfxFactory(Arc::clone(&shared)))))
+        .with_cliprdr_factory(Some(Box::new(crate::clipboard::ClipboardFactory::spawn(
+            session.remote.clone(),
+        ))))
         .with_connection_handler(Some(Box::new(Connections)))
         // RDP-UDP on the same port, as Windows does; TCP stays as the fallback.
         .with_udp_transport(opts.bind)

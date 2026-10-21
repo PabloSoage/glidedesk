@@ -39,6 +39,21 @@ pub trait RemoteDesktopSession {
     fn notify_pointer_axis(&self, dx: f64, dy: f64, flags: u32) -> zbus::Result<()>;
     fn notify_pointer_axis_discrete(&self, axis: u32, steps: i32) -> zbus::Result<()>;
 
+    fn enable_clipboard(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
+    fn disable_clipboard(&self) -> zbus::Result<()>;
+    fn set_selection(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
+    fn selection_write(&self, serial: u32) -> zbus::Result<zbus::OwnedFd>;
+    fn selection_write_done(&self, serial: u32, success: bool) -> zbus::Result<()>;
+    fn selection_read(&self, mime_type: &str) -> zbus::Result<zbus::OwnedFd>;
+
+    #[zbus(signal)]
+    fn selection_owner_changed(
+        &self,
+        options: HashMap<String, zbus::OwnedVariant>,
+    ) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn selection_transfer(&self, mime_type: String, serial: u32) -> zbus::Result<()>;
+
     #[zbus(signal)]
     fn closed(&self) -> zbus::Result<()>;
 }

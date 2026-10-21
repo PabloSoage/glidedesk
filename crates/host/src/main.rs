@@ -1,4 +1,5 @@
 mod capture;
+mod clipboard;
 mod color;
 mod gpu;
 mod input;
