@@ -1,4 +1,5 @@
 mod capture;
+mod color;
 mod gpu;
 mod input;
 mod mutter;
@@ -43,6 +44,9 @@ enum Command {
         /// RDP password; read from GLIDEDESK_PASSWORD when not given.
         #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
         password: String,
+        /// Send 4:2:0 only (AVC420) even to clients that support AVC444.
+        #[arg(long)]
+        no_avc444: bool,
     },
     /// Capture the session for a few seconds, resize half way, and report frame rates.
     CaptureTest {
@@ -94,6 +98,7 @@ async fn main() -> Result<()> {
             height,
             user,
             password,
+            no_avc444,
         } => {
             let state_dir = std::env::var_os("XDG_CONFIG_HOME")
                 .map(std::path::PathBuf::from)
@@ -103,6 +108,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| ".".into())
                 .join("glidedesk");
             rdp::serve(rdp::ServeOptions {
+                avc444: !no_avc444,
                 bind,
                 gpu,
                 bitrate,
@@ -172,6 +178,7 @@ async fn encode_test(
                 height: h,
                 fps: 60,
                 bitrate,
+                refs: 1,
             },
         )?;
         let mut file = std::fs::File::create(&out)?;

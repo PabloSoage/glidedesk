@@ -21,12 +21,14 @@ GPU:
 | Piece | State |
 |---|---|
 | Headless GNOME Shell rendered on the GPU (GBM) | works |
-| Virtual monitor capture over PipeWire (Mutter `RecordVirtual`) | works, system-memory frames |
+| Virtual monitor capture over PipeWire (Mutter `RecordVirtual`) | works |
 | Live resize of the virtual monitor | works |
 | NVENC H.264 / HEVC encoding | works |
-| RDP front end (IronRDP, NLA, EGFX AVC420, Display Control) | works with `mstsc`, first version |
+| RDP front end (IronRDP, NLA, EGFX AVC420 and AVC444v2, Display Control, RDP-UDP) | works with `mstsc` and FreeRDP |
+| Client-side cursor (shape from Mutter, drawn by the client) | works |
+| Zero-copy capture: DMA-BUF → GL → CUDA → NVENC, colour conversion in CUDA | works |
 | Keyboard and mouse through Mutter RemoteDesktop | works |
-| Zero-copy DMA-BUF → CUDA → NVENC, AVC444, client-side cursor | planned |
+| HEVC / AV1 low-latency client (Moonlight protocol), adaptive per-region quality | planned |
 
 ## Try the pieces
 

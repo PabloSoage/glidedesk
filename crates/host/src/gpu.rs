@@ -635,3 +635,42 @@ impl Drop for DmabufImporter {
         let _ = self.context;
     }
 }
+
+/// Copies a BGRx frame from system memory into a pooled device buffer.
+pub fn upload(
+    pool: &mut Pool,
+    data: &[u8],
+    stride: usize,
+    width: u32,
+    height: u32,
+) -> Result<Arc<DeviceBuffer>> {
+    let dst = pool
+        .get(width, height, PixelOrder::Bgrx)?
+        .context("no free upload buffer")?;
+    let (w, h) = (width as usize, height as usize);
+    if data.len() < stride * (h - 1) + w * 4 {
+        bail!("frame buffer too small for {w}x{h}");
+    }
+    pool.ctx.bind_to_thread()?;
+    let copy = cu::CUDA_MEMCPY2D {
+        srcXInBytes: 0,
+        srcY: 0,
+        srcMemoryType: cu::CUmemorytype::CU_MEMORYTYPE_HOST,
+        srcHost: data.as_ptr() as *const c_void,
+        srcDevice: 0,
+        srcArray: ptr::null_mut(),
+        srcPitch: stride,
+        dstXInBytes: 0,
+        dstY: 0,
+        dstMemoryType: cu::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+        dstHost: ptr::null_mut(),
+        dstDevice: dst.ptr,
+        dstArray: ptr::null_mut(),
+        dstPitch: dst.pitch,
+        WidthInBytes: w * 4,
+        Height: h,
+    };
+    // SAFETY: source covers h rows of `stride` bytes; destination was allocated for it.
+    cu_check(unsafe { cu::cuMemcpy2D_v2(&copy) }, "cuMemcpy2D (upload)")?;
+    Ok(dst)
+}

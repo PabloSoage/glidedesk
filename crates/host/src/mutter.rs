@@ -148,3 +148,31 @@ impl Session {
         })
     }
 }
+
+#[proxy(
+    interface = "org.gnome.Shell",
+    default_service = "org.gnome.Shell",
+    default_path = "/org/gnome/Shell"
+)]
+pub trait Shell {
+    #[zbus(property)]
+    fn overview_active(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_overview_active(&self, active: bool) -> zbus::Result<()>;
+}
+
+/// GNOME Shell opens the activities overview when the first monitor appears (its startup
+/// animation), which for a remote session is our virtual monitor. Close it once it shows up,
+/// so a session starts on the desktop like a normal login.
+pub async fn leave_startup_overview(conn: &zbus::Connection) {
+    let Ok(shell) = ShellProxy::new(conn).await else {
+        return;
+    };
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if shell.overview_active().await.unwrap_or(false) {
+            let _ = shell.set_overview_active(false).await;
+            return;
+        }
+    }
+}

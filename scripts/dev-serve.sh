@@ -3,6 +3,8 @@
 # Shell, in the background, logging to $XDG_RUNTIME_DIR/glidedesk-serve.log.
 #
 #   GLIDEDESK_PASSWORD=... scripts/dev-serve.sh [serve options]
+#
+# GLIDEDESK_APP: a command to start inside the session (e.g. "python3 tools/flash.py").
 set -eu
 cd "$(dirname "$0")/.."
 log="${XDG_RUNTIME_DIR:-/tmp}/glidedesk-serve.log"
@@ -14,7 +16,11 @@ if pgrep -x glidedesk-host >/dev/null; then
 fi
 : "${GLIDEDESK_PASSWORD:?set GLIDEDESK_PASSWORD}"
 export GLIDEDESK_PASSWORD
-RUST_LOG="${RUST_LOG:-info}" setsid scripts/dev-session.sh -- target/release/glidedesk-host serve "$@" \
-  >"$log" 2>&1 </dev/null &
+if [ -n "${GLIDEDESK_APP:-}" ]; then
+  set -- --app "$GLIDEDESK_APP" -- target/release/glidedesk-host serve "$@"
+else
+  set -- -- target/release/glidedesk-host serve "$@"
+fi
+RUST_LOG="${RUST_LOG:-info}" setsid scripts/dev-session.sh "$@" >"$log" 2>&1 </dev/null &
 sleep 4
 grep -a glidedesk_host "$log" | sed 's/\x1b\[[0-9;]*m//g' || true

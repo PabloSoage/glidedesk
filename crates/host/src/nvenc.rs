@@ -27,8 +27,12 @@ pub struct EncoderConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Reference frames for P-frames. AVC444 interleaves the two views in one sequence, so
+    /// each view needs the picture two back to reference its own previous frame.
+    pub refs: u32,
 }
 
+#[derive(Default)]
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
@@ -180,11 +184,14 @@ impl Encoder {
                     h.set_repeatSPSPPS(1);
                     h.set_outputAUD(0);
                     h.chromaFormatIDC = 1;
-                    h.maxNumRefFrames = 0;
+                    h.maxNumRefFrames = c.refs;
+                    if c.refs >= 2 {
+                        h.numRefL0 = nv::NV_ENC_NUM_REF_FRAMES_2;
+                    }
                     let v = &mut h.h264VUIParameters;
                     v.videoSignalTypePresentFlag = 1;
                     v.videoFormat = nv::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-                    v.videoFullRangeFlag = 0;
+                    v.videoFullRangeFlag = 1;
                     v.colourDescriptionPresentFlag = 1;
                     v.colourPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
                     v.transferCharacteristics = nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
@@ -197,7 +204,7 @@ impl Encoder {
                     h.set_chromaFormatIDC(1);
                     let v = &mut h.hevcVUIParameters;
                     v.videoSignalTypePresentFlag = 1;
-                    v.videoFullRangeFlag = 0;
+                    v.videoFullRangeFlag = 1;
                     v.colourDescriptionPresentFlag = 1;
                     v.colourPrimaries = nv::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
                     v.transferCharacteristics = nv::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
@@ -358,38 +365,64 @@ impl Encoder {
         )
     }
 
-    /// Encodes a frame that is already on this GPU (registered on first use).
+    /// Encodes a 32-bit frame that is already on this GPU (registered on first use).
     pub fn encode_device(&mut self, buf: &crate::gpu::DeviceBuffer) -> Result<EncodedFrame> {
-        if (buf.width, buf.height) != (self.cfg.width, self.cfg.height) {
+        self.encode_external(
+            buf.ptr,
+            buf.pitch,
+            buf.width,
+            buf.height,
+            buffer_format(buf.order),
+        )
+    }
+
+    /// Encodes an NV12 frame (from [`crate::color::Converter`]).
+    pub fn encode_nv12(&mut self, f: &crate::color::Nv12) -> Result<EncodedFrame> {
+        self.encode_external(
+            f.ptr,
+            f.pitch,
+            f.width,
+            f.height,
+            nv::NV_ENC_BUFFER_FORMAT_NV12,
+        )
+    }
+
+    fn encode_external(
+        &mut self,
+        ptr: cu::CUdeviceptr,
+        pitch: usize,
+        width: u32,
+        height: u32,
+        format: nv::NV_ENC_BUFFER_FORMAT,
+    ) -> Result<EncodedFrame> {
+        if (width, height) != (self.cfg.width, self.cfg.height) {
             bail!(
-                "device frame is {}x{}, encoder {}x{}",
-                buf.width,
-                buf.height,
+                "frame is {width}x{height}, encoder {}x{}",
                 self.cfg.width,
                 self.cfg.height
             );
         }
         self.ctx.bind_to_thread()?;
-        let registered = match self.external.get(&buf.ptr) {
+        let registered = match self.external.get(&ptr) {
             Some(&r) => r,
             None => {
                 let mut reg = nv::NV_ENC_REGISTER_RESOURCE {
                     version: nv::NV_ENC_REGISTER_RESOURCE_VER,
                     resourceType: nv::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                    width: buf.width,
-                    height: buf.height,
-                    pitch: buf.pitch as u32,
-                    resourceToRegister: buf.ptr as *mut c_void,
-                    bufferFormat: buffer_format(buf.order),
+                    width,
+                    height,
+                    pitch: pitch as u32,
+                    resourceToRegister: ptr as *mut c_void,
+                    bufferFormat: format,
                     bufferUsage: nv::NV_ENC_INPUT_IMAGE,
                     ..Default::default()
                 };
                 call!(self.api, nvEncRegisterResource, self.enc, &mut reg)?;
-                self.external.insert(buf.ptr, reg.registeredResource);
+                self.external.insert(ptr, reg.registeredResource);
                 reg.registeredResource
             }
         };
-        self.encode_mapped(registered, buf.pitch, buffer_format(buf.order))
+        self.encode_mapped(registered, pitch, format)
     }
 
     fn encode_mapped(
