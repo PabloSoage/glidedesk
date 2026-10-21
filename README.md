@@ -28,6 +28,9 @@ GPU:
 | Client-side cursor (shape from Mutter, drawn by the client) | works |
 | Zero-copy capture: DMA-BUF → GL → CUDA → NVENC, colour conversion in CUDA | works |
 | Keyboard and mouse through Mutter RemoteDesktop | works |
+| Clipboard (text, both ways) | works |
+| Audio (session sink → rdpsnd, 48 kHz PCM) | works |
+| Virtual monitor above 60 Hz (`--refresh`, default 120) | works |
 | HEVC / AV1 low-latency client (Moonlight protocol), adaptive per-region quality | planned |
 
 ## Try the pieces

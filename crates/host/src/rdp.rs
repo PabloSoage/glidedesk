@@ -615,6 +615,13 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let acceptor = identity
         .make_acceptor()
         .map_err(|e| anyhow::anyhow!("building the TLS acceptor: {e}"))?;
+    let audio = match crate::audio::start() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            warn!(%e, "No audio");
+            None
+        }
+    };
     let input = InputForwarder::spawn(session.remote.clone(), session.stream_path.clone());
 
     let mut server = RdpServer::builder()
@@ -626,6 +633,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             cursor: cursor_rx,
         })
         .with_gfx_factory(Some(Box::new(GfxFactory(Arc::clone(&shared)))))
+        .with_sound_factory(audio.map(|a| {
+            Box::new(crate::audio::SoundFactory::new(a))
+                as Box<dyn ironrdp_server::SoundServerFactory>
+        }))
         .with_cliprdr_factory(Some(Box::new(crate::clipboard::ClipboardFactory::spawn(
             session.remote.clone(),
         ))))
