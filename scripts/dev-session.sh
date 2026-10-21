@@ -25,6 +25,9 @@ until gdbus introspect --session --dest org.gnome.Mutter.RemoteDesktop \
   i=$((i + 1)); [ $i -gt 100 ] && { echo "gnome-shell did not start, see $log" >&2; exit 1; }
   sleep 0.1
 done
+# GNOME starts in the activities overview; a remote session should start on the desktop.
+(sleep 1; gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
+  --method org.freedesktop.DBus.Properties.Set org.gnome.Shell OverviewActive "<false>" >/dev/null 2>&1) &
 export WAYLAND_DISPLAY
 WAYLAND_DISPLAY=$(sed -n 's/.*Using Wayland display name .\(wayland-[0-9]*\).*/\1/p' "$log" | head -1)
 if [ -n "$app" ]; then (sleep 1.5; sh -c "$app") >/dev/null 2>&1 & fi

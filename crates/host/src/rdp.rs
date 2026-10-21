@@ -15,15 +15,18 @@ use anyhow::{Context, Result};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_egfx::pdu::{Avc420Region, CapabilitiesAdvertisePdu, CapabilitySet};
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
     Credentials, DesktopSize, DisplayContext, DisplayUpdate, EgfxServerMessage, GfxDvcBridge,
-    GfxServerFactory, GfxServerHandle, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
-    ServerEvent, ServerEventSender, ServerResult, TlsIdentityCtx,
+    GfxServerFactory, GfxServerHandle, LargePointer, RGBAPointer, RdpServer, RdpServerDisplay,
+    RdpServerDisplayUpdates, ServerEvent, ServerEventSender, ServerResult, TlsIdentityCtx,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
-use crate::capture::{Capture, Frame};
+use cudarc::driver::CudaContext;
+
+use crate::capture::{Capture, CursorEvent, Frame, FrameData, Sinks};
 use crate::input::InputForwarder;
 use crate::mutter;
 use crate::nvenc::{Codec, Encoder, EncoderConfig};
@@ -108,22 +111,58 @@ fn clamp_size(w: u32, h: u32) -> (u32, u32) {
     (w, h)
 }
 
-struct Display(Arc<Shared>);
+struct Display {
+    shared: Arc<Shared>,
+    cursor: tokio::sync::watch::Receiver<Option<CursorEvent>>,
+}
 
-struct NoBitmapUpdates;
+/// Graphics go through EGFX; the classic update stream only carries the pointer, which
+/// the client then draws itself with no round trip.
+struct PointerUpdates {
+    cursor: tokio::sync::watch::Receiver<Option<CursorEvent>>,
+    /// Send the current shape first on every new connection.
+    first: bool,
+}
 
 #[async_trait::async_trait]
-impl RdpServerDisplayUpdates for NoBitmapUpdates {
+impl RdpServerDisplayUpdates for PointerUpdates {
     async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
-        // All graphics go through EGFX.
-        std::future::pending().await
+        loop {
+            if !std::mem::take(&mut self.first) && self.cursor.changed().await.is_err() {
+                return Ok(None);
+            }
+            let ev = self.cursor.borrow_and_update().clone();
+            let update = match ev {
+                None => continue,
+                Some(CursorEvent::Hidden) => DisplayUpdate::HidePointer,
+                Some(CursorEvent::Shape(s)) if s.width <= 96 && s.height <= 96 => {
+                    DisplayUpdate::RGBAPointer(RGBAPointer {
+                        cache_index: 0,
+                        width: s.width,
+                        height: s.height,
+                        hot_x: s.hot_x,
+                        hot_y: s.hot_y,
+                        data: s.bgra_bottom_up,
+                    })
+                }
+                Some(CursorEvent::Shape(s)) => DisplayUpdate::LargePointer(LargePointer {
+                    cache_index: 0,
+                    width: s.width,
+                    height: s.height,
+                    hot_x: s.hot_x,
+                    hot_y: s.hot_y,
+                    data: s.bgra_bottom_up,
+                }),
+            };
+            return Ok(Some(update));
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl RdpServerDisplay for Display {
     async fn size(&mut self) -> DesktopSize {
-        let (w, h) = *self.0.current_size.lock().unwrap();
+        let (w, h) = *self.shared.current_size.lock().unwrap();
         DesktopSize {
             width: w as u16,
             height: h as u16,
@@ -133,8 +172,8 @@ impl RdpServerDisplay for Display {
     async fn request_initial_size(&mut self, client: DesktopSize) -> DesktopSize {
         let (w, h) = clamp_size(u32::from(client.width), u32::from(client.height));
         info!(w, h, "Client initial size");
-        *self.0.wanted_size.lock().unwrap() = Some((w, h));
-        *self.0.current_size.lock().unwrap() = (w, h);
+        *self.shared.wanted_size.lock().unwrap() = Some((w, h));
+        *self.shared.current_size.lock().unwrap() = (w, h);
         DesktopSize {
             width: w as u16,
             height: h as u16,
@@ -145,7 +184,10 @@ impl RdpServerDisplay for Display {
         &mut self,
         _ctx: DisplayContext,
     ) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        Ok(Box::new(NoBitmapUpdates))
+        Ok(Box::new(PointerUpdates {
+            cursor: self.cursor.clone(),
+            first: true,
+        }))
     }
 
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
@@ -160,7 +202,7 @@ impl RdpServerDisplay for Display {
         let (w, h) = m.dimensions();
         let (w, h) = clamp_size(w, h);
         info!(w, h, "Client asked for a new layout");
-        *self.0.wanted_size.lock().unwrap() = Some((w, h));
+        *self.shared.wanted_size.lock().unwrap() = Some((w, h));
     }
 }
 
@@ -172,7 +214,7 @@ struct Pipeline {
     capture: Capture,
     frames: mpsc::Receiver<Frame>,
     encoder: Option<Encoder>,
-    gpu: usize,
+    ctx: Arc<CudaContext>,
     bitrate: u32,
     fps: u32,
     generation: u64,
@@ -244,16 +286,23 @@ impl Pipeline {
                 warn!("Client does not support AVC420");
                 return Ok(());
             }
-            match self.surface {
-                Some((_, sw, sh)) if (sw, sh) == (w, h) => {}
-                Some(_) => {
-                    g.resize(w as u16, h as u16);
-                    self.surface = None;
-                }
-                None => {}
+            if !matches!(self.surface, Some((_, sw, sh)) if (sw, sh) == (w, h)) {
+                // ResetGraphics with one primary monitor (FreeRDP rejects an empty list),
+                // which also deletes the old surface.
+                g.resize_with_monitors(
+                    w as u16,
+                    h as u16,
+                    vec![Monitor {
+                        left: 0,
+                        top: 0,
+                        right: w as i32 - 1,
+                        bottom: h as i32 - 1,
+                        flags: MonitorFlags::PRIMARY,
+                    }],
+                );
+                self.surface = None;
             }
             if self.surface.is_none() {
-                g.set_output_dimensions(w as u16, h as u16);
                 let id = g
                     .create_surface(w as u16, h as u16)
                     .context("creating the EGFX surface")?;
@@ -278,7 +327,7 @@ impl Pipeline {
                 e
             }
             None => self.encoder.insert(Encoder::new(
-                self.gpu,
+                Arc::clone(&self.ctx),
                 EncoderConfig {
                     codec: Codec::H264,
                     width: w,
@@ -289,7 +338,10 @@ impl Pipeline {
             )?),
         };
         let t = Instant::now();
-        let out = enc.encode_host(&frame.data, frame.stride as usize)?;
+        let out = match &frame.data {
+            FrameData::Cpu { data, stride } => enc.encode_host(data, *stride as usize)?,
+            FrameData::Gpu(buf) => enc.encode_device(buf)?,
+        };
         let encode_us = t.elapsed().as_micros();
 
         let (surface_id, _, _) = self.surface.expect("surface created above");
@@ -376,21 +428,32 @@ fn tls_identity(dir: &Path) -> Result<TlsIdentityCtx> {
 
 pub async fn serve(opts: ServeOptions) -> Result<()> {
     let conn = zbus::Connection::session().await?;
-    let session = mutter::Session::start(&conn, mutter::CursorMode::Embedded).await?;
+    let session = mutter::Session::start(&conn, mutter::CursorMode::Metadata).await?;
     info!(node = session.node_id, "Virtual monitor ready");
 
     let shared = Arc::new(Shared::default());
     *shared.current_size.lock().unwrap() = clamp_size(opts.width, opts.height);
     let (w, h) = *shared.current_size.lock().unwrap();
+    let ctx = CudaContext::new(opts.gpu).context("creating the CUDA context")?;
     let (tx, rx) = mpsc::sync_channel(1);
-    let capture = Capture::start(session.node_id, w, h, tx)?;
+    let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
+    let capture = Capture::start(
+        session.node_id,
+        w,
+        h,
+        Sinks {
+            frames: tx,
+            cursor: cursor_tx,
+        },
+        Some(Arc::clone(&ctx)),
+    )?;
 
     let pipeline = Pipeline {
         shared: Arc::clone(&shared),
         capture,
         frames: rx,
         encoder: None,
-        gpu: opts.gpu,
+        ctx: Arc::clone(&ctx),
         bitrate: opts.bitrate,
         fps: opts.fps,
         generation: 0,
@@ -417,7 +480,10 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .with_addr(opts.bind)
         .with_hybrid(acceptor, identity.pub_key)
         .with_input_handler(input)
-        .with_display_handler(Display(Arc::clone(&shared)))
+        .with_display_handler(Display {
+            shared: Arc::clone(&shared),
+            cursor: cursor_rx,
+        })
         .with_gfx_factory(Some(Box::new(GfxFactory(Arc::clone(&shared)))))
         .build();
     server.set_credentials(Some(Credentials {

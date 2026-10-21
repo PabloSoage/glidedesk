@@ -80,6 +80,8 @@ pub struct Encoder {
     input_pitch: usize,
     registered: nv::NV_ENC_REGISTERED_PTR,
     bitstream: nv::NV_ENC_OUTPUT_PTR,
+    /// Device buffers from the capture pool, registered once each.
+    external: std::collections::HashMap<cu::CUdeviceptr, nv::NV_ENC_REGISTERED_PTR>,
     cfg: EncoderConfig,
     frame_idx: u32,
     force_idr: bool,
@@ -97,8 +99,7 @@ macro_rules! call {
 }
 
 impl Encoder {
-    pub fn new(gpu: usize, cfg: EncoderConfig) -> Result<Self> {
-        let ctx = CudaContext::new(gpu).context("creating the CUDA context")?;
+    pub fn new(ctx: Arc<CudaContext>, cfg: EncoderConfig) -> Result<Self> {
         ctx.bind_to_thread()?;
         let api = Api::load()?;
 
@@ -120,6 +121,7 @@ impl Encoder {
             input_pitch: 0,
             registered: ptr::null_mut(),
             bitstream: ptr::null_mut(),
+            external: Default::default(),
             cfg: cfg.clone(),
             frame_idx: 0,
             force_idr: true,
@@ -283,6 +285,11 @@ impl Encoder {
                 cu::cuMemFree_v2(self.input);
                 self.input = 0;
             }
+            for (_, r) in self.external.drain() {
+                if let Some(f) = self.api.f.nvEncUnregisterResource {
+                    f(self.enc, r);
+                }
+            }
         }
     }
 
@@ -344,13 +351,56 @@ impl Encoder {
         };
         // SAFETY: source covers `h` rows of `stride` bytes; destination was allocated for it.
         cu_check(unsafe { cu::cuMemcpy2D_v2(&copy) }, "cuMemcpy2D")?;
-        self.encode_mapped()
+        self.encode_mapped(
+            self.registered,
+            self.input_pitch,
+            nv::NV_ENC_BUFFER_FORMAT_ARGB,
+        )
     }
 
-    fn encode_mapped(&mut self) -> Result<EncodedFrame> {
+    /// Encodes a frame that is already on this GPU (registered on first use).
+    pub fn encode_device(&mut self, buf: &crate::gpu::DeviceBuffer) -> Result<EncodedFrame> {
+        if (buf.width, buf.height) != (self.cfg.width, self.cfg.height) {
+            bail!(
+                "device frame is {}x{}, encoder {}x{}",
+                buf.width,
+                buf.height,
+                self.cfg.width,
+                self.cfg.height
+            );
+        }
+        self.ctx.bind_to_thread()?;
+        let registered = match self.external.get(&buf.ptr) {
+            Some(&r) => r,
+            None => {
+                let mut reg = nv::NV_ENC_REGISTER_RESOURCE {
+                    version: nv::NV_ENC_REGISTER_RESOURCE_VER,
+                    resourceType: nv::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+                    width: buf.width,
+                    height: buf.height,
+                    pitch: buf.pitch as u32,
+                    resourceToRegister: buf.ptr as *mut c_void,
+                    bufferFormat: buffer_format(buf.order),
+                    bufferUsage: nv::NV_ENC_INPUT_IMAGE,
+                    ..Default::default()
+                };
+                call!(self.api, nvEncRegisterResource, self.enc, &mut reg)?;
+                self.external.insert(buf.ptr, reg.registeredResource);
+                reg.registeredResource
+            }
+        };
+        self.encode_mapped(registered, buf.pitch, buffer_format(buf.order))
+    }
+
+    fn encode_mapped(
+        &mut self,
+        registered: nv::NV_ENC_REGISTERED_PTR,
+        pitch: usize,
+        format: nv::NV_ENC_BUFFER_FORMAT,
+    ) -> Result<EncodedFrame> {
         let mut map = nv::NV_ENC_MAP_INPUT_RESOURCE {
             version: nv::NV_ENC_MAP_INPUT_RESOURCE_VER,
-            registeredResource: self.registered,
+            registeredResource: registered,
             ..Default::default()
         };
         call!(self.api, nvEncMapInputResource, self.enc, &mut map)?;
@@ -358,10 +408,10 @@ impl Encoder {
             version: nv::NV_ENC_PIC_PARAMS_VER,
             inputWidth: self.cfg.width,
             inputHeight: self.cfg.height,
-            inputPitch: self.input_pitch as u32,
+            inputPitch: pitch as u32,
             inputBuffer: map.mappedResource,
             outputBitstream: self.bitstream,
-            bufferFmt: nv::NV_ENC_BUFFER_FORMAT_ARGB,
+            bufferFmt: format,
             pictureStruct: nv::NV_ENC_PIC_STRUCT_FRAME,
             frameIdx: self.frame_idx,
             inputTimeStamp: self.frame_idx as u64,
@@ -414,5 +464,14 @@ impl Drop for Encoder {
                 f(self.enc);
             }
         }
+    }
+}
+
+fn buffer_format(order: crate::gpu::PixelOrder) -> nv::NV_ENC_BUFFER_FORMAT {
+    match order {
+        // A8R8G8B8 little-endian: B, G, R, A in memory.
+        crate::gpu::PixelOrder::Bgrx => nv::NV_ENC_BUFFER_FORMAT_ARGB,
+        // A8B8G8R8 little-endian: R, G, B, A in memory.
+        crate::gpu::PixelOrder::Rgba => nv::NV_ENC_BUFFER_FORMAT_ABGR,
     }
 }

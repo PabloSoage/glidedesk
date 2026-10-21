@@ -1,4 +1,5 @@
 mod capture;
+mod gpu;
 mod input;
 mod mutter;
 mod nvenc;
@@ -148,7 +149,15 @@ async fn encode_test(
     let conn = zbus::Connection::session().await?;
     let session = mutter::Session::start(&conn, mutter::CursorMode::Embedded).await?;
     let (tx, rx) = mpsc::sync_channel(1);
-    let cap = capture::Capture::start(session.node_id, w, h, tx)?;
+    let (cursor, _cursor_rx) = tokio::sync::watch::channel(None);
+    let ctx = cudarc::driver::CudaContext::new(gpu)?;
+    let cap = capture::Capture::start(
+        session.node_id,
+        w,
+        h,
+        capture::Sinks { frames: tx, cursor },
+        Some(std::sync::Arc::clone(&ctx)),
+    )?;
     let codec = if hevc {
         nvenc::Codec::Hevc
     } else {
@@ -156,7 +165,7 @@ async fn encode_test(
     };
     let worker = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut enc = nvenc::Encoder::new(
-            gpu,
+            ctx,
             nvenc::EncoderConfig {
                 codec,
                 width: w,
@@ -176,7 +185,12 @@ async fn encode_test(
                 enc.resize(f.width, f.height)?;
             }
             let t = Instant::now();
-            let e = enc.encode_host(&f.data, f.stride as usize)?;
+            let e = match &f.data {
+                capture::FrameData::Cpu { data, stride } => {
+                    enc.encode_host(data, *stride as usize)?
+                }
+                capture::FrameData::Gpu(buf) => enc.encode_device(buf)?,
+            };
             let us = t.elapsed().as_micros();
             total_us += us;
             max_us = max_us.max(us);
@@ -217,7 +231,14 @@ async fn capture_test(w: u32, h: u32, rw: u32, rh: u32, seconds: u64) -> Result<
     let session = mutter::Session::start(&conn, mutter::CursorMode::Metadata).await?;
     info!(node = session.node_id, "Virtual monitor stream ready");
     let (tx, rx) = mpsc::sync_channel(1);
-    let cap = capture::Capture::start(session.node_id, w, h, tx)?;
+    let (cursor, _cursor_rx) = tokio::sync::watch::channel(None);
+    let cap = capture::Capture::start(
+        session.node_id,
+        w,
+        h,
+        capture::Sinks { frames: tx, cursor },
+        None,
+    )?;
 
     let total = Duration::from_secs(seconds);
     let start = Instant::now();
@@ -236,7 +257,6 @@ async fn capture_test(w: u32, h: u32, rw: u32, rh: u32, seconds: u64) -> Result<
                     info!(
                         width = f.width,
                         height = f.height,
-                        stride = f.stride,
                         t_ms = start.elapsed().as_millis() as u64,
                         "Frame size"
                     );

@@ -1214,6 +1214,7 @@ dependencies = [
  "ironrdp-displaycontrol",
  "ironrdp-dvc",
  "ironrdp-egfx",
+ "ironrdp-pdu",
  "ironrdp-server",
  "ironrdp-svc",
  "libloading 0.9.0",

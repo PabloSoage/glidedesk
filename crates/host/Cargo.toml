@@ -25,3 +25,4 @@ ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e"
 ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
 ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
 ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
