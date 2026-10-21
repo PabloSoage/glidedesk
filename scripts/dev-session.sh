@@ -14,7 +14,10 @@ if [ "${1:-}" = "--app" ]; then app="$2"; shift 2; fi
 [ "${1:-}" = "--" ] && shift
 
 log="${XDG_RUNTIME_DIR:-/tmp}/glidedesk-shell.log"
-gnome-shell --headless --no-x11 >"$log" 2>&1 &
+# Full redraws: with clipped redraws the software cursor painted over the previous frame stays
+# in the parts of the framebuffer that are not repainted, and the zero-copy capture (a blit of
+# that framebuffer) would carry it although the client draws its own pointer.
+CLUTTER_PAINT="${CLUTTER_PAINT:-disable-clipped-redraws}" gnome-shell --headless --no-x11 >"$log" 2>&1 &
 shell=$!
 trap 'kill -9 $shell 2>/dev/null || true' EXIT INT TERM
 

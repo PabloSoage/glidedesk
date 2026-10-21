@@ -30,3 +30,4 @@ ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "57997
 ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
 libc = "0.2"
 ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

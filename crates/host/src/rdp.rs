@@ -556,8 +556,18 @@ fn tls_identity(dir: &Path) -> Result<TlsIdentityCtx> {
 
 pub async fn serve(opts: ServeOptions) -> Result<()> {
     let conn = zbus::Connection::session().await?;
-    let session = mutter::Session::start(&conn, mutter::CursorMode::Metadata).await?;
-    info!(node = session.node_id, "Virtual monitor ready");
+    // GLIDEDESK_CURSOR=hidden|embedded for experiments; metadata (client-drawn) by default.
+    let cursor_mode = match std::env::var("GLIDEDESK_CURSOR").as_deref() {
+        Ok("hidden") => mutter::CursorMode::Hidden,
+        Ok("embedded") => mutter::CursorMode::Embedded,
+        _ => mutter::CursorMode::Metadata,
+    };
+    let session = mutter::Session::start(&conn, cursor_mode).await?;
+    info!(
+        node = session.node_id,
+        ?cursor_mode,
+        "Virtual monitor ready"
+    );
     {
         let conn = conn.clone();
         tokio::spawn(async move { mutter::leave_startup_overview(&conn).await });

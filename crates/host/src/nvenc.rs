@@ -189,6 +189,9 @@ impl Encoder {
                         h.numRefL0 = nv::NV_ENC_NUM_REF_FRAMES_2;
                     }
                     let v = &mut h.h264VUIParameters;
+                    // Tell decoders there is no reordering (no B-frames): they can output each
+                    // frame as soon as it is decoded instead of holding one back.
+                    v.bitstreamRestrictionFlag = 1;
                     v.videoSignalTypePresentFlag = 1;
                     v.videoFormat = nv::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
                     v.videoFullRangeFlag = 1;

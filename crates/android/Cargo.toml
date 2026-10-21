@@ -1,0 +1,22 @@
+[package]
+name = "glidedesk-android"
+description = "JNI bridge of the glidedesk Android client: session, MediaCodec decoding into the app's Surface, input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "glidedesk_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+glidedesk-client = { path = "../client" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk = { version = "0.9", features = ["media", "api-level-29"] }
+tracing-subscriber = "0.3"
