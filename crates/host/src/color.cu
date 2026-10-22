@@ -5,11 +5,12 @@ __device__ __forceinline__ unsigned char clamp8(int v) {
     return (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
-// Full-range BT.709 (integer coefficients as in FreeRDP's primitives).
+// Full-range BT.709 in integer arithmetic. The luma weights add up to 256 (FreeRDP's 54, 183,
+// 18 add up to 255, which turns white into 254 and darkens every grey a little).
 __device__ __forceinline__ void yuv(const unsigned char* p, int order, int* y, int* u, int* v) {
     int r, g, b;
     if (order == 0) { b = p[0]; g = p[1]; r = p[2]; } else { r = p[0]; g = p[1]; b = p[2]; }
-    *y = clamp8((54 * r + 183 * g + 18 * b) >> 8);
+    *y = clamp8((54 * r + 183 * g + 19 * b) >> 8);
     *u = clamp8(((-29 * r - 99 * g + 128 * b) >> 8) + 128);
     *v = clamp8(((128 * r - 116 * g - 12 * b) >> 8) + 128);
 }

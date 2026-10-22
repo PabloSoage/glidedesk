@@ -31,3 +31,6 @@ ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e"
 libc = "0.2"
 ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rayon = "1"
+# Bindings to the system FFmpeg (libavcodec-dev): VA-API and software encoders.
+ffmpeg-sys-next = { version = "7", default-features = false, features = ["avcodec"] }

@@ -6,8 +6,8 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
   composited on the GPU, with no physical monitor, dummy plug or virtual display driver.
 - **The desktop follows the client window**: resize the window and the remote resolution
   changes, as with `mstsc`.
-- **Hardware video end to end**: NVENC H.264 (and HEVC for the low-latency client),
-  low-latency encoder settings, no B-frames, frames encoded as soon as the compositor
+- **Hardware video end to end**: NVENC on NVIDIA, VA-API on AMD and Intel (x264 on the CPU
+  when there is no usable GPU), low-latency encoder settings, no B-frames, frames encoded as soon as the compositor
   produces them.
 - **Standard clients**: the RDP front end speaks the graphics pipeline extension (H.264
   AVC420/AVC444), so the Windows Remote Desktop client (`mstsc`), Microsoft's Windows App on
@@ -24,6 +24,7 @@ GPU:
 | Virtual monitor capture over PipeWire (Mutter `RecordVirtual`) | works |
 | Live resize of the virtual monitor | works |
 | NVENC H.264 / HEVC encoding | works |
+| VA-API encoding (AMD, Intel; through FFmpeg), x264 fallback, `--encoder` | works (tested through Mesa d3d12 in WSL; not yet on AMD/Intel hardware) |
 | RDP front end (IronRDP, NLA, EGFX AVC420 and AVC444v2, Display Control, RDP-UDP) | works with `mstsc` and FreeRDP |
 | Client-side cursor (shape from Mutter, drawn by the client) | works |
 | Zero-copy capture: DMA-BUF → GL → CUDA → NVENC, colour conversion in CUDA | works |
@@ -35,10 +36,11 @@ GPU:
 
 ## Try the pieces
 
-On the machine with the GPU (Ubuntu 24.04, GNOME 46, NVIDIA driver 570+):
+On the machine with the GPU (Ubuntu 24.04, GNOME 46; NVIDIA driver 570+, or Mesa / Intel media
+VA-API drivers):
 
 ```sh
-sudo apt install libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang libegl-dev libgbm-dev
+sudo apt install libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang libegl-dev libgbm-dev \n  libavcodec-dev libavutil-dev
 cargo build --release
 # A private headless GNOME Shell on its own D-Bus session, plus a capture + encode test:
 scripts/dev-session.sh -- target/release/glidedesk-host capture-test
@@ -61,8 +63,8 @@ client (mstsc / Windows App / FreeRDP / Moonlight)
    v
 glidedesk-host (one process per session)
    +- RDP front end (IronRDP)
-   +- encode: NVENC, colour conversion in CUDA
-   +- capture: Mutter ScreenCast RecordVirtual -> PipeWire -> CUDA
+   +- encode: NVENC (colour conversion in CUDA), or VA-API / x264 through FFmpeg (on the CPU)
+   +- capture: Mutter ScreenCast RecordVirtual -> PipeWire -> CUDA (NVIDIA) or system memory
    +- input: Mutter RemoteDesktop
    +- session: gnome-shell --headless (Wayland, GPU rendering through GBM)
 ```

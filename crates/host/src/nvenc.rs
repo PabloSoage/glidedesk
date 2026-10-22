@@ -14,31 +14,7 @@ use cudarc::driver::{CudaContext, sys as cu};
 use nvenc_sys as nv;
 use tracing::{debug, info};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Codec {
-    H264,
-    Hevc,
-}
-
-#[derive(Clone, Debug)]
-pub struct EncoderConfig {
-    pub codec: Codec,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub bitrate: u32,
-    /// Reference frames for P-frames. AVC444 interleaves the two views in one sequence, so
-    /// each view needs the picture two back to reference its own previous frame.
-    pub refs: u32,
-}
-
-#[derive(Default)]
-pub struct EncodedFrame {
-    pub data: Vec<u8>,
-    pub keyframe: bool,
-    /// Average QP NVENC used for the picture.
-    pub qp: u32,
-}
+pub use crate::encoder::{Codec, EncodedFrame, EncoderConfig};
 
 struct Api {
     _lib: libloading::Library,
@@ -57,6 +33,11 @@ fn cu_check(r: cu::CUresult, what: &str) -> Result<()> {
         bail!("{what} failed: {r:?}");
     }
     Ok(())
+}
+
+/// Checks that the driver offers NVENC.
+pub fn probe() -> Result<()> {
+    Api::load().map(|_| ())
 }
 
 impl Api {

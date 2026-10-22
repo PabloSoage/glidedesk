@@ -25,13 +25,10 @@ use ironrdp_server::{
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
-use cudarc::driver::CudaContext;
-
 use crate::capture::{Capture, CursorEvent, Frame, FrameData, Sinks};
-use crate::color;
+use crate::encoder;
 use crate::input::InputForwarder;
 use crate::mutter;
-use crate::nvenc::{Codec, Encoder, EncoderConfig};
 
 pub struct ServeOptions {
     /// Use AVC444v2 (full chroma) when the client supports it.
@@ -44,6 +41,10 @@ pub struct ServeOptions {
     pub max_in_flight: u32,
     pub bind: SocketAddr,
     pub gpu: usize,
+    /// Video encoder (NVENC, VA-API or software).
+    pub encoder: encoder::Choice,
+    /// DRM render node for VA-API; the first one when `None`.
+    pub render_node: Option<String>,
     pub bitrate: u32,
     pub fps: u32,
     pub width: u32,
@@ -225,21 +226,11 @@ impl RdpServerDisplay for Display {
 // ---------------------------------------------------------------------------------------
 // Pipeline
 
-/// The H.264 encoder of one connection (both AVC444 views go through it).
-struct Encoders {
-    encoder: Encoder,
-    avc444: bool,
-    size: (u32, u32),
-}
-
 struct Pipeline {
     shared: Arc<Shared>,
     capture: Capture,
     frames: crate::capture::FrameReceiver,
-    encoders: Option<Encoders>,
-    converter: color::Converter,
-    /// Device buffers for frames that arrive in system memory.
-    upload: crate::gpu::Pool,
+    backend: Box<dyn encoder::Backend>,
     /// Send AVC444v2 (4:4:4) when the client supports it.
     avc444: bool,
     /// H-002: luma-only frames while things move, chroma once still.
@@ -247,9 +238,6 @@ struct Pipeline {
     refine: bool,
     /// Frames sent and not yet acknowledged; beyond this the newest frame waits.
     max_in_flight: u32,
-    ctx: Arc<CudaContext>,
-    bitrate: u32,
-    fps: u32,
     generation: u64,
     surface: Option<(u16, u32, u32)>,
     last_frame: Option<Frame>,
@@ -393,9 +381,7 @@ impl Pipeline {
                 g.map_surface_to_output(id, 0, 0);
                 self.surface = Some((id, w, h));
                 self.need_full = true;
-                if let Some(e) = self.encoders.as_mut() {
-                    e.encoder.request_keyframe();
-                }
+                self.backend.request_keyframe();
                 info!(w, h, surface = id, "EGFX surface ready");
             }
             if g.should_backpressure() {
@@ -407,36 +393,8 @@ impl Pipeline {
             }
         }
 
-        let avc444 = self.avc444 && gfx.lock().unwrap().supports_avc444();
-        // Pixels on the GPU; frames from system memory are uploaded first.
-        let src = match &frame.data {
-            FrameData::Gpu(b) => Arc::clone(b),
-            FrameData::Cpu { data, stride } => {
-                crate::gpu::upload(&mut self.upload, data, *stride as usize, w, h)?
-            }
-        };
-        let (cw, ch) = color::coded_size(w, h);
-        if self
-            .encoders
-            .as_ref()
-            .is_none_or(|e| e.size != (cw, ch) || e.avc444 != avc444)
-        {
-            let cfg = EncoderConfig {
-                codec: Codec::H264,
-                width: cw,
-                height: ch,
-                // AVC444 sends two pictures per frame.
-                fps: if avc444 { self.fps * 2 } else { self.fps },
-                bitrate: self.bitrate,
-                refs: if avc444 { 2 } else { 1 },
-            };
-            self.encoders = Some(Encoders {
-                encoder: Encoder::new(Arc::clone(&self.ctx), cfg)?,
-                avc444,
-                size: (cw, ch),
-            });
-            info!(w, h, cw, ch, avc444, "Encoder ready");
-        }
+        let avc444 =
+            self.avc444 && self.backend.supports_avc444() && gfx.lock().unwrap().supports_avc444();
         // Which AVC444 views this frame carries (H-002): luma-only while things move,
         // chroma-only once still, both otherwise. The first frame on a surface has both.
         let mode = if !avc444 || self.need_full {
@@ -444,23 +402,16 @@ impl Pipeline {
         } else {
             mode
         };
-        let encoders = self.encoders.as_mut().expect("created above");
-        encoders.encoder.set_const_qp(self.refine_qp)?;
         let t = Instant::now();
-        let (main, aux) = self
-            .converter
-            .convert(&src, avc444 && mode != Mode::LumaOnly)?;
-        // Both views go through the same encoder as consecutive pictures: clients decode
-        // AVC444 with a single H.264 decoder (FreeRDP does; so does its server).
-        let out_main = if mode == Mode::ChromaOnly {
-            Default::default()
-        } else {
-            encoders.encoder.encode_nv12(main)?
-        };
-        let out_aux = match aux {
-            Some(aux) => encoders.encoder.encode_nv12(aux)?,
-            None => Default::default(),
-        };
+        let (out_main, out_aux) = self.backend.encode(
+            frame,
+            &encoder::Request {
+                avc444,
+                main: mode != Mode::ChromaOnly,
+                aux: avc444 && mode != Mode::LumaOnly,
+                const_qp: self.refine_qp,
+            },
+        )?;
         let encode_us = t.elapsed().as_micros();
         debug!(
             bytes = out_main.data.len(),
@@ -617,7 +568,14 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let shared = Arc::new(Shared::default());
     *shared.current_size.lock().unwrap() = clamp_size(opts.width, opts.height);
     let (w, h) = *shared.current_size.lock().unwrap();
-    let ctx = CudaContext::new(opts.gpu).context("creating the CUDA context")?;
+    let (backend, cuda) = encoder::select(
+        opts.encoder,
+        opts.gpu,
+        opts.render_node.clone(),
+        opts.fps,
+        opts.bitrate,
+    )?;
+    info!(encoder = backend.name(), "Video encoder");
     let (tx, rx) = crate::capture::latest_frame();
     let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
     let capture = Capture::start(
@@ -628,23 +586,18 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             frames: tx,
             cursor: cursor_tx,
         },
-        Some(Arc::clone(&ctx)),
+        cuda,
     )?;
 
     let pipeline = Pipeline {
         shared: Arc::clone(&shared),
         capture,
         frames: rx,
-        encoders: None,
-        converter: color::Converter::new(Arc::clone(&ctx))?,
-        upload: crate::gpu::Pool::new(Arc::clone(&ctx)),
+        backend,
         avc444: opts.avc444,
         hybrid: opts.hybrid,
         refine: opts.refine,
         max_in_flight: opts.max_in_flight,
-        ctx: Arc::clone(&ctx),
-        bitrate: opts.bitrate,
-        fps: opts.fps,
         generation: 0,
         surface: None,
         last_frame: None,

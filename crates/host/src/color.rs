@@ -1,7 +1,7 @@
 //! RGB → YUV on the GPU for the RDP H.264 codecs.
 //!
-//! RDP clients rebuild RGB with full-range BT.709 (MS-RDPEGFX; FreeRDP uses the same
-//! integer coefficients as below), so the conversion is done here rather than by NVENC
+//! RDP clients rebuild RGB with full-range BT.709 (MS-RDPEGFX), so the conversion (integer
+//! coefficients, see color.cu) is done here rather than by NVENC
 //! (whose own conversion is limited range). One kernel thread handles a 2×2 block and writes:
 //!
 //! - the main view, an NV12 frame (full luma, chroma averaged over the block): AVC420, and

@@ -2,6 +2,9 @@ mod audio;
 mod capture;
 mod clipboard;
 mod color;
+mod csc;
+mod encoder;
+mod ffenc;
 mod gpu;
 mod input;
 mod mutter;
@@ -32,8 +35,15 @@ enum Command {
         refresh: u32,
         #[arg(long, default_value = "0.0.0.0:3389")]
         bind: std::net::SocketAddr,
+        /// CUDA device index (NVENC).
         #[arg(long, default_value_t = 0)]
         gpu: usize,
+        /// Video encoder: NVENC (NVIDIA), VA-API (AMD, Intel, others) or software (x264).
+        #[arg(long, value_enum, env = "GLIDEDESK_ENCODER", default_value = "auto")]
+        encoder: encoder::Choice,
+        /// DRM render node for VA-API (default: the first /dev/dri/renderD*).
+        #[arg(long, env = "GLIDEDESK_RENDER_NODE")]
+        render_node: Option<String>,
         /// Video bitrate in bits per second.
         #[arg(long, default_value_t = 30_000_000)]
         bitrate: u32,
@@ -111,6 +121,8 @@ async fn main() -> Result<()> {
             refresh,
             bind,
             gpu,
+            encoder,
+            render_node,
             bitrate,
             fps,
             width,
@@ -137,6 +149,8 @@ async fn main() -> Result<()> {
                 max_in_flight,
                 bind,
                 gpu,
+                encoder,
+                render_node,
                 bitrate,
                 fps: fps.max(refresh),
                 width,
