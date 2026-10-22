@@ -23,3 +23,4 @@ wgpu = "30"
 pollster = "1"
 openh264 = "0.9"
 cpal = "0.18"
+arboard = { version = "3", default-features = false }

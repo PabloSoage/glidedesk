@@ -66,6 +66,8 @@ struct Parts {
     input: Box<dyn InputBackend>,
     audio: Option<broadcast::Sender<Vec<u8>>>,
     clipboard: Option<Box<dyn ironrdp_server::CliprdrServerFactory>>,
+    /// The same clipboard for the native front end.
+    text_clipboard: Option<Arc<dyn crate::native::TextClipboard>>,
     /// Size the session starts with.
     size: (u32, u32),
     /// Run when the server stops.
@@ -118,6 +120,8 @@ async fn gnome(
         }
     };
     let remote = session.remote.clone();
+    let clipboard = crate::clipboard::ClipboardFactory::spawn(session.remote.clone());
+    let hub = clipboard.hub();
     Ok(Parts {
         source: Box::new(capture),
         frames: rx,
@@ -127,9 +131,8 @@ async fn gnome(
             stream_path: session.stream_path.clone(),
         }),
         audio,
-        clipboard: Some(Box::new(crate::clipboard::ClipboardFactory::spawn(
-            session.remote.clone(),
-        ))),
+        clipboard: Some(Box::new(clipboard)),
+        text_clipboard: Some(Arc::new(hub)),
         size: (w, h),
         stop: Some(Box::pin(async move {
             remote.stop().await.ok();
@@ -150,6 +153,7 @@ fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
             .map_err(|e| warn!(%e, "No audio"))
             .ok(),
         clipboard: None,
+        text_clipboard: None,
         stop: None,
     })
 }
@@ -224,6 +228,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                         cursor: parts.cursor.clone(),
                         audio: parts.audio.clone(),
                         input: input.clone(),
+                        clipboard: parts.text_clipboard.clone(),
                     })
                     .await
             }

@@ -27,6 +27,8 @@ pub enum Event {
     /// A new picture is in the slot.
     Picture,
     Cursor(glidedesk_proto::Cursor),
+    /// Text copied in the session.
+    Clipboard(String),
     Ended(String),
 }
 
@@ -62,6 +64,10 @@ impl VideoSink for Sink {
         if let Some(a) = &self.audio {
             a.push(pcm);
         }
+    }
+
+    fn clipboard(&mut self, text: &str) {
+        (self.notify)(Event::Clipboard(text.to_owned()));
     }
 }
 

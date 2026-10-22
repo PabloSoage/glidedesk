@@ -31,6 +31,8 @@ pub trait VideoSink: Send {
     fn cursor(&mut self, _cursor: &glidedesk_proto::Cursor) {}
     /// Session audio: PCM S16LE 48 kHz stereo (native protocol).
     fn audio(&mut self, _pcm: &[u8]) {}
+    /// Text copied in the session (native protocol).
+    fn clipboard(&mut self, _text: &str) {}
 }
 
 pub type SharedSink = Arc<Mutex<dyn VideoSink>>;

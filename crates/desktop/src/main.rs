@@ -5,6 +5,7 @@
 //! sent as scan codes, session audio plays on the default output.
 
 mod audio;
+mod clip;
 mod keymap;
 mod render;
 mod video;
@@ -71,6 +72,7 @@ struct App {
     pending_resize: Option<(PhysicalSize<u32>, Instant)>,
     pressed: HashSet<(u8, bool)>,
     cursor: Option<CustomCursor>,
+    clipboard: Option<clip::Clipboard>,
     _audio: Option<cpal::Stream>,
     runtime: tokio::runtime::Runtime,
     stats: (u32, Duration, Instant),
@@ -108,6 +110,9 @@ impl App {
             player,
         )));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if !self.args.rdp {
+            self.clipboard = Some(clip::Clipboard::start(tx.clone()));
+        }
         self.input = Some(tx);
         let a = self.args.clone();
         let (w, h) = (size.width.max(200) & !1, size.height.max(200) & !1);
@@ -250,6 +255,11 @@ impl ApplicationHandler<Event> for App {
                     }
                 }
             }
+            Event::Clipboard(text) => {
+                if let Some(c) = &self.clipboard {
+                    c.remote(text);
+                }
+            }
             Event::Ended(reason) => {
                 eprintln!("{reason}");
                 el.exit();
@@ -377,6 +387,7 @@ fn main() -> Result<()> {
         pending_resize: None,
         pressed: HashSet::new(),
         cursor: None,
+        clipboard: None,
         _audio: None,
         runtime: tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

@@ -1,4 +1,4 @@
-//! Clipboard between the RDP client and the GNOME session (text).
+//! Clipboard between the clients (RDP and native) and the GNOME session (text).
 //!
 //! IronRDP's CLIPRDR callbacks are synchronous; they post to a task that talks to Mutter's
 //! remote desktop clipboard API (`EnableClipboard`, `SetSelection`, `SelectionRead`,
@@ -9,6 +9,9 @@
 //!   data request → `SelectionRead` → `CF_UNICODETEXT`.
 //! - Client → GNOME: the client's format list → `SetSelection`; a GNOME app pasting →
 //!   `SelectionTransfer` → data request to the client → `SelectionWrite`.
+//!
+//! Native clients get GNOME's text as soon as it is copied (read eagerly, it is small) and
+//! send theirs the same way; the bridge keeps it to answer pastes in GNOME.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -45,6 +48,23 @@ enum FromClient {
     DataRequest(ClipboardFormatId),
     /// The client's answer to our paste request.
     Data(Option<String>),
+    /// A native client copied this text.
+    NativeText(String),
+}
+
+/// The native front end's side of the clipboard.
+#[derive(Clone)]
+pub struct ClipboardHub {
+    to_bridge: mpsc::UnboundedSender<FromClient>,
+    /// Text copied in GNOME.
+    pub from_session: tokio::sync::broadcast::Sender<String>,
+}
+
+impl ClipboardHub {
+    /// A native client copied `text`.
+    pub fn set(&self, text: String) {
+        let _ = self.to_bridge.send(FromClient::NativeText(text));
+    }
 }
 
 type Events = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ServerEvent>>>>;
@@ -52,6 +72,7 @@ type Events = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ServerEvent>>>
 pub struct ClipboardFactory {
     events: Events,
     to_bridge: mpsc::UnboundedSender<FromClient>,
+    from_session: tokio::sync::broadcast::Sender<String>,
 }
 
 impl ClipboardFactory {
@@ -59,10 +80,25 @@ impl ClipboardFactory {
     pub fn spawn(remote: RemoteDesktopSessionProxy<'static>) -> Self {
         let events: Events = Arc::default();
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(bridge(remote, rx, Arc::clone(&events)));
+        let (from_session, _) = tokio::sync::broadcast::channel(4);
+        tokio::spawn(bridge(
+            remote,
+            rx,
+            Arc::clone(&events),
+            from_session.clone(),
+        ));
         Self {
             events,
             to_bridge: tx,
+            from_session,
+        }
+    }
+
+    /// The same clipboard for the native front end.
+    pub fn hub(&self) -> ClipboardHub {
+        ClipboardHub {
+            to_bridge: self.to_bridge.clone(),
+            from_session: self.from_session.clone(),
         }
     }
 }
@@ -163,6 +199,7 @@ async fn bridge(
     remote: RemoteDesktopSessionProxy<'static>,
     mut from_client: mpsc::UnboundedReceiver<FromClient>,
     events: Events,
+    to_native: tokio::sync::broadcast::Sender<String>,
 ) {
     if let Err(e) = remote.enable_clipboard(HashMap::new()).await {
         warn!(%e, "EnableClipboard failed; no clipboard");
@@ -180,6 +217,8 @@ async fn bridge(
     let mut waiting: Vec<u32> = Vec::new();
     // The MIME type GNOME's current clipboard offers text in.
     let mut gnome_text_mime: Option<String> = None;
+    // Text a native client copied, to answer GNOME pastes without a round trip.
+    let mut native_text: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -196,6 +235,13 @@ async fn bridge(
                     continue;
                 }
                 gnome_text_mime = TEXT_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m)).map(|m| m.to_string());
+                native_text = None;
+                if let Some(mime) = gnome_text_mime.clone()
+                    && to_native.receiver_count() > 0
+                    && let Some(t) = read_selection(&remote, &mime).await
+                {
+                    let _ = to_native.send(t);
+                }
                 if gnome_text_mime.is_some() {
                     debug!(mime = ?gnome_text_mime, "Offering GNOME text to the client");
                     send(&events, ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]));
@@ -203,7 +249,10 @@ async fn bridge(
             }
             Some(sig) = transfers.next() => {
                 let Ok(args) = sig.args() else { continue };
-                if TEXT_MIMES.contains(&args.mime_type.as_str()) {
+                if let (true, Some(t)) = (TEXT_MIMES.contains(&args.mime_type.as_str()), &native_text) {
+                    let ok = write_selection(&remote, args.serial, t).await;
+                    let _ = remote.selection_write_done(args.serial, ok).await;
+                } else if TEXT_MIMES.contains(&args.mime_type.as_str()) {
                     waiting.push(args.serial);
                     send(&events, ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT));
                 } else {
@@ -212,6 +261,7 @@ async fn bridge(
             }
             Some(msg) = from_client.recv() => match msg {
                 FromClient::Copied { text } => {
+                    native_text = None;
                     // Only text for now; Mutter rejects an empty list.
                     if !text {
                         continue;
@@ -232,6 +282,14 @@ async fn bridge(
                         None => FormatDataResponse::new_error(),
                     };
                     send(&events, ClipboardMessage::SendFormatData(response.into_owned()));
+                }
+                FromClient::NativeText(text) => {
+                    native_text = Some(text);
+                    let mimes: Vec<&str> = TEXT_MIMES.to_vec();
+                    let opts = HashMap::from([("mime-types", Value::from(mimes))]);
+                    if let Err(e) = remote.set_selection(opts).await {
+                        warn!(%e, "SetSelection failed");
+                    }
                 }
                 FromClient::Data(text) => {
                     for serial in waiting.drain(..) {
@@ -299,4 +357,14 @@ async fn write_selection(
     tokio::task::spawn_blocking(move || std::fs::File::from(fd).write_all(&bytes).is_ok())
         .await
         .unwrap_or(false)
+}
+
+impl crate::native::TextClipboard for ClipboardHub {
+    fn set(&self, text: String) {
+        ClipboardHub::set(self, text);
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.from_session.subscribe()
+    }
 }

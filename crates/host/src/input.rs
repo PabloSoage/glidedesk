@@ -65,7 +65,7 @@ impl InputBackend for MutterInput {
 
     async fn apply(&self, ev: &Input) -> anyhow::Result<()> {
         let r = &self.remote;
-        Ok(match *ev {
+        match *ev {
             Input::Key(code, down) => r.notify_keyboard_keycode(code, down).await?,
             Input::Keysym(sym, down) => r.notify_keyboard_keysym(sym, down).await?,
             Input::Motion(x, y) => {
@@ -74,7 +74,8 @@ impl InputBackend for MutterInput {
             }
             Input::Button(b, down) => r.notify_pointer_button(b, down).await?,
             Input::Scroll { axis, steps } => r.notify_pointer_axis_discrete(axis, steps).await?,
-        })
+        }
+        Ok(())
     }
 }
 

@@ -145,6 +145,14 @@ impl Output for NativeOutput {
     }
 }
 
+/// Text clipboard of the session, as the native front end uses it.
+pub trait TextClipboard: Send + Sync {
+    /// The client copied `text`.
+    fn set(&self, text: String);
+    /// Text copied in the session.
+    fn subscribe(&self) -> broadcast::Receiver<String>;
+}
+
 // ---------------------------------------------------------------------------------------
 // Server
 
@@ -158,6 +166,7 @@ pub struct Front {
     pub cursor: watch::Receiver<Option<CursorEvent>>,
     pub audio: Option<broadcast::Sender<Vec<u8>>>,
     pub input: InputForwarder,
+    pub clipboard: Option<Arc<dyn TextClipboard>>,
 }
 
 pub struct Server {
@@ -404,10 +413,16 @@ where
     // Outgoing: queued messages and cursor changes.
     let mut cursor = front.cursor.clone();
     cursor.mark_changed();
+    let mut clip = front.clipboard.as_ref().map(|c| c.subscribe());
     let writer = tokio::spawn(async move {
         loop {
             let msg = tokio::select! {
                 m = ctl_rx.recv() => match m { Some(m) => m, None => break },
+                t = async { match clip.as_mut() { Some(c) => c.recv().await, None => std::future::pending().await } } => match t {
+                    Ok(text) => ServerMsg::Clipboard(text),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => { clip = None; continue }
+                },
                 c = cursor.changed() => {
                     if c.is_err() { break }
                     // The watch guard must not live across the write below.
@@ -458,8 +473,10 @@ where
             ClientMsg::Ping { t_us } => {
                 let _ = ctl_tx.send(ServerMsg::Pong { t_us });
             }
-            ClientMsg::Clipboard(_) => {
-                // TODO: through the clipboard bridge, as for RDP.
+            ClientMsg::Clipboard(text) => {
+                if let Some(c) = &front.clipboard {
+                    c.set(text);
+                }
             }
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
         }

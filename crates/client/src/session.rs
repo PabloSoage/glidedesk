@@ -58,6 +58,8 @@ pub enum Input {
         height: u32,
     },
     Disconnect,
+    /// Text copied on the client (native protocol; RDP clients use CLIPRDR).
+    Clipboard(String),
 }
 
 /// NLA with NTLM does not need network access beyond the RDP connection.
@@ -285,7 +287,7 @@ fn operations(ev: Input) -> Vec<Operation> {
         } else {
             Operation::UnicodeKeyReleased(ch)
         }],
-        Input::Resize { .. } | Input::Disconnect => Vec::new(),
+        Input::Resize { .. } | Input::Disconnect | Input::Clipboard(_) => Vec::new(),
     }
 }
 

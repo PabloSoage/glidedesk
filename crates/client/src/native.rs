@@ -139,6 +139,7 @@ fn input_event(i: Input) -> Option<ClientMsg> {
             width: width.min(u32::from(u16::MAX)) as u16,
             height: height.min(u32::from(u16::MAX)) as u16,
         },
+        Input::Clipboard(text) => ClientMsg::Clipboard(text),
         Input::Disconnect => return None,
     })
 }
@@ -360,7 +361,7 @@ pub async fn run(
                 Ok(ServerMsg::Pong { t_us }) => {
                     debug!(rtt_us = now_us().saturating_sub(t_us), "Pong");
                 }
-                Ok(ServerMsg::Clipboard(_)) => {}
+                Ok(ServerMsg::Clipboard(text)) => sink.lock().unwrap().clipboard(&text),
                 Ok(other) => warn!(?other, "Unexpected message"),
                 Err(e) => break Err(anyhow::Error::from(e).context("control channel")),
             },
