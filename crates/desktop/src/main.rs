@@ -4,9 +4,13 @@
 //! follows the window size, the pointer is the local one with the remote shape, keys are
 //! sent as scan codes, session audio plays on the default output.
 
+// A window program: no console next to it. The log goes to a file (`platform::log_path`).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod audio;
 mod clip;
 mod keymap;
+mod platform;
 mod render;
 mod video;
 
@@ -37,10 +41,11 @@ const ICON: &[u8] = include_bytes!("../../../assets/logo/glidedesk-64.rgba");
 struct Args {
     /// Server host name or address.
     host: String,
+    /// Without a password, the saved credentials or the Windows sign-in dialog are used.
     #[arg(long)]
-    user: String,
+    user: Option<String>,
     #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
-    password: String,
+    password: Option<String>,
     /// Default 3391 (native) or 3389 (RDP).
     #[arg(long)]
     port: Option<u16>,
@@ -79,6 +84,8 @@ struct App {
     _audio: Option<cpal::Stream>,
     runtime: tokio::runtime::Runtime,
     stats: (u32, Duration, Instant),
+    /// The user closed the window: the session's end is no error.
+    closing: bool,
 }
 
 impl App {
@@ -131,8 +138,8 @@ impl App {
                 let opts = glidedesk_client::session::ConnectOptions {
                     host: a.host,
                     port: a.port.unwrap_or(3389),
-                    username: a.user,
-                    password: a.password,
+                    username: a.user.unwrap_or_default(),
+                    password: a.password.unwrap_or_default(),
                     width: w as u16,
                     height: h as u16,
                 };
@@ -141,8 +148,8 @@ impl App {
                 let opts = glidedesk_client::native::NativeOptions {
                     host: a.host,
                     port: a.port.unwrap_or(glidedesk_proto::DEFAULT_PORT),
-                    username: a.user,
-                    password: a.password,
+                    username: a.user.unwrap_or_default(),
+                    password: a.password.unwrap_or_default(),
                     width: w as u16,
                     height: h as u16,
                     codecs: vec![VideoCodec::H264],
@@ -194,17 +201,23 @@ impl ApplicationHandler<Event> for App {
             .with_title(format!("glidedesk - {}", self.args.host))
             .with_window_icon(Icon::from_rgba(ICON.to_vec(), 64, 64).ok())
             .with_inner_size(PhysicalSize::new(self.args.width, self.args.height));
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_taskbar_icon(Icon::from_rgba(ICON.to_vec(), 64, 64).ok());
+        }
         if self.args.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
-                eprintln!("creating the window: {e}");
+                platform::show_error(&format!("Creating the window: {e}"));
                 el.exit();
                 return;
             }
         };
+        platform::add_menu(&window, self.proxy.clone());
         let instance = self.instance.get_or_insert_with(|| {
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
                 Box::new(el.owned_display_handle()),
@@ -213,7 +226,7 @@ impl ApplicationHandler<Event> for App {
         match render::Renderer::new(instance, Arc::clone(&window)) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
-                eprintln!("graphics: {e:#}");
+                platform::show_error(&format!("Graphics: {e:#}"));
                 el.exit();
                 return;
             }
@@ -272,15 +285,30 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             Event::Ended(reason) => {
-                eprintln!("{reason}");
+                if reason.contains("wrong user name or password") {
+                    platform::forget_credentials(&self.args.host);
+                }
+                if self.closing {
+                    info!("{reason}");
+                } else {
+                    platform::show_error(&reason);
+                }
                 el.exit();
             }
+            Event::ToggleFullscreen => {
+                if let Some(win) = &self.window {
+                    let full = win.fullscreen().is_some();
+                    win.set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
+                }
+            }
+            Event::ShowLog => platform::open_log(),
         }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                self.closing = true;
                 self.send(Input::Disconnect);
                 el.exit();
             }
@@ -379,12 +407,31 @@ impl ApplicationHandler<Event> for App {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-    let args = Args::parse();
+    platform::init_logging();
+    let args = match Args::try_parse() {
+        Ok(a) => a,
+        // Help, version and usage errors: in a dialog, as there is no console on Windows.
+        Err(e) if !e.use_stderr() => {
+            #[cfg(windows)]
+            platform::show_message(&e.to_string());
+            e.exit()
+        }
+        Err(e) => {
+            platform::show_error(&e.to_string());
+            e.exit()
+        }
+    };
+    let mut args = args;
+    if args.password.is_none() {
+        let Some((user, password)) = platform::credentials(&args.host, args.user.as_deref()) else {
+            if !cfg!(windows) {
+                platform::show_error("--user and --password (or GLIDEDESK_PASSWORD) are needed");
+            }
+            return Ok(());
+        };
+        args.user = Some(user);
+        args.password = Some(password);
+    }
     let event_loop = EventLoop::<Event>::with_user_event().build()?;
     let mut app = App {
         args,
@@ -405,6 +452,7 @@ fn main() -> Result<()> {
             .enable_all()
             .build()?,
         stats: (0, Duration::ZERO, Instant::now()),
+        closing: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

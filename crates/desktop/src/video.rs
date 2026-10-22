@@ -30,6 +30,9 @@ pub enum Event {
     /// Text copied in the session.
     Clipboard(String),
     Ended(String),
+    /// Window menu entries (Windows).
+    ToggleFullscreen,
+    ShowLog,
 }
 
 pub type Notify = Arc<dyn Fn(Event) + Send + Sync>;

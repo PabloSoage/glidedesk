@@ -110,8 +110,6 @@ struct StreamState {
     format: spa::param::video::VideoInfoRaw,
     sinks: Sinks,
     dropped: u64,
-    /// Last cursor id seen, to send each image once.
-    cursor_id: u32,
     /// DMA-BUF import, when a GPU was given and the modifiers could be queried.
     gpu: Option<(DmabufImporter, Pool)>,
     /// The negotiated format carries a modifier: buffers are DMA-BUFs.
@@ -362,7 +360,6 @@ fn run(
         format: Default::default(),
         sinks,
         dropped: 0,
-        cursor_id: 0,
         gpu,
         dmabuf: false,
         copy_errors: 0,
@@ -422,13 +419,20 @@ fn run(
                 return;
             };
 
+            // Mutter gives every sprite the same id and attaches a bitmap only when the
+            // image changed (an empty one while no pointer is on the monitor), so every
+            // bitmap is news; repeats are filtered by content.
             if let Some(cursor) = buffer.find_meta::<MetaCursor>()
                 && cursor.is_valid()
-                && cursor.id() != st.cursor_id
                 && let Some(ev) = cursor_shape(cursor)
             {
-                st.cursor_id = cursor.id();
-                st.sinks.cursor.send_replace(Some(ev));
+                st.sinks.cursor.send_if_modified(|cur| {
+                    if cur.as_ref() == Some(&ev) {
+                        return false;
+                    }
+                    *cur = Some(ev);
+                    true
+                });
             }
             let damage = buffer.find_meta::<MetaVideoDamage>().map(|d| {
                 d.iter()

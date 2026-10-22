@@ -35,7 +35,7 @@ pub struct Frame {
 }
 
 /// A cursor image, BGRA with rows bottom-up (the RDP pointer layout), straight alpha.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorShape {
     pub width: u16,
     pub height: u16,
@@ -44,7 +44,7 @@ pub struct CursorShape {
     pub bgra_bottom_up: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CursorEvent {
     Shape(CursorShape),
     Hidden,
