@@ -13,6 +13,8 @@ mod csc;
 mod encoder;
 mod ffenc;
 mod frame;
+#[cfg(feature = "gnome")]
+mod gnome;
 mod gpu;
 mod input;
 #[cfg(feature = "gnome")]
@@ -271,7 +273,10 @@ async fn encode_test(
         session.node_id,
         w,
         h,
-        capture::Sinks { frames: tx, cursor },
+        capture::Sinks {
+            frames: tx,
+            cursor: std::sync::Arc::new(cursor),
+        },
         Some(std::sync::Arc::clone(&ctx)),
     )?;
     let codec = if hevc {
@@ -354,7 +359,10 @@ async fn capture_test(w: u32, h: u32, rw: u32, rh: u32, seconds: u64) -> Result<
         session.node_id,
         w,
         h,
-        capture::Sinks { frames: tx, cursor },
+        capture::Sinks {
+            frames: tx,
+            cursor: std::sync::Arc::new(cursor),
+        },
         None,
     )?;
 

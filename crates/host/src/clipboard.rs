@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use zbus::{OwnedVariant as OwnedValue, Variant as Value};
 
-use crate::mutter::RemoteDesktopSessionProxy;
+use crate::mutter::{LiveRx, RemoteDesktopSessionProxy};
 
 /// MIME types offered to GNOME for client text, preferred first.
 const TEXT_MIMES: &[&str] = &[
@@ -76,17 +76,23 @@ pub struct ClipboardFactory {
 }
 
 impl ClipboardFactory {
-    /// Starts the bridge task on the session and returns the factory for IronRDP.
-    pub fn spawn(remote: RemoteDesktopSessionProxy<'static>) -> Self {
+    /// Starts the bridge task on the current session (and each one replacing it) and
+    /// returns the factory for IronRDP.
+    pub fn spawn(mut live: LiveRx) -> Self {
         let events: Events = Arc::default();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let (from_session, _) = tokio::sync::broadcast::channel(4);
-        tokio::spawn(bridge(
-            remote,
-            rx,
-            Arc::clone(&events),
-            from_session.clone(),
-        ));
+        let (ev, to_native) = (Arc::clone(&events), from_session.clone());
+        tokio::spawn(async move {
+            loop {
+                let remote = live.borrow_and_update().remote.clone();
+                tokio::select! {
+                    // The session's signals ended: wait for the next session.
+                    () = bridge(remote, &mut rx, &ev, &to_native) => if live.changed().await.is_err() { return },
+                    changed = live.changed() => if changed.is_err() { return },
+                }
+            }
+        });
         Self {
             events,
             to_bridge: tx,
@@ -195,22 +201,24 @@ fn mime_list(options: &HashMap<String, OwnedValue>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Bridges the clipboard of one remote desktop session; returns when its signals end. A
+/// session that fails to enable it waits for the next one.
 async fn bridge(
     remote: RemoteDesktopSessionProxy<'static>,
-    mut from_client: mpsc::UnboundedReceiver<FromClient>,
-    events: Events,
-    to_native: tokio::sync::broadcast::Sender<String>,
+    from_client: &mut mpsc::UnboundedReceiver<FromClient>,
+    events: &Events,
+    to_native: &tokio::sync::broadcast::Sender<String>,
 ) {
     if let Err(e) = remote.enable_clipboard(HashMap::new()).await {
         warn!(%e, "EnableClipboard failed; no clipboard");
-        return;
+        return std::future::pending().await;
     }
     let (Ok(mut owner_changed), Ok(mut transfers)) = (
         remote.receive_selection_owner_changed().await,
         remote.receive_selection_transfer().await,
     ) else {
         warn!("Could not subscribe to the clipboard signals");
-        return;
+        return std::future::pending().await;
     };
     info!("Clipboard enabled");
     // GNOME pastes waiting for the client's text: Mutter serials.
@@ -244,7 +252,7 @@ async fn bridge(
                 }
                 if gnome_text_mime.is_some() {
                     debug!(mime = ?gnome_text_mime, "Offering GNOME text to the client");
-                    send(&events, ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]));
+                    send(events, ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]));
                 }
             }
             Some(sig) = transfers.next() => {
@@ -254,7 +262,7 @@ async fn bridge(
                     let _ = remote.selection_write_done(args.serial, ok).await;
                 } else if TEXT_MIMES.contains(&args.mime_type.as_str()) {
                     waiting.push(args.serial);
-                    send(&events, ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT));
+                    send(events, ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT));
                 } else {
                     let _ = remote.selection_write_done(args.serial, false).await;
                 }
@@ -281,7 +289,7 @@ async fn bridge(
                         Some(t) => FormatDataResponse::new_unicode_string(&t),
                         None => FormatDataResponse::new_error(),
                     };
-                    send(&events, ClipboardMessage::SendFormatData(response.into_owned()));
+                    send(events, ClipboardMessage::SendFormatData(response.into_owned()));
                 }
                 FromClient::NativeText(text) => {
                     native_text = Some(text);

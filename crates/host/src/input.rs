@@ -40,38 +40,55 @@ pub trait InputBackend: Send + Sync + 'static {
     async fn apply(&self, ev: &Input) -> anyhow::Result<()>;
 }
 
-/// Mutter's RemoteDesktop session.
+/// Mutter's RemoteDesktop session: whichever is current (it is replaced when Mutter closes
+/// one, see `gnome`).
 #[cfg(feature = "gnome")]
 pub struct MutterInput {
-    pub remote: crate::mutter::RemoteDesktopSessionProxy<'static>,
-    pub stream_path: String,
+    pub live: crate::mutter::LiveRx,
+    /// Stream of the session whose first key was spent (see `prime`).
+    pub primed: tokio::sync::Mutex<String>,
+}
+
+#[cfg(feature = "gnome")]
+impl MutterInput {
+    pub fn new(live: crate::mutter::LiveRx) -> Self {
+        Self {
+            live,
+            primed: Default::default(),
+        }
+    }
+
+    /// The current session; on a session not used yet, its first key event first.
+    async fn session(&self) -> (crate::mutter::RemoteDesktopSessionProxy<'static>, String) {
+        let (remote, path) = {
+            let l = self.live.borrow();
+            (l.remote.clone(), l.stream_path.clone())
+        };
+        let mut primed = self.primed.lock().await;
+        if *primed != path {
+            // Mutter drops the first key event of a remote desktop session (the virtual
+            // keyboard is set up on it): spend it on a Shift tap, which types nothing.
+            let _ = remote.notify_keyboard_keycode(KEY_LEFTSHIFT, true).await;
+            let _ = remote.notify_keyboard_keycode(KEY_LEFTSHIFT, false).await;
+            primed.clone_from(&path);
+        }
+        (remote, path)
+    }
 }
 
 #[cfg(feature = "gnome")]
 #[async_trait::async_trait]
 impl InputBackend for MutterInput {
     async fn start(&self) {
-        // Mutter drops the first key event of a remote desktop session (the virtual
-        // keyboard is set up on it): spend it on a Shift tap, which types nothing.
-        let _ = self
-            .remote
-            .notify_keyboard_keycode(KEY_LEFTSHIFT, true)
-            .await;
-        let _ = self
-            .remote
-            .notify_keyboard_keycode(KEY_LEFTSHIFT, false)
-            .await;
+        self.session().await;
     }
 
     async fn apply(&self, ev: &Input) -> anyhow::Result<()> {
-        let r = &self.remote;
+        let (r, stream_path) = self.session().await;
         match *ev {
             Input::Key(code, down) => r.notify_keyboard_keycode(code, down).await?,
             Input::Keysym(sym, down) => r.notify_keyboard_keysym(sym, down).await?,
-            Input::Motion(x, y) => {
-                r.notify_pointer_motion_absolute(&self.stream_path, x, y)
-                    .await?
-            }
+            Input::Motion(x, y) => r.notify_pointer_motion_absolute(&stream_path, x, y).await?,
             Input::Button(b, down) => r.notify_pointer_button(b, down).await?,
             Input::Scroll { axis, steps } => r.notify_pointer_axis_discrete(axis, steps).await?,
         }

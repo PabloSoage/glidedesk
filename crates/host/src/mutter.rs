@@ -107,6 +107,15 @@ pub enum CursorMode {
     Metadata = 2,
 }
 
+/// The remote desktop session in use; replaced when Mutter closes one (see `gnome`).
+pub struct Live {
+    pub remote: RemoteDesktopSessionProxy<'static>,
+    /// Stream object path, needed for absolute pointer motion.
+    pub stream_path: String,
+}
+
+pub type LiveRx = tokio::sync::watch::Receiver<std::sync::Arc<Live>>;
+
 /// A started remote desktop session with one virtual monitor.
 pub struct Session {
     pub remote: RemoteDesktopSessionProxy<'static>,

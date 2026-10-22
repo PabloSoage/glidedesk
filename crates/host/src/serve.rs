@@ -102,16 +102,24 @@ async fn gnome(
     let (w, h) = pipeline::clamp_size(opts.width, opts.height);
     let (tx, rx) = crate::frame::latest_frame();
     let (cursor_tx, cursor_rx) = watch::channel(None);
-    let capture = Capture::start(
-        session.node_id,
-        w,
-        h,
-        Sinks {
-            frames: tx,
-            cursor: cursor_tx,
-        },
+    let sinks = Sinks {
+        frames: tx,
+        cursor: Arc::new(cursor_tx),
+    };
+    let capture = Capture::start(session.node_id, w, h, sinks.clone(), cuda.clone())?;
+    let followed = crate::gnome::Followed::new(capture, (w, h));
+    let (live_tx, live) = watch::channel(Arc::new(mutter::Live {
+        remote: session.remote.clone(),
+        stream_path: session.stream_path.clone(),
+    }));
+    tokio::spawn(crate::gnome::supervise(
+        conn.clone(),
+        cursor_mode,
+        live_tx,
+        Arc::clone(&followed),
+        sinks,
         cuda,
-    )?;
+    ));
     let audio = match crate::audio::start() {
         Ok(a) => Some(a),
         Err(e) => {
@@ -119,22 +127,20 @@ async fn gnome(
             None
         }
     };
-    let remote = session.remote.clone();
-    let clipboard = crate::clipboard::ClipboardFactory::spawn(session.remote.clone());
+    let clipboard = crate::clipboard::ClipboardFactory::spawn(live.clone());
     let hub = clipboard.hub();
+    let current = live.clone();
     Ok(Parts {
-        source: Box::new(capture),
+        source: Box::new(crate::gnome::FollowedSource(followed)),
         frames: rx,
         cursor: cursor_rx,
-        input: Box::new(crate::input::MutterInput {
-            remote: session.remote.clone(),
-            stream_path: session.stream_path.clone(),
-        }),
+        input: Box::new(crate::input::MutterInput::new(live)),
         audio,
         clipboard: Some(Box::new(clipboard)),
         text_clipboard: Some(Arc::new(hub)),
         size: (w, h),
         stop: Some(Box::pin(async move {
+            let remote = current.borrow().remote.clone();
             remote.stop().await.ok();
         })),
     })

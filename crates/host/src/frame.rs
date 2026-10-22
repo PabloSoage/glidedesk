@@ -67,6 +67,7 @@ pub fn latest_frame() -> (FrameSender, FrameReceiver) {
     (FrameSender(Arc::clone(&shared)), FrameReceiver(shared))
 }
 
+#[derive(Clone)]
 pub struct FrameSender(Arc<LatestFrame>);
 
 impl FrameSender {

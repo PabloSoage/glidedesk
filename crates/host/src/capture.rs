@@ -45,9 +45,10 @@ pub struct Capture {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
 pub struct Sinks {
     pub frames: FrameSender,
-    pub cursor: tokio::sync::watch::Sender<Option<CursorEvent>>,
+    pub cursor: Arc<tokio::sync::watch::Sender<Option<CursorEvent>>>,
 }
 
 impl Capture {

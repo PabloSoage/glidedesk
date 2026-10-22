@@ -44,6 +44,13 @@ pub fn init_logging() {
             .init(),
         None => builder.with_writer(std::io::stderr).init(),
     }
+    // Without a console a panic would vanish: log it and show it.
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("{info}");
+        show_error(&format!("glidedesk stopped: {info}"));
+        default(info);
+    }));
 }
 
 /// Tells the user something went wrong: a dialog on Windows (there is no console).
