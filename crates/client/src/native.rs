@@ -362,6 +362,7 @@ pub async fn run(
                     debug!(rtt_us = now_us().saturating_sub(t_us), "Pong");
                 }
                 Ok(ServerMsg::Clipboard(text)) => sink.lock().unwrap().clipboard(&text),
+                Ok(ServerMsg::Denied(reason)) => break Err(anyhow::anyhow!(reason)),
                 Ok(other) => warn!(?other, "Unexpected message"),
                 Err(e) => break Err(anyhow::Error::from(e).context("control channel")),
             },

@@ -42,14 +42,15 @@ class NativeSession private constructor(private var handle: Long) {
         /** `lowLatency`: the native protocol (UDP video, HEVC) instead of RDP. */
         fun connect(
             host: String, port: Int, user: String, password: String, width: Int, height: Int,
-            lowLatency: Boolean,
+            lowLatency: Boolean, refresh: Int,
         ): NativeSession? {
-            val h = nativeConnect(host, port, user, password, width, height, lowLatency)
+            val h = nativeConnect(host, port, user, password, width, height, lowLatency, refresh)
             return if (h == 0L) null else NativeSession(h)
         }
 
         @JvmStatic private external fun nativeConnect(
             host: String, port: Int, user: String, password: String, width: Int, height: Int, native: Boolean,
+            refresh: Int,
         ): Long
         @JvmStatic private external fun nativeSetSurface(handle: Long, surface: Surface?)
         @JvmStatic private external fun nativeMouseMove(handle: Long, x: Int, y: Int)

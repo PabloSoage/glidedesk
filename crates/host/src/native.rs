@@ -386,8 +386,9 @@ where
     let key: [u8; 32] = glidedesk_proto::random();
     let token: [u8; 16] = glidedesk_proto::random();
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel();
-    // This client replaces any previous one (its control task ends when its sender drops).
-    *shared.link.lock().unwrap() = Some(Link {
+    // This client replaces any previous one, which is told why (its control task ends when
+    // its sender drops).
+    let previous = shared.link.lock().unwrap().replace(Link {
         key: PacketKey::new(&key),
         token,
         peer: None,
@@ -397,6 +398,11 @@ where
         seq: 0,
         frame_id: 0,
     });
+    if let Some(old) = previous {
+        let _ = old.control.send(ServerMsg::Denied(format!(
+            "another client ({peer}) took over the session"
+        )));
+    }
     shared.acked_id.store(0, Ordering::SeqCst);
     glidedesk_proto::write_msg(
         &mut wr,

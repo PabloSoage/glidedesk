@@ -38,11 +38,28 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+    /**
+     * Asks for the display's fastest mode at the current resolution (phones otherwise keep
+     * apps at 60 Hz) and returns its refresh rate, which the session then runs at.
+     */
+    private fun fastestMode(): Int {
+        @Suppress("DEPRECATION")
+        val display = windowManager.defaultDisplay
+        val cur = display.mode
+        val best = display.supportedModes
+            .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+            .maxByOrNull { it.refreshRate } ?: cur
+        window.attributes = window.attributes.also { it.preferredDisplayModeId = best.modeId }
+        return best.refreshRate.roundToInt()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val refresh = fastestMode()
         val prefs = getSharedPreferences("connection", Context.MODE_PRIVATE)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -64,6 +81,7 @@ class MainActivity : ComponentActivity() {
                                 extras.getString("port")?.toIntOrNull() ?: if (lowLatency) 3391 else 3389,
                                 extras.getString("user") ?: "", extras.getString("password") ?: "",
                                 (m.widthPixels / sc).toInt(), (m.heightPixels / sc).toInt(), lowLatency,
+                                refresh,
                             )
                         }
                     }
@@ -75,6 +93,7 @@ class MainActivity : ComponentActivity() {
                             session = NativeSession.connect(
                                 host, port, user, password,
                                 (m.widthPixels / sc).toInt(), (m.heightPixels / sc).toInt(), lowLatency,
+                                refresh,
                             )
                             message = if (session == null) "Could not start the session" else ""
                         }

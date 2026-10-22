@@ -154,6 +154,7 @@ mod android {
         width: jint,
         height: jint,
         native: jboolean,
+        refresh: jint,
     ) -> jlong {
         let opts = ConnectOptions {
             host: string(&mut env, &host),
@@ -197,7 +198,7 @@ mod android {
                     width: opts.width,
                     height: opts.height,
                     codecs: vec![VideoCodec::Hevc, VideoCodec::H264],
-                    refresh: 60,
+                    refresh: refresh.clamp(30, 240) as u32,
                     pinned: None,
                 };
                 glidedesk_client::native::run(opts, sink, rx)

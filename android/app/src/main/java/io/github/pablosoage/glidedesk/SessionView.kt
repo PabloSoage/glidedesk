@@ -3,7 +3,9 @@ package io.github.pablosoage.glidedesk
 import android.annotation.SuppressLint
 import android.content.Context
 import android.view.GestureDetector
+import android.os.Build
 import android.view.KeyEvent
+import android.view.Surface
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -40,6 +42,11 @@ class SessionView(context: Context, private val session: NativeSession, private 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         session.resize(remote(width.toFloat()), remote(height.toFloat()))
         session.setSurface(holder.surface)
+        // Dynamic-refresh phones drop to 60 Hz unless the surface says it carries more.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val hz = display?.supportedModes?.maxOfOrNull { it.refreshRate } ?: return
+            holder.surface.setFrameRate(hz, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
