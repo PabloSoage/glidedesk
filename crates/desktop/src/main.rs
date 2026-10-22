@@ -25,9 +25,12 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
-use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
+use winit::window::{CustomCursor, Fullscreen, Icon, Window, WindowId};
 
 use video::{Event, Picture};
+
+/// The logo as 64x64 RGBA (scripts/gen-icons.py).
+const ICON: &[u8] = include_bytes!("../../../assets/logo/glidedesk-64.rgba");
 
 #[derive(Parser, Clone)]
 #[command(version, about = "glidedesk remote desktop client")]
@@ -189,6 +192,7 @@ impl ApplicationHandler<Event> for App {
         }
         let mut attrs = Window::default_attributes()
             .with_title(format!("glidedesk - {}", self.args.host))
+            .with_window_icon(Icon::from_rgba(ICON.to_vec(), 64, 64).ok())
             .with_inner_size(PhysicalSize::new(self.args.width, self.args.height));
         if self.args.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));

@@ -25,6 +25,7 @@ use crate::encoder::{Codec, EncodedFrame};
 use crate::frame::CursorEvent;
 use crate::input::InputForwarder;
 use crate::pipeline::{self, Mode, Output, Prepared};
+use crate::rate::DelayMeter;
 
 /// State shared by the IronRDP callbacks and the RDP output of the pipeline.
 struct Shared {
@@ -35,6 +36,8 @@ struct Shared {
     gfx: Mutex<Option<GfxServerHandle>>,
     /// Frames the client acknowledged as decoded (MS-RDPEGFX frame acknowledge).
     acked: AtomicU64,
+    /// Send-to-acknowledge delays, for the rate control.
+    meter: Mutex<DelayMeter>,
     events: Mutex<Option<UnboundedSender<ServerEvent>>>,
 }
 
@@ -59,6 +62,7 @@ impl GfxServerFactory for GfxFactory {
             self.build_gfx_handler(),
         )));
         *self.0.gfx.lock().unwrap() = Some(Arc::clone(&server));
+        self.0.meter.lock().unwrap().clear();
         Some((GfxDvcBridge::new(Arc::clone(&server)), server))
     }
 }
@@ -75,8 +79,9 @@ impl GraphicsPipelineHandler for GfxHandler {
         self.0.session.take_over(self.0.index);
     }
 
-    fn on_frame_ack(&mut self, _frame_id: u32, _queue_depth: u32, _total_frames_decoded: u32) {
+    fn on_frame_ack(&mut self, frame_id: u32, _queue_depth: u32, _total_frames_decoded: u32) {
         self.0.acked.fetch_add(1, Ordering::Relaxed);
+        self.0.meter.lock().unwrap().acked(frame_id);
     }
 
     fn on_close(&mut self) {
@@ -295,9 +300,14 @@ impl Output for RdpOutput {
                     ts,
                 ),
             };
-            if queued.is_none() {
+            let Some(frame_id) = queued else {
                 return Ok(false);
-            }
+            };
+            self.shared
+                .meter
+                .lock()
+                .unwrap()
+                .sent(frame_id, main.data.len() + aux.data.len());
             let channel_id = g.channel_id().context("EGFX channel has no id")?;
             ironrdp_dvc::encode_dvc_messages(
                 channel_id,
@@ -316,6 +326,10 @@ impl Output for RdpOutput {
 
     fn take_acked(&mut self) -> u64 {
         self.shared.acked.swap(0, Ordering::Relaxed)
+    }
+
+    fn take_delays(&mut self) -> Vec<(std::time::Duration, usize)> {
+        self.shared.meter.lock().unwrap().take()
     }
 
     fn reset(&mut self) {
@@ -375,6 +389,7 @@ pub fn new(session: Arc<pipeline::Shared>, index: usize) -> (RdpOutput, Server) 
         index,
         gfx: Mutex::new(None),
         acked: AtomicU64::new(0),
+        meter: Mutex::default(),
         events: Mutex::new(None),
     });
     (

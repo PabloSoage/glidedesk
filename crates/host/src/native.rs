@@ -22,6 +22,7 @@ use crate::encoder::{Codec, EncodedFrame};
 use crate::frame::CursorEvent;
 use crate::input::InputForwarder;
 use crate::pipeline::{self, Mode, Output, Prepared};
+use crate::rate::DelayMeter;
 
 /// Parity added to every video block, in percent of its data shards.
 const FEC_PERCENT: u32 = 20;
@@ -53,6 +54,8 @@ struct Shared {
     acked_id: AtomicU32,
     acked: AtomicU64,
     keyframe_requested: AtomicBool,
+    /// Send-to-acknowledge delays, for the rate control.
+    meter: Mutex<DelayMeter>,
 }
 
 impl Shared {
@@ -112,6 +115,11 @@ impl Output for NativeOutput {
             return Ok(false);
         };
         link.frame_id = link.frame_id.wrapping_add(1);
+        self.shared
+            .meter
+            .lock()
+            .unwrap()
+            .sent(link.frame_id, main.data.len());
         let start = std::time::Instant::now();
         let packets = fec::packetize(link.frame_id, main.keyframe, &main.data, FEC_PERCENT);
         for (i, p) in packets.iter().enumerate() {
@@ -132,6 +140,10 @@ impl Output for NativeOutput {
 
     fn take_acked(&mut self) -> u64 {
         self.shared.acked.swap(0, Ordering::Relaxed)
+    }
+
+    fn take_delays(&mut self) -> Vec<(std::time::Duration, usize)> {
+        self.shared.meter.lock().unwrap().take()
     }
 
     fn reset(&mut self) {
@@ -204,6 +216,7 @@ pub async fn new(
         link: Mutex::new(None),
         acked_id: AtomicU32::new(0),
         acked: AtomicU64::new(0),
+        meter: Mutex::default(),
         keyframe_requested: AtomicBool::new(false),
     });
     Ok((
@@ -404,6 +417,7 @@ where
         )));
     }
     shared.acked_id.store(0, Ordering::SeqCst);
+    shared.meter.lock().unwrap().clear();
     glidedesk_proto::write_msg(
         &mut wr,
         &ServerMsg::Welcome {
@@ -473,6 +487,7 @@ where
             ClientMsg::FrameAck { frame_id } => {
                 shared.acked_id.store(frame_id, Ordering::SeqCst);
                 shared.acked.fetch_add(1, Ordering::Relaxed);
+                shared.meter.lock().unwrap().acked(frame_id);
             }
             ClientMsg::RequestKeyframe => {
                 shared.keyframe_requested.store(true, Ordering::SeqCst);

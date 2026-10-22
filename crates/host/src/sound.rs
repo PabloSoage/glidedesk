@@ -17,7 +17,8 @@ pub const CHANNELS: u16 = 2;
 /// Bytes per 20 ms block of 48 kHz stereo S16.
 pub const BLOCK: usize = (RATE as usize / 50) * CHANNELS as usize * 2;
 const BLOCK_MS: u32 = 20;
-/// Above this much queued audio, blocks are dropped until it is back under `QUEUE_LOW_MS`.
+/// Above this much audio queued beyond the client's own buffering, blocks are dropped until
+/// it is back under `QUEUE_LOW_MS`.
 const QUEUE_HIGH_MS: u32 = 160;
 const QUEUE_LOW_MS: u32 = 80;
 
@@ -78,7 +79,15 @@ struct Flow {
     unreceived: u32,
     /// Time the client held the last played wave before playing it (its buffer).
     held_ms: u32,
+    /// The client's own buffering: the least audio queued during the first `LEARN` after
+    /// the first confirm. mstsc keeps far more than FreeRDP; counting it as delay would drop
+    /// blocks all the time (choppy sound).
+    floor_ms: Option<u32>,
+    learn_until: Option<std::time::Instant>,
 }
+
+/// How long the client's own buffering is measured at the start.
+const LEARN: Duration = Duration::from_secs(3);
 
 impl Default for Flow {
     fn default() -> Self {
@@ -87,6 +96,8 @@ impl Default for Flow {
             next_block: 0,
             unreceived: 0,
             held_ms: 0,
+            floor_ms: None,
+            learn_until: None,
         }
     }
 }
@@ -114,11 +125,22 @@ impl Flow {
         if held > 0 {
             self.held_ms = u32::from(held);
         }
+        let now = std::time::Instant::now();
+        let until = *self.learn_until.get_or_insert(now + LEARN);
+        if now < until {
+            let q = self.queued_ms();
+            self.floor_ms = Some(self.floor_ms.map_or(q, |f| f.min(q)));
+        }
     }
 
     /// Audio between the capture and the speakers, in ms.
     fn queued_ms(&self) -> u32 {
         self.unreceived * BLOCK_MS + self.held_ms
+    }
+
+    /// Delay beyond the client's own buffering: what drift and congestion added.
+    fn excess_ms(&self) -> u32 {
+        self.queued_ms().saturating_sub(self.floor_ms.unwrap_or(0))
     }
 }
 
@@ -169,7 +191,10 @@ impl RdpsndServerHandler for Sound {
                         // The capture keeps its pace (ts advances) while blocks are dropped,
                         // so the client's clock follows the capture again.
                         ts = ts.wrapping_add(BLOCK_MS);
-                        let queued = flow.lock().unwrap().queued_ms();
+                        let (queued, floor) = {
+                            let f = flow.lock().unwrap();
+                            (f.excess_ms(), f.floor_ms)
+                        };
                         if queued > QUEUE_HIGH_MS {
                             draining = true;
                         } else if queued <= QUEUE_LOW_MS {
@@ -199,6 +224,7 @@ impl RdpsndServerHandler for Sound {
                                 with_sound = loud,
                                 dropped,
                                 queued,
+                                ?floor,
                                 "Audio blocks sent"
                             );
                             (blocks, loud, dropped, since) = (0, 0, 0, std::time::Instant::now());

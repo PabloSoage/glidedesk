@@ -1,7 +1,8 @@
 //! NVENC encoder on a CUDA context.
 //!
-//! Low-latency settings (see docs: ultra-low-latency tuning, no B-frames, infinite GOP, a
-//! VBV of about one frame, intra refresh instead of periodic IDR). Frames are BGRx in a
+//! Low-latency settings (see docs: ultra-low-latency tuning, no B-frames, infinite GOP,
+//! constant quality under a link-adapted ceiling with a VBV of about one frame, intra
+//! refresh instead of periodic IDR). Frames are BGRx in a
 //! pitched CUDA buffer that NVENC reads as `ARGB` (A8R8G8B8 little-endian is B, G, R, A in
 //! memory); NVENC converts to YUV itself.
 
@@ -15,6 +16,11 @@ use nvenc_sys as nv;
 use tracing::{debug, info};
 
 pub use crate::encoder::{Codec, EncodedFrame, EncoderConfig};
+
+/// Constant-quality targets (about the QP of a frame that fits under the ceiling): sharp
+/// text for the desktop; still images get finer quality passes after motion.
+const TARGET_QUALITY_H264: u8 = 22;
+const TARGET_QUALITY_HEVC: u8 = 24;
 
 struct Api {
     _lib: libloading::Library,
@@ -163,10 +169,17 @@ impl Encoder {
                 qpIntra: qp,
             };
         } else {
-            rc.rateControlMode = nv::NV_ENC_PARAMS_RC_CBR;
-            rc.averageBitRate = c.bitrate;
+            // Constant quality under a ceiling: a frame costs what its content needs, never
+            // a set bandwidth. The ceiling follows the link (`pipeline::Rate`), and one frame
+            // of VBV keeps any picture within what the link carries in a frame time, so the
+            // encoder never builds a queue the network must drain.
+            rc.rateControlMode = nv::NV_ENC_PARAMS_RC_VBR;
+            rc.targetQuality = match c.codec {
+                Codec::H264 => TARGET_QUALITY_H264,
+                Codec::Hevc => TARGET_QUALITY_HEVC,
+            };
+            rc.averageBitRate = 0;
             rc.maxBitRate = c.bitrate;
-            // One frame of VBV: the encoder never builds a queue the network must drain.
             rc.vbvBufferSize = c.bitrate / c.fps.max(1);
             rc.vbvInitialDelay = rc.vbvBufferSize;
         }
@@ -336,8 +349,25 @@ impl Encoder {
         if self.const_qp == qp {
             return Ok(());
         }
-        self.ctx.bind_to_thread()?;
         self.const_qp = qp;
+        self.reconfigure_rate()
+    }
+
+    /// Changes the bitrate ceiling in place (no IDR).
+    pub fn set_max_bitrate(&mut self, bps: u32) -> Result<()> {
+        if self.cfg.bitrate == bps {
+            return Ok(());
+        }
+        self.cfg.bitrate = bps;
+        if self.const_qp.is_some() {
+            // Applied when the quality pass ends.
+            return Ok(());
+        }
+        self.reconfigure_rate()
+    }
+
+    fn reconfigure_rate(&mut self) -> Result<()> {
+        self.ctx.bind_to_thread()?;
         let mut config = nv::NV_ENC_CONFIG::default();
         let mut init = self.init_params(&mut config)?;
         init.encodeConfig = &mut config;

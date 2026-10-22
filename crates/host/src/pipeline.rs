@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::encoder::{self, Codec, EncodedFrame};
 use crate::frame::{Frame, FrameData, FrameReceiver, Source};
+use crate::rate::Rate;
 
 /// State shared by the front ends and the pipeline thread.
 #[derive(Default)]
@@ -87,6 +88,9 @@ pub trait Output: Send {
     fn send(&mut self, mode: Mode, main: &EncodedFrame, aux: &EncodedFrame) -> Result<bool>;
     /// Frames the client acknowledged since the last call.
     fn take_acked(&mut self) -> u64;
+    /// Send-to-acknowledge delay and size of the frames acknowledged since the last call,
+    /// for the rate control.
+    fn take_delays(&mut self) -> Vec<(Duration, usize)>;
     /// The client changed: forget its surface.
     fn reset(&mut self);
     /// The client needs the current image again (it lost a frame and asked for an IDR),
@@ -105,6 +109,8 @@ pub struct Options {
     pub refine: bool,
     /// Frames sent and not yet acknowledged; beyond this the newest frame waits.
     pub max_in_flight: u32,
+    /// Highest bitrate the rate control may reach (`--max-bitrate`); none: the link decides.
+    pub max_bitrate: Option<u32>,
 }
 
 pub struct Pipeline {
@@ -129,6 +135,7 @@ pub struct Pipeline {
     refine_left: u32,
     /// QP of the quality pass being sent; `None` for normal frames.
     refine_qp: Option<u32>,
+    rate: Rate,
     stats: Stats,
 }
 
@@ -149,6 +156,7 @@ impl Pipeline {
         outputs: Vec<Box<dyn Output>>,
         opts: Options,
     ) -> Self {
+        let max_bitrate = opts.max_bitrate;
         Self {
             shared,
             source,
@@ -164,6 +172,7 @@ impl Pipeline {
             need_full: true,
             refine_left: 0,
             refine_qp: None,
+            rate: Rate::new(max_bitrate),
             stats: Stats {
                 at: Instant::now(),
                 frames: 0,
@@ -175,7 +184,9 @@ impl Pipeline {
     }
 
     pub fn run(mut self) -> Result<()> {
+        self.backend.set_max_bitrate(self.rate.bps())?;
         while !self.shared.stop.load(Ordering::Relaxed) {
+            self.adapt_rate();
             let refresh = self.shared.wanted_refresh.lock().unwrap().take();
             if let Some(hz) = refresh
                 && self.source.set_refresh(hz)
@@ -249,6 +260,11 @@ impl Pipeline {
                 for o in &mut self.outputs {
                     o.reset();
                 }
+                // Another client, maybe on another link: learn it from the start.
+                self.rate = Rate::new(self.opts.max_bitrate);
+                if let Err(e) = self.backend.set_max_bitrate(self.rate.bps()) {
+                    warn!(%e, "Setting the bitrate failed");
+                }
                 mode = Mode::Full;
             }
             if let Err(e) = self.send(&frame, mode) {
@@ -258,6 +274,20 @@ impl Pipeline {
             self.last_frame = Some(frame);
         }
         Ok(())
+    }
+
+    /// Feeds the active client's acknowledgements to the rate control.
+    fn adapt_rate(&mut self) {
+        let index = self.shared.active.load(Ordering::SeqCst);
+        let Some(output) = self.outputs.get_mut(index) else {
+            return;
+        };
+        if let Some(bps) = self.rate.update(output.take_delays()) {
+            debug!(mbps = bps / 1_000_000, "Bitrate ceiling");
+            if let Err(e) = self.backend.set_max_bitrate(bps) {
+                warn!(%e, "Changing the bitrate failed");
+            }
+        }
     }
 
     fn active_wants_refresh(&self) -> bool {
@@ -314,7 +344,17 @@ impl Pipeline {
             },
         )?;
         let encode_us = t.elapsed().as_micros();
-        debug!(bytes = main.data.len(), qp = main.qp, ?mode, "Frame");
+        let damaged: Option<u32> = frame
+            .damage
+            .as_ref()
+            .map(|d| d.iter().map(|r| r.w * r.h).sum());
+        debug!(
+            bytes = main.data.len(),
+            qp = main.qp,
+            ?mode,
+            ?damaged,
+            "Frame"
+        );
         if !output.send(mode, &main, &aux)? {
             return Ok(());
         }
@@ -345,6 +385,7 @@ impl Pipeline {
                 capture_to_queue_ms =
                     format!("{:.2}", frame.captured.elapsed().as_secs_f64() * 1000.0),
                 refines = s.refines,
+                ceiling_mbps = self.rate.bps() / 1_000_000,
                 ?codec,
                 "Stream"
             );

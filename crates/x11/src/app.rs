@@ -195,6 +195,9 @@ fn audio_thread() -> Option<mpsc::Sender<Vec<u8>>> {
     Some(tx)
 }
 
+/// The logo as 64x64 RGBA (scripts/gen-icons.py).
+const ICON: &[u8] = include_bytes!("../../../assets/logo/glidedesk-64.rgba");
+
 pub fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -247,6 +250,22 @@ pub fn main() -> Result<()> {
         AtomEnum::WM_NAME,
         AtomEnum::STRING,
         title.as_bytes(),
+    )?;
+    // _NET_WM_ICON: width, height, then ARGB pixels.
+    let net_wm_icon = conn.intern_atom(false, b"_NET_WM_ICON")?.reply()?.atom;
+    let icon: Vec<u32> = [64, 64]
+        .into_iter()
+        .chain(
+            ICON.chunks_exact(4)
+                .map(|p| u32::from_be_bytes([p[3], p[0], p[1], p[2]])),
+        )
+        .collect();
+    conn.change_property32(
+        PropMode::REPLACE,
+        win,
+        net_wm_icon,
+        AtomEnum::CARDINAL,
+        &icon,
     )?;
     let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
     let wm_delete = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;

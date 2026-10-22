@@ -22,6 +22,7 @@ mod nvenc;
 mod pipeline;
 #[cfg(feature = "x11")]
 mod pulse;
+mod rate;
 mod rdp;
 mod serve;
 mod sound;
@@ -72,9 +73,11 @@ enum Command {
         /// DRM render node for VA-API (default: the first /dev/dri/renderD*).
         #[arg(long, env = "GLIDEDESK_RENDER_NODE")]
         render_node: Option<String>,
-        /// Video bitrate in bits per second.
-        #[arg(long, default_value_t = 30_000_000)]
-        bitrate: u32,
+        /// Highest video bitrate in bits per second (mobile data, metered or remote links).
+        /// Without it the bitrate follows the link: frames are encoded at a constant quality
+        /// and only their ceiling adapts to the measured delay.
+        #[arg(long, env = "GLIDEDESK_MAX_BITRATE")]
+        max_bitrate: Option<u32>,
         #[arg(long, default_value_t = 60)]
         fps: u32,
         /// Size before the client says what it wants.
@@ -88,9 +91,10 @@ enum Command {
         /// RDP password; read from GLIDEDESK_PASSWORD when not given.
         #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
         password: String,
-        /// Send 4:2:0 only (AVC420) even to clients that support AVC444.
+        /// Send AVC444 (full chroma) to clients that support it. Off by default: mstsc shows
+        /// our AVC444v2 stream blurred (to fix).
         #[arg(long)]
-        no_avc444: bool,
+        avc444: bool,
         /// With AVC444, always send both views (no luma-only frames during motion).
         #[arg(long)]
         no_hybrid: bool,
@@ -157,13 +161,13 @@ async fn main() -> Result<()> {
             gpu,
             encoder,
             render_node,
-            bitrate,
+            max_bitrate,
             fps,
             width,
             height,
             user,
             password,
-            no_avc444,
+            avc444,
             no_hybrid,
             no_refine,
             max_in_flight,
@@ -189,17 +193,18 @@ async fn main() -> Result<()> {
             serve::serve(serve::ServeOptions {
                 session,
                 pipeline: pipeline::Options {
-                    avc444: !no_avc444,
+                    avc444,
                     hybrid: !no_hybrid,
                     refine: !no_refine,
                     max_in_flight,
+                    max_bitrate,
                 },
                 bind,
                 native_bind: (!no_native).then_some(native_bind),
                 gpu,
                 encoder,
                 render_node,
-                bitrate,
+                bitrate: max_bitrate.map_or(rate::START_BPS, |m| m.min(rate::START_BPS)),
                 fps: fps.max(refresh),
                 width,
                 height,

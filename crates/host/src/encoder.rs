@@ -75,6 +75,8 @@ pub trait Backend: Send {
     /// `Request::const_qp` is honoured only where the rate control can switch in place
     /// (NVENC); elsewhere a quality pass is a plain re-encode.
     fn request_keyframe(&mut self);
+    /// The bitrate ceiling the link allows (bits per second), from the rate control.
+    fn set_max_bitrate(&mut self, bps: u32) -> Result<()>;
     /// Encodes `frame`; empty pictures for views that were not asked for.
     fn encode(&mut self, frame: &Frame, req: &Request) -> Result<(EncodedFrame, EncodedFrame)>;
 }
@@ -138,6 +140,14 @@ impl Backend for Nvenc {
     fn request_keyframe(&mut self) {
         if let Some((e, _, _)) = self.encoder.as_mut() {
             e.request_keyframe();
+        }
+    }
+
+    fn set_max_bitrate(&mut self, bps: u32) -> Result<()> {
+        self.bitrate = bps;
+        match self.encoder.as_mut() {
+            Some((e, _, _)) => e.set_max_bitrate(bps),
+            None => Ok(()),
         }
     }
 
@@ -251,6 +261,17 @@ impl Backend for Ffmpeg {
         if let Some((e, _)) = self.encoder.as_mut() {
             e.request_keyframe();
         }
+    }
+
+    fn set_max_bitrate(&mut self, bps: u32) -> Result<()> {
+        // FFmpeg encoders take their rate when opened: reopen (a new IDR) only when the
+        // ceiling moved a lot, not on every small step of the rate control.
+        let ratio = f64::from(bps) / f64::from(self.bitrate.max(1));
+        if !(0.67..=1.5).contains(&ratio) {
+            self.bitrate = bps;
+            self.encoder = None;
+        }
+        Ok(())
     }
 
     fn encode(&mut self, frame: &Frame, req: &Request) -> Result<(EncodedFrame, EncodedFrame)> {
