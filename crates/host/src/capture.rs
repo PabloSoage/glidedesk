@@ -1,6 +1,6 @@
 //! PipeWire capture of a Mutter virtual monitor.
 //!
-//! The PipeWire main loop runs on its own thread. Frames go out through a bounded channel
+//! The PipeWire main loop runs on its own thread. Frames go out through a one-frame mailbox
 //! that keeps only the newest frame: if the encoder is behind, older frames are dropped
 //! instead of queueing latency. Resizing renegotiates the stream format; Mutter then
 //! resizes the virtual monitor to match.
@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use cudarc::driver::CudaContext;
@@ -86,15 +86,69 @@ pub struct Capture {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+/// One-frame mailbox between the capture and the encoder: a new frame replaces the one
+/// waiting, so the encoder always gets the newest image and never a backlog. (A bounded
+/// channel with `try_send` drops the *new* frame instead, and when motion stops the final
+/// image can be the one lost.)
+pub struct LatestFrame {
+    slot: std::sync::Mutex<(Option<Frame>, bool)>,
+    ready: std::sync::Condvar,
+}
+
+pub fn latest_frame() -> (FrameSender, FrameReceiver) {
+    let shared = Arc::new(LatestFrame {
+        slot: std::sync::Mutex::new((None, false)),
+        ready: std::sync::Condvar::new(),
+    });
+    (FrameSender(Arc::clone(&shared)), FrameReceiver(shared))
+}
+
+pub struct FrameSender(Arc<LatestFrame>);
+
+impl FrameSender {
+    /// Hands over `frame`; returns whether it replaced one the encoder had not taken.
+    pub fn send(&self, frame: Frame) -> bool {
+        let mut slot = self.0.slot.lock().unwrap();
+        let replaced = slot.0.replace(frame).is_some();
+        self.0.ready.notify_one();
+        replaced
+    }
+}
+
+impl Drop for FrameSender {
+    fn drop(&mut self) {
+        self.0.slot.lock().unwrap().1 = true;
+        self.0.ready.notify_one();
+    }
+}
+
+pub struct FrameReceiver(Arc<LatestFrame>);
+
+impl FrameReceiver {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Frame, mpsc::RecvTimeoutError> {
+        let slot = self.0.slot.lock().unwrap();
+        let (mut slot, _) = self
+            .0
+            .ready
+            .wait_timeout_while(slot, timeout, |(f, closed)| f.is_none() && !*closed)
+            .unwrap();
+        match slot.0.take() {
+            Some(f) => Ok(f),
+            None if slot.1 => Err(mpsc::RecvTimeoutError::Disconnected),
+            None => Err(mpsc::RecvTimeoutError::Timeout),
+        }
+    }
+}
+
 pub struct Sinks {
-    pub frames: mpsc::SyncSender<Frame>,
+    pub frames: FrameSender,
     pub cursor: tokio::sync::watch::Sender<Option<CursorEvent>>,
 }
 
 impl Capture {
-    /// Connects to `node_id` asking for `width`×`height`. Frames are sent to `frames`; a
-    /// `sync_channel(1)` with `try_send` gives "latest frame wins". With `gpu`, DMA-BUFs are
-    /// negotiated and frames arrive as [`FrameData::Gpu`] on that CUDA context.
+    /// Connects to `node_id` asking for `width`×`height`. Frames go to `frames` (see
+    /// [`latest_frame`]). With `gpu`, DMA-BUFs are negotiated and frames arrive as
+    /// [`FrameData::Gpu`] on that CUDA context.
     pub fn start(
         node_id: u32,
         width: u32,
@@ -557,11 +611,11 @@ fn run(
                 st.stats_copy_us = 0;
                 st.stats_at = Instant::now();
             }
-            if st.sinks.frames.try_send(frame).is_err() {
+            if st.sinks.frames.send(frame) {
                 st.stats_dropped += 1;
                 st.dropped += 1;
                 if st.dropped.is_power_of_two() {
-                    debug!(dropped = st.dropped, "Encoder behind, dropped frames");
+                    debug!(dropped = st.dropped, "Encoder behind, replaced frames");
                 }
             }
         })

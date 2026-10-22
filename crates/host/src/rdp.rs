@@ -38,6 +38,8 @@ pub struct ServeOptions {
     pub avc444: bool,
     /// AVC444 sends luma-only frames during motion and the chroma once the image is still.
     pub hybrid: bool,
+    /// Re-encode the still image after motion until its quality settles.
+    pub refine: bool,
     /// Unacknowledged frames allowed; more frames than the client can show only queue up.
     pub max_in_flight: u32,
     pub bind: SocketAddr,
@@ -233,7 +235,7 @@ struct Encoders {
 struct Pipeline {
     shared: Arc<Shared>,
     capture: Capture,
-    frames: mpsc::Receiver<Frame>,
+    frames: crate::capture::FrameReceiver,
     encoders: Option<Encoders>,
     converter: color::Converter,
     /// Device buffers for frames that arrive in system memory.
@@ -242,6 +244,7 @@ struct Pipeline {
     avc444: bool,
     /// H-002: luma-only frames while things move, chroma once still.
     hybrid: bool,
+    refine: bool,
     /// Frames sent and not yet acknowledged; beyond this the newest frame waits.
     max_in_flight: u32,
     ctx: Arc<CudaContext>,
@@ -259,6 +262,11 @@ struct Pipeline {
     chroma_owed: bool,
     /// The next AVC444 frame must carry both views (after a new surface).
     need_full: bool,
+    /// Quality passes left over the still image (see `REFINE_QPS`).
+    refine_left: u32,
+    /// QP of the quality pass being sent; `None` for normal frames.
+    refine_qp: Option<u32>,
+    stats_refines: u32,
     start: Instant,
     sent: u64,
     stats_at: Instant,
@@ -282,7 +290,13 @@ impl Pipeline {
 
             let generation = self.shared.gfx_generation.load(Ordering::SeqCst);
             let new_client = generation != self.generation;
-            let wait = if self.pending { 2 } else { 50 };
+            let wait = if self.pending {
+                2
+            } else if self.refine_left > 0 {
+                REFINE_INTERVAL.as_millis() as u64
+            } else {
+                50
+            };
             let frame = match self.frames.recv_timeout(Duration::from_millis(wait)) {
                 Ok(f) => Some(f),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -296,7 +310,13 @@ impl Pipeline {
                     mode = Mode::LumaOnly;
                 }
                 self.last_new_frame = Instant::now();
+                debug_dump_frame(&f);
                 self.last_frame = Some(f);
+                self.refine_left = if self.refine {
+                    REFINE_QPS.len() as u32
+                } else {
+                    0
+                };
             } else if self.pending {
                 // Retrying a frame held back by back pressure: same choice as when it came in.
                 if self.hybrid && self.last_new_frame.elapsed() < MOTION_GAP {
@@ -304,6 +324,13 @@ impl Pipeline {
                 }
             } else if self.chroma_owed && self.last_new_frame.elapsed() >= STILL_AFTER {
                 mode = Mode::ChromaOnly;
+            } else if self.refine_left > 0 && self.last_new_frame.elapsed() >= REFINE_AFTER {
+                // The image is still: frames encoded during motion got one frame's worth of
+                // bits each and the compositor sends nothing new, so the client would keep
+                // that quality. Encode the same image again until the encoder has little
+                // left to improve (send() stops the passes on a small frame).
+                self.refine_left -= 1;
+                self.refine_qp = Some(REFINE_QPS[REFINE_QPS.len() - self.refine_left as usize - 1]);
             } else if !new_client {
                 continue;
             }
@@ -320,6 +347,7 @@ impl Pipeline {
             if let Err(e) = self.send(&frame, mode) {
                 warn!(%e, "Sending a frame failed");
             }
+            self.refine_qp = None;
             self.last_frame = Some(frame);
         }
         Ok(())
@@ -417,6 +445,7 @@ impl Pipeline {
             mode
         };
         let encoders = self.encoders.as_mut().expect("created above");
+        encoders.encoder.set_const_qp(self.refine_qp)?;
         let t = Instant::now();
         let (main, aux) = self
             .converter
@@ -433,6 +462,12 @@ impl Pipeline {
             None => Default::default(),
         };
         let encode_us = t.elapsed().as_micros();
+        debug!(
+            bytes = out_main.data.len(),
+            qp = out_main.qp,
+            ?mode,
+            "Frame"
+        );
 
         let (surface_id, _, _) = self.surface.expect("surface created above");
         let region = Avc420Region {
@@ -505,6 +540,10 @@ impl Pipeline {
         self.stats_frames += 1;
         self.stats_encode_us += encode_us;
         self.stats_bytes += bytes;
+        if let Some(qp) = self.refine_qp {
+            debug!(bytes, qp, used_qp = out_main.qp, "Quality pass");
+            self.stats_refines += 1;
+        }
         if self.stats_at.elapsed() >= Duration::from_secs(5) {
             let secs = self.stats_at.elapsed().as_secs_f64();
             let acked = self.shared.acked.swap(0, Ordering::Relaxed);
@@ -518,8 +557,10 @@ impl Pipeline {
                 ),
                 capture_to_queue_ms =
                     format!("{:.2}", frame.captured.elapsed().as_secs_f64() * 1000.0),
+                refines = self.stats_refines,
                 "Stream"
             );
+            self.stats_refines = 0;
             self.stats_at = Instant::now();
             self.stats_frames = 0;
             self.stats_encode_us = 0;
@@ -577,7 +618,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     *shared.current_size.lock().unwrap() = clamp_size(opts.width, opts.height);
     let (w, h) = *shared.current_size.lock().unwrap();
     let ctx = CudaContext::new(opts.gpu).context("creating the CUDA context")?;
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = crate::capture::latest_frame();
     let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
     let capture = Capture::start(
         session.node_id,
@@ -599,6 +640,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         upload: crate::gpu::Pool::new(Arc::clone(&ctx)),
         avc444: opts.avc444,
         hybrid: opts.hybrid,
+        refine: opts.refine,
         max_in_flight: opts.max_in_flight,
         ctx: Arc::clone(&ctx),
         bitrate: opts.bitrate,
@@ -610,6 +652,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         last_new_frame: Instant::now(),
         chroma_owed: false,
         need_full: true,
+        refine_left: 0,
+        refine_qp: None,
+        stats_refines: 0,
         start: Instant::now(),
         sent: 0,
         stats_at: Instant::now(),
@@ -696,11 +741,34 @@ impl ConnectionHandler for Connections {
     }
 }
 
+/// GLIDEDESK_DEBUG_FRAME=PATH: keep the newest captured frame (system-memory captures only)
+/// in PATH as raw BGRx, the lossless reference for image quality tests.
+fn debug_dump_frame(f: &Frame) {
+    static PATH: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| std::env::var("GLIDEDESK_DEBUG_FRAME").ok());
+    let (Some(path), FrameData::Cpu { data, stride }) = (PATH.as_ref(), &f.data) else {
+        return;
+    };
+    let row = f.width as usize * 4;
+    let mut out = Vec::with_capacity(row * f.height as usize);
+    for y in 0..f.height as usize {
+        let start = y * *stride as usize;
+        out.extend_from_slice(&data[start..start + row]);
+    }
+    let _ = std::fs::write(path, out);
+}
+
 /// Frames that arrive closer together than this count as motion (H-002).
 const MOTION_GAP: Duration = Duration::from_millis(50);
 /// After this long without a new frame, the image counts as still and its full chroma is
 /// sent.
 const STILL_AFTER: Duration = Duration::from_millis(60);
+/// Quality passes over a still image: once nothing new has arrived for `REFINE_AFTER`, the
+/// image is encoded again at these constant QPs, one pass every `REFINE_INTERVAL`.
+/// The low-latency rate control cannot do it: it gives a static image the same coarse QP.
+const REFINE_QPS: [u32; 2] = [20, 14];
+const REFINE_AFTER: Duration = Duration::from_millis(120);
+const REFINE_INTERVAL: Duration = Duration::from_millis(16);
 
 /// What an AVC444v2 frame carries (MS-RDPEGFX 2.2.4.5, the LC field).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -36,6 +36,8 @@ pub struct EncoderConfig {
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
+    /// Average QP NVENC used for the picture.
+    pub qp: u32,
 }
 
 struct Api {
@@ -89,6 +91,8 @@ pub struct Encoder {
     cfg: EncoderConfig,
     frame_idx: u32,
     force_idr: bool,
+    /// Constant QP of a quality pass, `None` for the normal rate control.
+    const_qp: Option<u32>,
 }
 
 // The raw handles are only used from the thread that owns the encoder.
@@ -129,6 +133,7 @@ impl Encoder {
             cfg: cfg.clone(),
             frame_idx: 0,
             force_idr: true,
+            const_qp: None,
         };
         this.initialize()?;
         this.allocate()?;
@@ -167,13 +172,23 @@ impl Encoder {
         config.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
         config.frameIntervalP = 1;
         let rc = &mut config.rcParams;
-        rc.rateControlMode = nv::NV_ENC_PARAMS_RC_CBR;
-        rc.averageBitRate = c.bitrate;
-        rc.maxBitRate = c.bitrate;
-        // One frame of VBV: the encoder never builds a queue the network must drain.
-        rc.vbvBufferSize = c.bitrate / c.fps.max(1);
-        rc.vbvInitialDelay = rc.vbvBufferSize;
         rc.set_zeroReorderDelay(1);
+        if let Some(qp) = self.const_qp {
+            // Quality pass over a still image: a fixed QP regardless of the bit budget.
+            rc.rateControlMode = nv::NV_ENC_PARAMS_RC_CONSTQP;
+            rc.constQP = nv::NV_ENC_QP {
+                qpInterP: qp,
+                qpInterB: qp,
+                qpIntra: qp,
+            };
+        } else {
+            rc.rateControlMode = nv::NV_ENC_PARAMS_RC_CBR;
+            rc.averageBitRate = c.bitrate;
+            rc.maxBitRate = c.bitrate;
+            // One frame of VBV: the encoder never builds a queue the network must drain.
+            rc.vbvBufferSize = c.bitrate / c.fps.max(1);
+            rc.vbvInitialDelay = rc.vbvBufferSize;
+        }
 
         // SAFETY: the union member matches the codec GUID.
         unsafe {
@@ -334,6 +349,25 @@ impl Encoder {
         self.force_idr = true;
     }
 
+    /// Switches between the low-latency CBR (`None`) and a constant QP for quality passes
+    /// over a still image. The rate control changes in place: no new sequence, no IDR.
+    pub fn set_const_qp(&mut self, qp: Option<u32>) -> Result<()> {
+        if self.const_qp == qp {
+            return Ok(());
+        }
+        self.ctx.bind_to_thread()?;
+        self.const_qp = qp;
+        let mut config = nv::NV_ENC_CONFIG::default();
+        let mut init = self.init_params(&mut config)?;
+        init.encodeConfig = &mut config;
+        let mut re = nv::NV_ENC_RECONFIGURE_PARAMS {
+            version: nv::NV_ENC_RECONFIGURE_PARAMS_VER,
+            reInitEncodeParams: init,
+            ..Default::default()
+        };
+        call!(self.api, nvEncReconfigureEncoder, self.enc, &mut re)
+    }
+
     /// Encodes one BGRx frame from system memory.
     pub fn encode_host(&mut self, data: &[u8], stride: usize) -> Result<EncodedFrame> {
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
@@ -473,8 +507,9 @@ impl Encoder {
             }
             .to_vec();
             let keyframe = lock.pictureType == nv::NV_ENC_PIC_TYPE_IDR;
+            let qp = lock.frameAvgQP;
             call!(self.api, nvEncUnlockBitstream, self.enc, self.bitstream)?;
-            Ok(EncodedFrame { data, keyframe })
+            Ok(EncodedFrame { data, keyframe, qp })
         });
         call!(
             self.api,

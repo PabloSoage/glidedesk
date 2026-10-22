@@ -56,6 +56,9 @@ enum Command {
         /// With AVC444, always send both views (no luma-only frames during motion).
         #[arg(long)]
         no_hybrid: bool,
+        /// Do not re-encode a still image to raise its quality after motion.
+        #[arg(long)]
+        no_refine: bool,
         /// Frames sent and not yet acknowledged by the client. Low values keep the client's
         /// queue short (lower latency); higher ones absorb network jitter.
         #[arg(long, default_value_t = 2)]
@@ -116,6 +119,7 @@ async fn main() -> Result<()> {
             password,
             no_avc444,
             no_hybrid,
+            no_refine,
             max_in_flight,
         } => {
             capture::set_refresh_rate(refresh);
@@ -129,6 +133,7 @@ async fn main() -> Result<()> {
             rdp::serve(rdp::ServeOptions {
                 avc444: !no_avc444,
                 hybrid: !no_hybrid,
+                refine: !no_refine,
                 max_in_flight,
                 bind,
                 gpu,
@@ -181,7 +186,7 @@ async fn encode_test(
     }
     let conn = zbus::Connection::session().await?;
     let session = mutter::Session::start(&conn, mutter::CursorMode::Embedded).await?;
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = capture::latest_frame();
     let (cursor, _cursor_rx) = tokio::sync::watch::channel(None);
     let ctx = cudarc::driver::CudaContext::new(gpu)?;
     let cap = capture::Capture::start(
@@ -264,7 +269,7 @@ async fn capture_test(w: u32, h: u32, rw: u32, rh: u32, seconds: u64) -> Result<
     let conn = zbus::Connection::session().await?;
     let session = mutter::Session::start(&conn, mutter::CursorMode::Metadata).await?;
     info!(node = session.node_id, "Virtual monitor stream ready");
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = capture::latest_frame();
     let (cursor, _cursor_rx) = tokio::sync::watch::channel(None);
     let cap = capture::Capture::start(
         session.node_id,
