@@ -19,10 +19,25 @@ android {
         }
     }
 
+    // Release signing from the environment (never in the repository):
+    // GLIDEDESK_KEYSTORE (path), GLIDEDESK_KEYSTORE_PASSWORD, GLIDEDESK_KEY_ALIAS,
+    // GLIDEDESK_KEY_PASSWORD. Without them, release builds use the debug key.
+    val keystore = System.getenv("GLIDEDESK_KEYSTORE")
+    signingConfigs {
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("GLIDEDESK_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("GLIDEDESK_KEY_ALIAS")
+                keyPassword = System.getenv("GLIDEDESK_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {
