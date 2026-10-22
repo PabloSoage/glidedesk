@@ -1,4 +1,5 @@
-//! Connects like a client, writes the H.264 stream to a file and reports frame rate.
+//! Connects like a client (RDP, or the native protocol with `--native`), writes the video
+//! stream to a file and reports frame rate.
 //! A test tool for the client core (no decoder, no window).
 
 use std::io::Write;
@@ -7,14 +8,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use glidedesk_client::gfx::VideoSink;
+use glidedesk_client::gfx::{VideoCodec, VideoSink};
 use glidedesk_client::session::{ConnectOptions, Input, run};
 
 #[derive(Parser)]
 struct Args {
     host: String,
-    #[arg(long, default_value_t = 3389)]
-    port: u16,
+    /// Default 3389, or 3391 with --native.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Use the native low-latency protocol instead of RDP.
+    #[arg(long)]
+    native: bool,
+    /// With --native: ask for HEVC instead of H.264.
+    #[arg(long)]
+    hevc: bool,
     #[arg(long)]
     user: String,
     #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
@@ -40,14 +48,14 @@ struct FileSink {
 }
 
 impl VideoSink for FileSink {
-    fn reset(&mut self, width: u32, height: u32) {
+    fn reset(&mut self, width: u32, height: u32, codec: VideoCodec) {
         self.resets.push((width, height));
-        eprintln!("reset {width}x{height}");
+        eprintln!("reset {width}x{height} {codec:?}");
     }
-    fn frame(&mut self, h264: &[u8]) {
+    fn frame(&mut self, data: &[u8]) {
         self.frames += 1;
-        self.bytes += h264.len() as u64;
-        let _ = self.file.write_all(h264);
+        self.bytes += data.len() as u64;
+        let _ = self.file.write_all(data);
     }
 }
 
@@ -67,16 +75,39 @@ async fn main() -> Result<()> {
         resets: Vec::new(),
     }));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let opts = ConnectOptions {
-        host: a.host,
-        port: a.port,
-        username: a.user,
-        password: a.password,
-        width: a.width,
-        height: a.height,
-    };
     let shared: glidedesk_client::gfx::SharedSink = sink.clone();
-    let session = tokio::spawn(run(opts, shared, rx));
+    let session = if a.native {
+        let opts = glidedesk_client::native::NativeOptions {
+            host: a.host,
+            port: a.port.unwrap_or(glidedesk_proto::DEFAULT_PORT),
+            username: a.user,
+            password: a.password,
+            width: a.width,
+            height: a.height,
+            codecs: if a.hevc {
+                vec![VideoCodec::Hevc, VideoCodec::H264]
+            } else {
+                vec![VideoCodec::H264]
+            },
+            refresh: 60,
+            pinned: None,
+        };
+        tokio::spawn(async move {
+            glidedesk_client::native::run(opts, shared, rx)
+                .await
+                .map(|_| ())
+        })
+    } else {
+        let opts = ConnectOptions {
+            host: a.host,
+            port: a.port.unwrap_or(3389),
+            username: a.user,
+            password: a.password,
+            width: a.width,
+            height: a.height,
+        };
+        tokio::spawn(run(opts, shared, rx))
+    };
     let start = Instant::now();
     let total = Duration::from_secs(a.seconds);
     let mut resized = false;

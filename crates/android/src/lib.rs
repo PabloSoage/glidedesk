@@ -10,7 +10,7 @@ mod android {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use glidedesk_client::gfx::{SharedSink, VideoSink};
+    use glidedesk_client::gfx::{SharedSink, VideoCodec, VideoSink};
     use glidedesk_client::session::{ConnectOptions, Input, run};
     use jni::JNIEnv;
     use jni::objects::{JClass, JObject, JString};
@@ -26,8 +26,9 @@ mod android {
     /// dropped and the next keyframe restarts the picture.
     struct Decoder {
         window: Option<NativeWindow>,
-        codec: Option<MediaCodec>,
+        mc: Option<MediaCodec>,
         size: (u32, u32),
+        codec: VideoCodec,
         pts_us: u64,
         frames: u64,
     }
@@ -38,18 +39,22 @@ mod android {
 
     impl Decoder {
         fn start(&mut self) {
-            self.codec = None;
+            self.mc = None;
             let (Some(window), (w, h)) = (&self.window, self.size) else {
                 return;
             };
             if w == 0 || h == 0 {
                 return;
             }
-            let Some(codec) = MediaCodec::from_decoder_type("video/avc") else {
+            let mime = match self.codec {
+                VideoCodec::H264 => "video/avc",
+                VideoCodec::Hevc => "video/hevc",
+            };
+            let Some(codec) = MediaCodec::from_decoder_type(mime) else {
                 return;
             };
             let mut format = MediaFormat::new();
-            format.set_str("mime", "video/avc");
+            format.set_str("mime", mime);
             format.set_i32("width", w as i32);
             format.set_i32("height", h as i32);
             // Ask the decoder not to hold frames back (Android 11+; ignored before).
@@ -60,19 +65,20 @@ mod android {
                 .is_ok()
                 && codec.start().is_ok()
             {
-                self.codec = Some(codec);
+                self.mc = Some(codec);
             }
         }
     }
 
     impl VideoSink for Decoder {
-        fn reset(&mut self, width: u32, height: u32) {
+        fn reset(&mut self, width: u32, height: u32, codec: VideoCodec) {
             self.size = (width, height);
+            self.codec = codec;
             self.start();
         }
 
         fn frame(&mut self, h264: &[u8]) {
-            let Some(codec) = &self.codec else { return };
+            let Some(codec) = &self.mc else { return };
             self.frames += 1;
             if let Ok(DequeuedInputBufferResult::Buffer(mut buf)) =
                 codec.dequeue_input_buffer(Duration::from_millis(5))
@@ -119,9 +125,9 @@ mod android {
     }
 
     impl VideoSink for Sink {
-        fn reset(&mut self, width: u32, height: u32) {
+        fn reset(&mut self, width: u32, height: u32, codec: VideoCodec) {
             self.status.lock().unwrap().connected = true;
-            self.decoder.lock().unwrap().reset(width, height);
+            self.decoder.lock().unwrap().reset(width, height, codec);
         }
         fn frame(&mut self, h264: &[u8]) {
             self.decoder.lock().unwrap().frame(h264);
@@ -165,8 +171,9 @@ mod android {
         };
         let decoder = Arc::new(Mutex::new(Decoder {
             window: None,
-            codec: None,
+            mc: None,
             size: (0, 0),
+            codec: VideoCodec::H264,
             pts_us: 0,
             frames: 0,
         }));

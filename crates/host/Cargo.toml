@@ -30,6 +30,9 @@ ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "57997
 ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
 libc = "0.2"
 ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+glidedesk-proto = { path = "../proto" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+socket2 = { version = "0.6", features = ["all"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rayon = "1"
 # Bindings to the system FFmpeg (libavcodec-dev): VA-API and software encoders.

@@ -32,3 +32,8 @@ ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e"
 ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
 ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
 ironrdp-input = { git = "https://github.com/Devolutions/IronRDP", rev = "579979e" }
+glidedesk-proto = { path = "../proto" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }

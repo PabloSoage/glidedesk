@@ -57,6 +57,7 @@ pub enum Choice {
 
 /// What one EGFX frame needs from the encoder.
 pub struct Request {
+    pub codec: Codec,
     pub avc444: bool,
     /// Encode the main view (not for an AVC444 chroma-only frame).
     pub main: bool,
@@ -70,6 +71,7 @@ pub trait Backend: Send {
     fn name(&self) -> &'static str;
     /// Whether AVC444 (both views through one encoder, two references) is available.
     fn supports_avc444(&self) -> bool;
+    fn supports_hevc(&self) -> bool;
     /// `Request::const_qp` is honoured only where the rate control can switch in place
     /// (NVENC); elsewhere a quality pass is a plain re-encode.
     fn request_keyframe(&mut self);
@@ -77,9 +79,9 @@ pub trait Backend: Send {
     fn encode(&mut self, frame: &Frame, req: &Request) -> Result<(EncodedFrame, EncodedFrame)>;
 }
 
-fn config(w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) -> EncoderConfig {
+fn config(codec: Codec, w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) -> EncoderConfig {
     EncoderConfig {
-        codec: Codec::H264,
+        codec,
         width: w,
         height: h,
         // AVC444 sends two pictures per frame.
@@ -91,12 +93,16 @@ fn config(w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) -> EncoderConfig
 
 // ---------------------------------------------------------------------------------------
 
+/// Codec and whether the two AVC444 views go through the encoder.
+type EncoderKey = (Codec, bool);
+
 pub struct Nvenc {
     ctx: Arc<CudaContext>,
     converter: color::Converter,
     /// Device buffers for frames that arrive in system memory.
     upload: crate::gpu::Pool,
-    encoder: Option<(Encoder, bool, (u32, u32))>,
+    /// The encoder, what it was opened for (codec, AVC444) and its size.
+    encoder: Option<(Encoder, EncoderKey, (u32, u32))>,
     fps: u32,
     bitrate: u32,
 }
@@ -125,6 +131,10 @@ impl Backend for Nvenc {
         true
     }
 
+    fn supports_hevc(&self) -> bool {
+        true
+    }
+
     fn request_keyframe(&mut self) {
         if let Some((e, _, _)) = self.encoder.as_mut() {
             e.request_keyframe();
@@ -143,11 +153,22 @@ impl Backend for Nvenc {
         if self
             .encoder
             .as_ref()
-            .is_none_or(|(_, a, s)| *s != size || *a != req.avc444)
+            .is_none_or(|(_, k, s)| *s != size || *k != (req.codec, req.avc444))
         {
-            let cfg = config(size.0, size.1, req.avc444, self.fps, self.bitrate);
-            self.encoder = Some((Encoder::new(Arc::clone(&self.ctx), cfg)?, req.avc444, size));
-            info!(w, h, avc444 = req.avc444, "NVENC encoder ready");
+            let cfg = config(
+                req.codec,
+                size.0,
+                size.1,
+                req.avc444,
+                self.fps,
+                self.bitrate,
+            );
+            self.encoder = Some((
+                Encoder::new(Arc::clone(&self.ctx), cfg)?,
+                (req.codec, req.avc444),
+                size,
+            ));
+            info!(w, h, codec = ?req.codec, avc444 = req.avc444, "NVENC encoder ready");
         }
         let (encoder, _, _) = self.encoder.as_mut().expect("created above");
         encoder.set_const_qp(req.const_qp)?;
@@ -174,17 +195,29 @@ pub struct Ffmpeg {
     device: String,
     main: Option<Nv12Frame>,
     aux: Option<Nv12Frame>,
-    encoder: Option<(FfEncoder, bool)>,
+    encoder: Option<(FfEncoder, (Codec, bool))>,
     fps: u32,
     bitrate: u32,
+    hevc: bool,
 }
 
 impl Ffmpeg {
     pub fn new(kind: Kind, device: String, fps: u32, bitrate: u32) -> Result<Self> {
         // Open a small encoder once so a missing driver or codec shows up at start.
-        FfEncoder::new(kind, &device, config(256, 256, false, fps, bitrate))
-            .with_context(|| format!("{kind:?} encoder on {device}"))?;
+        FfEncoder::new(
+            kind,
+            &device,
+            config(Codec::H264, 256, 256, false, fps, bitrate),
+        )
+        .with_context(|| format!("{kind:?} encoder on {device}"))?;
+        let hevc = FfEncoder::new(
+            kind,
+            &device,
+            config(Codec::Hevc, 256, 256, false, fps, bitrate),
+        )
+        .is_ok();
         Ok(Self {
+            hevc,
             kind,
             device,
             main: None,
@@ -210,6 +243,10 @@ impl Backend for Ffmpeg {
         self.kind == Kind::Software
     }
 
+    fn supports_hevc(&self) -> bool {
+        self.hevc
+    }
+
     fn request_keyframe(&mut self) {
         if let Some((e, _)) = self.encoder.as_mut() {
             e.request_keyframe();
@@ -233,9 +270,10 @@ impl Backend for Ffmpeg {
         if req.aux && self.aux.is_none() {
             self.aux = Some(Nv12Frame::new(cw, ch));
         }
-        if self.encoder.as_ref().is_none_or(|(_, a)| *a != req.avc444) {
-            let cfg = config(cw, ch, req.avc444, self.fps, self.bitrate);
-            self.encoder = Some((FfEncoder::new(self.kind, &self.device, cfg)?, req.avc444));
+        let key = (req.codec, req.avc444);
+        if self.encoder.as_ref().is_none_or(|(_, k)| *k != key) {
+            let cfg = config(req.codec, cw, ch, req.avc444, self.fps, self.bitrate);
+            self.encoder = Some((FfEncoder::new(self.kind, &self.device, cfg)?, key));
         }
         let main = self.main.as_mut().expect("allocated above");
         let aux = if req.aux { self.aux.as_mut() } else { None };

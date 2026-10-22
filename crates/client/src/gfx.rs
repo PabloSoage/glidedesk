@@ -20,11 +20,17 @@ use tracing::{debug, trace};
 
 /// Where decoded-to-be video goes. Implemented by the platform (MediaCodec on Android, a
 /// file in `glidedesk-dump`).
+pub use glidedesk_proto::Codec as VideoCodec;
+
 pub trait VideoSink: Send {
-    /// The desktop has a new size; a new H.264 stream (starting with an IDR) follows.
-    fn reset(&mut self, width: u32, height: u32);
-    /// One H.264 access unit, Annex B.
-    fn frame(&mut self, h264: &[u8]);
+    /// The desktop has a new size (or codec); a new stream starting with an IDR follows.
+    fn reset(&mut self, width: u32, height: u32, codec: VideoCodec);
+    /// One access unit (H.264 or HEVC), Annex B.
+    fn frame(&mut self, data: &[u8]);
+    /// The pointer shape (native protocol; over RDP it comes with the classic updates).
+    fn cursor(&mut self, _cursor: &glidedesk_proto::Cursor) {}
+    /// Session audio: PCM S16LE 48 kHz stereo (native protocol).
+    fn audio(&mut self, _pcm: &[u8]) {}
 }
 
 pub type SharedSink = Arc<Mutex<dyn VideoSink>>;
@@ -82,7 +88,10 @@ impl DvcProcessor for GfxClient {
             match pdu {
                 GfxPdu::ResetGraphics(r) => {
                     debug!(width = r.width, height = r.height, "ResetGraphics");
-                    self.sink.lock().unwrap().reset(r.width, r.height);
+                    self.sink
+                        .lock()
+                        .unwrap()
+                        .reset(r.width, r.height, VideoCodec::H264);
                 }
                 GfxPdu::WireToSurface1(w) if w.codec_id == Codec1Type::Avc420 => {
                     let mut cursor = ReadCursor::new(&w.bitmap_data);

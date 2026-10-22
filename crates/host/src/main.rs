@@ -8,8 +8,11 @@ mod ffenc;
 mod gpu;
 mod input;
 mod mutter;
+mod native;
 mod nvenc;
+mod pipeline;
 mod rdp;
+mod serve;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -27,14 +30,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve the session over RDP.
+    /// Serve the session over RDP and the native protocol.
     Serve {
         /// Refresh rate of the virtual monitor (Hz). Higher means fresher frames and lower
         /// latency at the cost of more encoding while things move.
         #[arg(long, env = "GLIDEDESK_REFRESH", default_value_t = 120)]
         refresh: u32,
+        /// RDP address.
         #[arg(long, default_value = "0.0.0.0:3389")]
         bind: std::net::SocketAddr,
+        /// Native protocol address (TCP and UDP).
+        #[arg(long, default_value = "0.0.0.0:3391")]
+        native_bind: std::net::SocketAddr,
+        /// Only RDP.
+        #[arg(long)]
+        no_native: bool,
         /// CUDA device index (NVENC).
         #[arg(long, default_value_t = 0)]
         gpu: usize,
@@ -120,6 +130,8 @@ async fn main() -> Result<()> {
         Command::Serve {
             refresh,
             bind,
+            native_bind,
+            no_native,
             gpu,
             encoder,
             render_node,
@@ -142,12 +154,15 @@ async fn main() -> Result<()> {
                 })
                 .unwrap_or_else(|| ".".into())
                 .join("glidedesk");
-            rdp::serve(rdp::ServeOptions {
-                avc444: !no_avc444,
-                hybrid: !no_hybrid,
-                refine: !no_refine,
-                max_in_flight,
+            serve::serve(serve::ServeOptions {
+                pipeline: pipeline::Options {
+                    avc444: !no_avc444,
+                    hybrid: !no_hybrid,
+                    refine: !no_refine,
+                    max_in_flight,
+                },
                 bind,
+                native_bind: (!no_native).then_some(native_bind),
                 gpu,
                 encoder,
                 render_node,
