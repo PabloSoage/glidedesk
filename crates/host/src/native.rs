@@ -18,13 +18,17 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::capture::CursorEvent;
 use crate::encoder::{Codec, EncodedFrame};
+use crate::frame::CursorEvent;
 use crate::input::InputForwarder;
 use crate::pipeline::{self, Mode, Output, Prepared};
 
 /// Parity added to every video block, in percent of its data shards.
 const FEC_PERCENT: u32 = 20;
+/// Packets of a frame sent at full speed before pacing starts (a typical P-frame fits).
+const PACE_BURST: usize = 64;
+/// Sending rate for the rest of a large frame.
+const PACE_BITS_PER_SEC: f64 = 300e6;
 
 /// The current client, as the pipeline and the UDP task see it.
 struct Link {
@@ -108,8 +112,20 @@ impl Output for NativeOutput {
             return Ok(false);
         };
         link.frame_id = link.frame_id.wrapping_add(1);
-        for p in fec::packetize(link.frame_id, main.keyframe, &main.data, FEC_PERCENT) {
-            Shared::seal_and_send(link, &self.shared.udp, peer, &p);
+        let start = std::time::Instant::now();
+        let packets = fec::packetize(link.frame_id, main.keyframe, &main.data, FEC_PERCENT);
+        for (i, p) in packets.iter().enumerate() {
+            Shared::seal_and_send(link, &self.shared.udp, peer, p);
+            // Pacing: past the first burst, keep to PACE_BITS_PER_SEC so a large frame (an
+            // IDR is hundreds of packets) does not overflow a Wi-Fi access point's queue.
+            if i >= PACE_BURST && i % 16 == 0 {
+                let due = std::time::Duration::from_secs_f64(
+                    ((i - PACE_BURST) * fec::SHARD * 8) as f64 / PACE_BITS_PER_SEC,
+                );
+                if let Some(wait) = due.checked_sub(start.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+            }
         }
         Ok(true)
     }

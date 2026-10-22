@@ -6,15 +6,22 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["gnome"]
+# Headless GNOME sessions through Mutter and PipeWire.
+gnome = ["dep:zbus", "dep:pipewire", "dep:futures-util"]
+# Existing X11 displays (Termux's termux-x11, X11 desktops).
+x11 = ["dep:x11rb"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
-pipewire = "0.10"
-futures-util = "0.3"
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"], optional = true }
+pipewire = { version = "0.10", optional = true }
+futures-util = { version = "0.3", optional = true }
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cuda-12080", "dynamic-loading"] }
 libloading = "0.9"
 nvenc-sys = { path = "../nvenc-sys" }
@@ -33,6 +40,7 @@ ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "579979
 glidedesk-proto = { path = "../proto" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 socket2 = { version = "0.6", features = ["all"] }
+x11rb = { version = "0.14", default-features = false, features = ["damage", "xfixes", "xtest"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rayon = "1"
 # Bindings to the system FFmpeg (libavcodec-dev): VA-API and software encoders.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/host", "crates/nvenc-sys", "crates/probe", "crates/client", "crates/android", "crates/proto", "crates/desktop"]
+members = ["crates/host", "crates/nvenc-sys", "crates/probe", "crates/client", "crates/android", "crates/proto", "crates/desktop", "crates/x11"]
 
 [workspace.package]
 version = "0.1.0"

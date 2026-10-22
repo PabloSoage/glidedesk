@@ -13,10 +13,10 @@ use anyhow::{Context, Result, bail};
 use cudarc::driver::CudaContext;
 use tracing::{info, warn};
 
-use crate::capture::{Frame, FrameData};
 use crate::color;
 use crate::csc::{self, Nv12Frame};
 use crate::ffenc::{FfEncoder, Kind};
+use crate::frame::{Frame, FrameData};
 use crate::nvenc::Encoder;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

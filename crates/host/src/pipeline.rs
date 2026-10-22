@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tracing::{debug, info, warn};
 
-use crate::capture::{Capture, Frame, FrameData, FrameReceiver};
 use crate::encoder::{self, Codec, EncodedFrame};
+use crate::frame::{Frame, FrameData, FrameReceiver, Source};
 
 /// State shared by the front ends and the pipeline thread.
 #[derive(Default)]
@@ -107,7 +107,7 @@ pub struct Options {
 
 pub struct Pipeline {
     shared: std::sync::Arc<Shared>,
-    capture: Capture,
+    source: Box<dyn Source>,
     frames: FrameReceiver,
     backend: Box<dyn encoder::Backend>,
     outputs: Vec<Box<dyn Output>>,
@@ -141,7 +141,7 @@ struct Stats {
 impl Pipeline {
     pub fn new(
         shared: std::sync::Arc<Shared>,
-        capture: Capture,
+        source: Box<dyn Source>,
         frames: FrameReceiver,
         backend: Box<dyn encoder::Backend>,
         outputs: Vec<Box<dyn Output>>,
@@ -149,7 +149,7 @@ impl Pipeline {
     ) -> Self {
         Self {
             shared,
-            capture,
+            source,
             frames,
             backend,
             outputs,
@@ -179,7 +179,7 @@ impl Pipeline {
                 if self.last_frame.as_ref().map(|f| (f.width, f.height)) != Some((w, h))
                     || cur != (w, h)
                 {
-                    self.capture.resize(w, h);
+                    self.source.resize(w, h);
                     *self.shared.current_size.lock().unwrap() = (w, h);
                 }
             }

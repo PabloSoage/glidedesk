@@ -21,8 +21,8 @@ use ironrdp_server::{
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
-use crate::capture::CursorEvent;
 use crate::encoder::{Codec, EncodedFrame};
+use crate::frame::CursorEvent;
 use crate::input::InputForwarder;
 use crate::pipeline::{self, Mode, Output, Prepared};
 
@@ -364,7 +364,8 @@ pub struct Front {
     pub cursor: tokio::sync::watch::Receiver<Option<CursorEvent>>,
     pub audio: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
     pub input: InputForwarder,
-    pub remote: crate::mutter::RemoteDesktopSessionProxy<'static>,
+    /// Clipboard bridge, when the session has one.
+    pub clipboard: Option<Box<dyn ironrdp_server::CliprdrServerFactory>>,
 }
 
 /// The RDP front end as output `index` of the pipeline: the output, and the server to run.
@@ -406,12 +407,10 @@ impl Server {
             })
             .with_gfx_factory(Some(Box::new(GfxFactory(Arc::clone(&self.shared)))))
             .with_sound_factory(front.audio.map(|a| {
-                Box::new(crate::audio::SoundFactory::new(a))
+                Box::new(crate::sound::SoundFactory::new(a))
                     as Box<dyn ironrdp_server::SoundServerFactory>
             }))
-            .with_cliprdr_factory(Some(Box::new(crate::clipboard::ClipboardFactory::spawn(
-                front.remote,
-            ))))
+            .with_cliprdr_factory(front.clipboard)
             .with_connection_handler(Some(Box::new(Connections)))
             // RDP-UDP on the same port, as Windows does; TCP stays as the fallback.
             .with_udp_transport(front.bind)

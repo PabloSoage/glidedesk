@@ -1,10 +1,10 @@
-//! RDP input to Mutter RemoteDesktop calls.
+//! Client input (RDP events, also used by the native front end) to the session: Linux key
+//! codes, keysyms, absolute pointer motion, buttons and wheel steps, applied by an
+//! [`InputBackend`] (Mutter RemoteDesktop, or XTEST on an X11 display).
 
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
-
-use crate::mutter::RemoteDesktopSessionProxy;
 
 // Linux evdev button codes (linux/input-event-codes.h).
 const BTN_LEFT: i32 = 0x110;
@@ -17,13 +17,65 @@ const KEY_LEFTSHIFT: u32 = 42;
 /// RDP wheel units per notch (MS-RDPBCGR 2.2.8.1.1.3.1.1.3).
 const WHEEL_DELTA: i32 = 120;
 
+/// One input event for the session.
 #[derive(Debug)]
-enum Input {
+pub enum Input {
+    /// Linux evdev key code, pressed.
     Key(u32, bool),
+    /// X keysym (text with no key), pressed.
     Keysym(u32, bool),
+    /// Absolute position in desktop pixels.
     Motion(f64, f64),
+    /// Linux evdev button code (BTN_LEFT ...), pressed.
     Button(i32, bool),
+    /// Wheel notches: axis 0 vertical (positive down), 1 horizontal (positive right).
     Scroll { axis: u32, steps: i32 },
+}
+
+/// Applies input to the session.
+#[async_trait::async_trait]
+pub trait InputBackend: Send + Sync + 'static {
+    /// Runs once before the first event.
+    async fn start(&self) {}
+    async fn apply(&self, ev: &Input) -> anyhow::Result<()>;
+}
+
+/// Mutter's RemoteDesktop session.
+#[cfg(feature = "gnome")]
+pub struct MutterInput {
+    pub remote: crate::mutter::RemoteDesktopSessionProxy<'static>,
+    pub stream_path: String,
+}
+
+#[cfg(feature = "gnome")]
+#[async_trait::async_trait]
+impl InputBackend for MutterInput {
+    async fn start(&self) {
+        // Mutter drops the first key event of a remote desktop session (the virtual
+        // keyboard is set up on it): spend it on a Shift tap, which types nothing.
+        let _ = self
+            .remote
+            .notify_keyboard_keycode(KEY_LEFTSHIFT, true)
+            .await;
+        let _ = self
+            .remote
+            .notify_keyboard_keycode(KEY_LEFTSHIFT, false)
+            .await;
+    }
+
+    async fn apply(&self, ev: &Input) -> anyhow::Result<()> {
+        let r = &self.remote;
+        Ok(match *ev {
+            Input::Key(code, down) => r.notify_keyboard_keycode(code, down).await?,
+            Input::Keysym(sym, down) => r.notify_keyboard_keysym(sym, down).await?,
+            Input::Motion(x, y) => {
+                r.notify_pointer_motion_absolute(&self.stream_path, x, y)
+                    .await?
+            }
+            Input::Button(b, down) => r.notify_pointer_button(b, down).await?,
+            Input::Scroll { axis, steps } => r.notify_pointer_axis_discrete(axis, steps).await?,
+        })
+    }
 }
 
 /// Translates a set-1 scan code (with the E0 prefix flag) to an evdev key code.
@@ -78,8 +130,8 @@ fn unicode_keysym(cp: u16) -> u32 {
     }
 }
 
-/// Input handler given to IronRDP. Its callbacks are synchronous, so events go through a
-/// channel to a task that makes the D-Bus calls in order.
+/// Input handler given to IronRDP (and used by the native front end). Its callbacks are
+/// synchronous, so events go through a channel to a task that applies them in order.
 #[derive(Clone)]
 pub struct InputForwarder {
     tx: mpsc::UnboundedSender<Input>,
@@ -91,13 +143,10 @@ pub struct InputForwarder {
 }
 
 impl InputForwarder {
-    pub fn spawn(remote: RemoteDesktopSessionProxy<'static>, stream_path: String) -> Self {
+    pub fn spawn(backend: Box<dyn InputBackend>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
         tokio::spawn(async move {
-            // Mutter drops the first key event of a remote desktop session (the virtual
-            // keyboard is set up on it): spend it on a Shift tap, which types nothing.
-            let _ = remote.notify_keyboard_keycode(KEY_LEFTSHIFT, true).await;
-            let _ = remote.notify_keyboard_keycode(KEY_LEFTSHIFT, false).await;
+            backend.start().await;
             let mut last_pos = None;
             let mut next = None;
             while let Some(mut ev) = match next.take() {
@@ -116,25 +165,14 @@ impl InputForwarder {
                     }
                 }
                 debug!(?ev, queued = rx.len(), "Input");
-                let r = match ev {
-                    Input::Key(code, down) => remote.notify_keyboard_keycode(code, down).await,
-                    Input::Keysym(sym, down) => remote.notify_keyboard_keysym(sym, down).await,
-                    Input::Motion(x, y) => {
-                        // Clients repeat the position with every button event.
-                        if last_pos == Some((x, y)) {
-                            continue;
-                        }
-                        last_pos = Some((x, y));
-                        remote
-                            .notify_pointer_motion_absolute(&stream_path, x, y)
-                            .await
+                if let Input::Motion(x, y) = ev {
+                    // Clients repeat the position with every button event.
+                    if last_pos == Some((x, y)) {
+                        continue;
                     }
-                    Input::Button(b, down) => remote.notify_pointer_button(b, down).await,
-                    Input::Scroll { axis, steps } => {
-                        remote.notify_pointer_axis_discrete(axis, steps).await
-                    }
-                };
-                if let Err(e) = r {
+                    last_pos = Some((x, y));
+                }
+                if let Err(e) = backend.apply(&ev).await {
                     warn!(%e, "Input call failed");
                 }
             }

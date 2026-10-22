@@ -11,9 +11,10 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
   produces them.
 - **Standard clients**: the RDP front end speaks the graphics pipeline extension (H.264
   AVC420/AVC444), so the Windows Remote Desktop client (`mstsc`), Microsoft's Windows App on
-  macOS/iOS/Android and FreeRDP/Remmina work without installing anything. A
-  Moonlight-compatible front end for the lowest latency (HEVC, high refresh rates) is
-  planned.
+  macOS/iOS/Android and FreeRDP/Remmina work without installing anything.
+- **A low-latency protocol of its own** for glidedesk's clients: video over UDP with
+  Reed-Solomon FEC (no retransmission stalls), HEVC or H.264, everything else over TLS, the
+  desktop following the window and the pointer drawn locally.
 
 **Status: early development.** What works today, on Ubuntu 24.04 with GNOME 46 and an NVIDIA
 GPU:
@@ -32,7 +33,12 @@ GPU:
 | Clipboard (text, both ways) | works |
 | Audio (session sink → rdpsnd, 48 kHz PCM) | works |
 | Virtual monitor above 60 Hz (`--refresh`, default 120) | works |
-| HEVC / AV1 low-latency client (Moonlight protocol), adaptive per-region quality | planned |
+| Native low-latency protocol (TLS control, encrypted UDP video with FEC, port 3391) | works |
+| Desktop client `glidedesk` (Windows, Linux: wgpu, OpenH264) | works (tested on Linux) |
+| Minimal X11 client `glidedesk-x11` (Termux with termux-x11, X11 without a GPU) | works (tested on Linux) |
+| Android client (RDP or native protocol, MediaCodec H.264/HEVC) | works on the emulator |
+| Serving an existing X11 display (`serve --x11 :0`: Termux with termux-x11, X11 desktops; DAMAGE capture, XTEST input, PulseAudio) | works (tested on Linux) |
+| Adaptive per-region quality, hardware decoding in the desktop client | planned |
 
 ## Try the pieces
 
@@ -51,6 +57,28 @@ GLIDEDESK_PASSWORD=... scripts/dev-serve.sh
 
 Then connect with `mstsc /v:<host>` as your Linux user name and that password. The
 certificate is self-signed (created in `~/.config/glidedesk/`).
+
+## Clients
+
+```sh
+# Desktop (Windows or Linux): native protocol, or --rdp
+GLIDEDESK_PASSWORD=... cargo run --release -p glidedesk-desktop -- <host> --user <user>
+# Termux (Android) with termux-x11: build on the phone (pkg install rust clang) or
+# cross-compile, then run it with DISPLAY=:0
+cargo ndk -t arm64-v8a build --release -p glidedesk-x11
+# Android app: android/ (Gradle; builds the Rust core with cargo-ndk)
+```
+
+## Serving an X11 display (Termux, X11 desktops)
+
+```sh
+# In Termux: pkg install rust clang ffmpeg pulseaudio termux-x11-nightly, start an X11 desktop
+# (e.g. XFCE) on :0, then:
+cargo build --release -p glidedesk-host --no-default-features --features x11
+GLIDEDESK_PASSWORD=... target/release/glidedesk-host serve --x11 :0 --encoder software
+```
+
+The display keeps its own size; input goes through XTEST, sound through PulseAudio.
 
 `dev-session.sh` starts its own session bus, so it does not interfere with a desktop that is
 already running.

@@ -71,8 +71,12 @@ rustTargets.forEach { target ->
         workingDir = file("../..")
         val components = project.extensions.getByType<com.android.build.api.variant.ApplicationAndroidComponentsExtension>()
         environment("ANDROID_NDK_HOME", components.sdkComponents.ndkDirectory.get().asFile.absolutePath)
+        // Without debug info the library is ~10x smaller (the APK went from 84 MB).
+        environment("CARGO_PROFILE_RELEASE_DEBUG", "false")
+        environment("CARGO_PROFILE_RELEASE_STRIP", "symbols")
         inputs.dir("../../crates/client/src")
         inputs.dir("../../crates/android/src")
+        inputs.dir("../../crates/proto/src")
         outputs.dir("src/main/jniLibs/$target")
         commandLine(
             cargoCommand, "ndk", "-t", target, "-o", "android/app/src/main/jniLibs",

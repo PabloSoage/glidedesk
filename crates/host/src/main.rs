@@ -1,18 +1,32 @@
+// Builds without the GNOME session (X11 only) leave the NVIDIA DMA-BUF import and the
+// GNOME-only test commands unused.
+#![cfg_attr(not(feature = "gnome"), allow(dead_code, unused_imports))]
+
+#[cfg(feature = "gnome")]
 mod audio;
+#[cfg(feature = "gnome")]
 mod capture;
+#[cfg(feature = "gnome")]
 mod clipboard;
 mod color;
 mod csc;
 mod encoder;
 mod ffenc;
+mod frame;
 mod gpu;
 mod input;
+#[cfg(feature = "gnome")]
 mod mutter;
 mod native;
 mod nvenc;
 mod pipeline;
+#[cfg(feature = "x11")]
+mod pulse;
 mod rdp;
 mod serve;
+mod sound;
+#[cfg(feature = "x11")]
+mod x11session;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -32,6 +46,10 @@ struct Cli {
 enum Command {
     /// Serve the session over RDP and the native protocol.
     Serve {
+        /// Serve an existing X11 display (e.g. :0) instead of a headless GNOME session.
+        #[cfg(feature = "x11")]
+        #[arg(long, value_name = "DISPLAY")]
+        x11: Option<String>,
         /// Refresh rate of the virtual monitor (Hz). Higher means fresher frames and lower
         /// latency at the cost of more encoding while things move.
         #[arg(long, env = "GLIDEDESK_REFRESH", default_value_t = 120)]
@@ -84,6 +102,7 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         max_in_flight: u32,
     },
+    #[cfg(feature = "gnome")]
     /// Capture the session for a few seconds, resize half way, and report frame rates.
     CaptureTest {
         #[arg(long, default_value_t = 1920)]
@@ -98,6 +117,7 @@ enum Command {
         #[arg(long, default_value_t = 6)]
         seconds: u64,
     },
+    #[cfg(feature = "gnome")]
     /// Capture and encode with NVENC, write the elementary stream and report timings.
     EncodeTest {
         #[arg(long, default_value_t = 1920)]
@@ -128,6 +148,8 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().command {
         Command::Serve {
+            #[cfg(feature = "x11")]
+            x11,
             refresh,
             bind,
             native_bind,
@@ -146,7 +168,17 @@ async fn main() -> Result<()> {
             no_refine,
             max_in_flight,
         } => {
+            #[cfg(feature = "gnome")]
             capture::set_refresh_rate(refresh);
+            #[cfg(feature = "x11")]
+            let session = match x11 {
+                Some(display) => serve::SessionKind::X11 {
+                    display: (!display.is_empty()).then_some(display),
+                },
+                None => default_session()?,
+            };
+            #[cfg(not(feature = "x11"))]
+            let session = default_session()?;
             let state_dir = std::env::var_os("XDG_CONFIG_HOME")
                 .map(std::path::PathBuf::from)
                 .or_else(|| {
@@ -155,6 +187,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| ".".into())
                 .join("glidedesk");
             serve::serve(serve::ServeOptions {
+                session,
                 pipeline: pipeline::Options {
                     avc444: !no_avc444,
                     hybrid: !no_hybrid,
@@ -178,6 +211,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        #[cfg(feature = "gnome")]
         Command::CaptureTest {
             width,
             height,
@@ -185,6 +219,7 @@ async fn main() -> Result<()> {
             resize_height,
             seconds,
         } => capture_test(width, height, resize_width, resize_height, seconds).await,
+        #[cfg(feature = "gnome")]
         Command::EncodeTest {
             width,
             height,
@@ -197,6 +232,15 @@ async fn main() -> Result<()> {
     }
 }
 
+/// The session served when no other is chosen: a headless GNOME Shell.
+fn default_session() -> Result<serve::SessionKind> {
+    #[cfg(feature = "gnome")]
+    return Ok(serve::SessionKind::Gnome);
+    #[cfg(not(feature = "gnome"))]
+    anyhow::bail!("this build serves X11 displays only: pass --x11 DISPLAY")
+}
+
+#[cfg(feature = "gnome")]
 async fn encode_test(
     w: u32,
     h: u32,
@@ -294,6 +338,7 @@ async fn encode_test(
     r
 }
 
+#[cfg(feature = "gnome")]
 async fn capture_test(w: u32, h: u32, rw: u32, rh: u32, seconds: u64) -> Result<()> {
     let conn = zbus::Connection::session().await?;
     let session = mutter::Session::start(&conn, mutter::CursorMode::Metadata).await?;

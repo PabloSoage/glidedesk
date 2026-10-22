@@ -1,9 +1,15 @@
-//! A remote session: the headless GNOME Shell's virtual monitor, captured and encoded once,
-//! served to the RDP and the native front ends (one client at a time).
+//! A remote session: frames from the session backend, encoded once, served to the RDP and
+//! the native front ends (one client at a time).
 //!
-//! Threads: the tokio runtime runs both front ends and the input task; the PipeWire threads
-//! capture video and audio; the pipeline thread encodes the newest frame and hands it to the
-//! output of whichever front end has the client.
+//! Session backends:
+//! - GNOME (`gnome` feature): a virtual monitor of the headless GNOME Shell through Mutter's
+//!   ScreenCast/RemoteDesktop and PipeWire; the desktop follows the client's size.
+//! - X11 (`x11` feature): an existing X display (Termux's termux-x11, a Linux desktop),
+//!   captured with GetImage/DAMAGE, input through XTEST; its size is the display's.
+//!
+//! Threads: the tokio runtime runs both front ends and the input task; the capture threads
+//! produce frames; the pipeline thread encodes the newest frame and hands it to the output
+//! of whichever front end has the client.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -11,15 +17,25 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
+use tokio::sync::{broadcast, watch};
 use tracing::{info, warn};
 
-use crate::capture::{Capture, Sinks};
 use crate::encoder;
-use crate::input::InputForwarder;
-use crate::mutter;
+use crate::frame::{CursorEvent, FrameReceiver, Source};
+use crate::input::{InputBackend, InputForwarder};
 use crate::pipeline::{self, Output, Pipeline};
 
+/// Where the desktop comes from.
+#[derive(Clone, Debug)]
+pub enum SessionKind {
+    #[cfg(feature = "gnome")]
+    Gnome,
+    #[cfg(feature = "x11")]
+    X11 { display: Option<String> },
+}
+
 pub struct ServeOptions {
+    pub session: SessionKind,
     pub pipeline: pipeline::Options,
     pub bind: SocketAddr,
     /// Native protocol (TCP + UDP); `None` turns it off.
@@ -42,7 +58,28 @@ pub struct ServeOptions {
 const RDP: usize = 0;
 const NATIVE: usize = 1;
 
-pub async fn serve(opts: ServeOptions) -> Result<()> {
+/// What a session backend provides to the front ends.
+struct Parts {
+    source: Box<dyn Source>,
+    frames: FrameReceiver,
+    cursor: watch::Receiver<Option<CursorEvent>>,
+    input: Box<dyn InputBackend>,
+    audio: Option<broadcast::Sender<Vec<u8>>>,
+    clipboard: Option<Box<dyn ironrdp_server::CliprdrServerFactory>>,
+    /// Size the session starts with.
+    size: (u32, u32),
+    /// Run when the server stops.
+    stop: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+}
+
+#[cfg(feature = "gnome")]
+async fn gnome(
+    opts: &ServeOptions,
+    cuda: Option<Arc<cudarc::driver::CudaContext>>,
+) -> Result<Parts> {
+    use crate::capture::{Capture, Sinks};
+    use crate::mutter;
+
     let conn = zbus::Connection::session().await?;
     // GLIDEDESK_CURSOR=hidden|embedded for experiments; metadata (client-drawn) by default.
     let cursor_mode = match std::env::var("GLIDEDESK_CURSOR").as_deref() {
@@ -60,25 +97,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         let conn = conn.clone();
         tokio::spawn(async move { mutter::leave_startup_overview(&conn).await });
     }
-
-    let shared = Arc::new(pipeline::Shared::default());
     let (w, h) = pipeline::clamp_size(opts.width, opts.height);
-    *shared.current_size.lock().unwrap() = (w, h);
-    let (backend, cuda) = encoder::select(
-        opts.encoder,
-        opts.gpu,
-        opts.render_node.clone(),
-        opts.fps,
-        opts.bitrate,
-    )?;
-    info!(
-        encoder = backend.name(),
-        hevc = backend.supports_hevc(),
-        "Video encoder"
-    );
-    let hevc = backend.supports_hevc();
-    let (tx, rx) = crate::capture::latest_frame();
-    let (cursor_tx, cursor_rx) = tokio::sync::watch::channel(None);
+    let (tx, rx) = crate::frame::latest_frame();
+    let (cursor_tx, cursor_rx) = watch::channel(None);
     let capture = Capture::start(
         session.node_id,
         w,
@@ -89,6 +110,72 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         },
         cuda,
     )?;
+    let audio = match crate::audio::start() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            warn!(%e, "No audio");
+            None
+        }
+    };
+    let remote = session.remote.clone();
+    Ok(Parts {
+        source: Box::new(capture),
+        frames: rx,
+        cursor: cursor_rx,
+        input: Box::new(crate::input::MutterInput {
+            remote: session.remote.clone(),
+            stream_path: session.stream_path.clone(),
+        }),
+        audio,
+        clipboard: Some(Box::new(crate::clipboard::ClipboardFactory::spawn(
+            session.remote.clone(),
+        ))),
+        size: (w, h),
+        stop: Some(Box::pin(async move {
+            remote.stop().await.ok();
+        })),
+    })
+}
+
+#[cfg(feature = "x11")]
+fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
+    let s = crate::x11session::start(display, fps)?;
+    Ok(Parts {
+        size: s.size,
+        source: Box::new(s.source),
+        frames: s.frames,
+        cursor: s.cursor,
+        input: Box::new(s.input),
+        audio: crate::pulse::start()
+            .map_err(|e| warn!(%e, "No audio"))
+            .ok(),
+        clipboard: None,
+        stop: None,
+    })
+}
+
+pub async fn serve(opts: ServeOptions) -> Result<()> {
+    let (backend, cuda) = encoder::select(
+        opts.encoder,
+        opts.gpu,
+        opts.render_node.clone(),
+        opts.fps,
+        opts.bitrate,
+    )?;
+    let hevc = backend.supports_hevc();
+    info!(encoder = backend.name(), hevc, "Video encoder");
+
+    let parts = match &opts.session {
+        #[cfg(feature = "gnome")]
+        SessionKind::Gnome => gnome(&opts, cuda).await?,
+        #[cfg(feature = "x11")]
+        SessionKind::X11 { display } => {
+            drop(cuda);
+            x11(display.as_deref(), opts.fps)?
+        }
+    };
+    let shared = Arc::new(pipeline::Shared::default());
+    *shared.current_size.lock().unwrap() = parts.size;
 
     crate::rdp::ensure_identity(&opts.state_dir)?;
     let (rdp_output, rdp_server) = crate::rdp::new(Arc::clone(&shared), RDP);
@@ -103,8 +190,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
     let pipeline = Pipeline::new(
         Arc::clone(&shared),
-        capture,
-        rx,
+        parts.source,
+        parts.frames,
         backend,
         outputs,
         opts.pipeline,
@@ -113,24 +200,16 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .name("pipeline".into())
         .spawn(move || pipeline.run())?;
 
-    let audio = match crate::audio::start() {
-        Ok(a) => Some(a),
-        Err(e) => {
-            warn!(%e, "No audio");
-            None
-        }
-    };
-    let input = InputForwarder::spawn(session.remote.clone(), session.stream_path.clone());
-
+    let input = InputForwarder::spawn(parts.input);
     let rdp = rdp_server.run(crate::rdp::Front {
         bind: opts.bind,
         username: opts.username.clone(),
         password: opts.password.clone(),
         state_dir: opts.state_dir.clone(),
-        cursor: cursor_rx.clone(),
-        audio: audio.clone(),
+        cursor: parts.cursor.clone(),
+        audio: parts.audio.clone(),
         input: input.clone(),
-        remote: session.remote.clone(),
+        clipboard: parts.clipboard,
     });
     let native = async {
         match native {
@@ -142,8 +221,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                         password: opts.password.clone(),
                         state_dir: opts.state_dir.clone(),
                         hevc,
-                        cursor: cursor_rx.clone(),
-                        audio: audio.clone(),
+                        cursor: parts.cursor.clone(),
+                        audio: parts.audio.clone(),
                         input: input.clone(),
                     })
                     .await
@@ -157,6 +236,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
     shared.stop.store(true, Ordering::Relaxed);
     let _ = pipeline_thread.join();
-    session.remote.stop().await.ok();
+    if let Some(stop) = parts.stop {
+        stop.await;
+    }
     r
 }
