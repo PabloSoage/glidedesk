@@ -12,6 +12,7 @@ const BTN_RIGHT: i32 = 0x111;
 const BTN_MIDDLE: i32 = 0x112;
 const BTN_SIDE: i32 = 0x113;
 const BTN_EXTRA: i32 = 0x114;
+const KEY_LEFTSHIFT: u32 = 42;
 
 /// RDP wheel units per notch (MS-RDPBCGR 2.2.8.1.1.3.1.1.3).
 const WHEEL_DELTA: i32 = 120;
@@ -93,6 +94,10 @@ impl InputForwarder {
     pub fn spawn(remote: RemoteDesktopSessionProxy<'static>, stream_path: String) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
         tokio::spawn(async move {
+            // Mutter drops the first key event of a remote desktop session (the virtual
+            // keyboard is set up on it): spend it on a Shift tap, which types nothing.
+            let _ = remote.notify_keyboard_keycode(KEY_LEFTSHIFT, true).await;
+            let _ = remote.notify_keyboard_keycode(KEY_LEFTSHIFT, false).await;
             let mut last_pos = None;
             let mut next = None;
             while let Some(mut ev) = match next.take() {

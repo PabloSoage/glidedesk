@@ -58,21 +58,23 @@ class MainActivity : ComponentActivity() {
                             val sc = extras.getString("scale")?.toFloatOrNull() ?: 1f
                             scale = sc
                             val m = resources.displayMetrics
+                            val lowLatency = extras.getString("native") == "true"
                             session = NativeSession.connect(
-                                extras.getString("host")!!, extras.getString("port")?.toIntOrNull() ?: 3389,
+                                extras.getString("host")!!,
+                                extras.getString("port")?.toIntOrNull() ?: if (lowLatency) 3391 else 3389,
                                 extras.getString("user") ?: "", extras.getString("password") ?: "",
-                                (m.widthPixels / sc).toInt(), (m.heightPixels / sc).toInt(),
+                                (m.widthPixels / sc).toInt(), (m.heightPixels / sc).toInt(), lowLatency,
                             )
                         }
                     }
                     val s = session
                     if (s == null) {
-                        ConnectScreen(prefs, message) { host, port, user, password, sc ->
+                        ConnectScreen(prefs, message) { host, port, user, password, sc, lowLatency ->
                             scale = sc
                             val m = resources.displayMetrics
                             session = NativeSession.connect(
                                 host, port, user, password,
-                                (m.widthPixels / sc).toInt(), (m.heightPixels / sc).toInt(),
+                                (m.widthPixels / sc).toInt(), (m.heightPixels / sc).toInt(), lowLatency,
                             )
                             message = if (session == null) "Could not start the session" else ""
                         }
@@ -93,13 +95,14 @@ class MainActivity : ComponentActivity() {
 private fun ConnectScreen(
     prefs: android.content.SharedPreferences,
     message: String,
-    onConnect: (String, Int, String, String, Float) -> Unit,
+    onConnect: (String, Int, String, String, Float, Boolean) -> Unit,
 ) {
     var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
-    var port by remember { mutableStateOf(prefs.getInt("port", 3389).toString()) }
+    var port by remember { mutableStateOf(prefs.getInt("port", 3391).toString()) }
     var user by remember { mutableStateOf(prefs.getString("user", "") ?: "") }
     var password by remember { mutableStateOf("") }
     var scale by remember { mutableStateOf(prefs.getFloat("scale", 2f).toString()) }
+    var lowLatency by remember { mutableStateOf(prefs.getBoolean("native", true)) }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
@@ -120,12 +123,28 @@ private fun ConnectScreen(
             scale, { scale = it }, Modifier.fillMaxWidth(), label = { Text("Scale (screen pixels per desktop pixel)") },
             singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
         )
+        androidx.compose.foundation.layout.Row(verticalAlignment = Alignment.CenterVertically) {
+            androidx.compose.material3.Switch(
+                checked = lowLatency,
+                onCheckedChange = {
+                    lowLatency = it
+                    // Follow the protocol's default port unless the user set another one.
+                    if (port == "3389" && it) port = "3391"
+                    if (port == "3391" && !it) port = "3389"
+                },
+            )
+            Text(
+                if (lowLatency) "  Low latency (glidedesk protocol)" else "  RDP (any RDP server)",
+                Modifier.padding(start = 8.dp),
+            )
+        }
         Button(
             onClick = {
-                val p = port.toIntOrNull() ?: 3389
+                val p = port.toIntOrNull() ?: if (lowLatency) 3391 else 3389
                 val sc = scale.toFloatOrNull()?.coerceIn(1f, 4f) ?: 2f
-                prefs.edit().putString("host", host).putInt("port", p).putString("user", user).putFloat("scale", sc).apply()
-                onConnect(host.trim(), p, user.trim(), password, sc)
+                prefs.edit().putString("host", host).putInt("port", p).putString("user", user)
+                    .putFloat("scale", sc).putBoolean("native", lowLatency).apply()
+                onConnect(host.trim(), p, user.trim(), password, sc, lowLatency)
             },
             enabled = host.isNotBlank() && user.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),

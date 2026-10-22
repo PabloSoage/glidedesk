@@ -113,7 +113,13 @@ fn input_event(i: Input) -> Option<ClientMsg> {
     Some(match i {
         Input::MouseMove { x, y } => ClientMsg::Input(InputEvent::MouseMove { x, y }),
         Input::MouseButton { button, pressed } => ClientMsg::Input(InputEvent::MouseButton {
-            button,
+            // The wire numbers buttons from 1: left, right, middle, back, forward.
+            button: match button {
+                0 => 1,
+                1 => 3,
+                2 => 2,
+                b => b + 1,
+            },
             down: pressed,
         }),
         Input::Wheel { vertical, units } => ClientMsg::Input(InputEvent::Wheel { vertical, units }),

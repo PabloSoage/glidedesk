@@ -39,12 +39,18 @@ class NativeSession private constructor(private var handle: Long) {
             System.loadLibrary("glidedesk_android")
         }
 
-        fun connect(host: String, port: Int, user: String, password: String, width: Int, height: Int): NativeSession? {
-            val h = nativeConnect(host, port, user, password, width, height)
+        /** `lowLatency`: the native protocol (UDP video, HEVC) instead of RDP. */
+        fun connect(
+            host: String, port: Int, user: String, password: String, width: Int, height: Int,
+            lowLatency: Boolean,
+        ): NativeSession? {
+            val h = nativeConnect(host, port, user, password, width, height, lowLatency)
             return if (h == 0L) null else NativeSession(h)
         }
 
-        @JvmStatic private external fun nativeConnect(host: String, port: Int, user: String, password: String, width: Int, height: Int): Long
+        @JvmStatic private external fun nativeConnect(
+            host: String, port: Int, user: String, password: String, width: Int, height: Int, native: Boolean,
+        ): Long
         @JvmStatic private external fun nativeSetSurface(handle: Long, surface: Surface?)
         @JvmStatic private external fun nativeMouseMove(handle: Long, x: Int, y: Int)
         @JvmStatic private external fun nativeMouseButton(handle: Long, button: Int, pressed: Boolean)

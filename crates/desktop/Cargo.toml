@@ -1,0 +1,25 @@
+[package]
+name = "glidedesk-desktop"
+description = "glidedesk desktop client (Windows, Linux): window, decoding, input, audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "glidedesk"
+path = "src/main.rs"
+
+[dependencies]
+glidedesk-client = { path = "../client" }
+glidedesk-proto = { path = "../proto" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+winit = "0.30"
+wgpu = "30"
+pollster = "1"
+openh264 = "0.9"
+cpal = "0.18"

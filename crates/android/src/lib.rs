@@ -153,6 +153,7 @@ mod android {
         password: JString,
         width: jint,
         height: jint,
+        native: jboolean,
     ) -> jlong {
         let opts = ConnectOptions {
             host: string(&mut env, &host),
@@ -162,6 +163,7 @@ mod android {
             width: width.clamp(200, 8192) as u16 & !1,
             height: height.clamp(200, 8192) as u16 & !1,
         };
+        let native = native != 0;
         let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -185,7 +187,25 @@ mod android {
         }));
         let st = Arc::clone(&status);
         runtime.spawn(async move {
-            let r = run(opts, sink, rx).await;
+            let r = if native {
+                // The low-latency protocol; MediaCodec decodes HEVC as well as H.264.
+                let opts = glidedesk_client::native::NativeOptions {
+                    host: opts.host,
+                    port: opts.port,
+                    username: opts.username,
+                    password: opts.password,
+                    width: opts.width,
+                    height: opts.height,
+                    codecs: vec![VideoCodec::Hevc, VideoCodec::H264],
+                    refresh: 60,
+                    pinned: None,
+                };
+                glidedesk_client::native::run(opts, sink, rx)
+                    .await
+                    .map(|_| ())
+            } else {
+                run(opts, sink, rx).await
+            };
             let mut s = st.lock().unwrap();
             s.ended = true;
             if let Err(e) = r {
