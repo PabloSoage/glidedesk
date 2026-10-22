@@ -116,6 +116,13 @@ impl App {
         self.input = Some(tx);
         let a = self.args.clone();
         let (w, h) = (size.width.max(200) & !1, size.height.max(200) & !1);
+        // The monitor's rate, so the session runs as fast as this screen shows frames.
+        let refresh = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map_or(60, |mhz| (mhz + 500) / 1000);
         self.runtime.spawn(async move {
             let r = if a.rdp {
                 let opts = glidedesk_client::session::ConnectOptions {
@@ -136,7 +143,7 @@ impl App {
                     width: w as u16,
                     height: h as u16,
                     codecs: vec![VideoCodec::H264],
-                    refresh: 60,
+                    refresh,
                     pinned: None,
                 };
                 glidedesk_client::native::run(opts, sink, rx)

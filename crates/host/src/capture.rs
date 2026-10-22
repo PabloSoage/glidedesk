@@ -86,6 +86,15 @@ impl crate::frame::Source for Capture {
     fn resize(&self, width: u32, height: u32) {
         Capture::resize(self, width, height);
     }
+
+    fn set_refresh(&self, hz: u32) -> bool {
+        let hz = hz.clamp(30, 240);
+        if refresh_rate() == hz {
+            return false;
+        }
+        set_refresh_rate(hz);
+        true
+    }
 }
 
 impl Drop for Capture {
@@ -195,7 +204,8 @@ fn format_object(width: u32, height: u32) -> Object {
     )
 }
 
-/// Refresh rate of the virtual monitor, set once at start ([`set_refresh_rate`]).
+/// Refresh rate of the virtual monitor: the default at start ([`set_refresh_rate`]), then
+/// the native client's screen.
 static REFRESH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
 
 pub fn set_refresh_rate(hz: u32) {

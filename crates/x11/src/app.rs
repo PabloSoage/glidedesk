@@ -34,9 +34,10 @@ struct Args {
     /// Use RDP instead of the native protocol.
     #[arg(long)]
     rdp: bool,
-    #[arg(long, default_value_t = 1280)]
+    /// Window width; 0 is the whole screen (termux-x11 has no window manager to size it).
+    #[arg(long, default_value_t = 0)]
     width: u16,
-    #[arg(long, default_value_t = 720)]
+    #[arg(long, default_value_t = 0)]
     height: u16,
     /// No sound.
     #[arg(long)]
@@ -200,9 +201,13 @@ pub fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = Args::parse();
+    let mut args = Args::parse();
     let conn = Arc::new(connect()?);
     let screen = &conn.setup().roots[0];
+    if args.width == 0 || args.height == 0 {
+        args.width = screen.width_in_pixels;
+        args.height = screen.height_in_pixels;
+    }
     if screen.root_depth != 24 && screen.root_depth != 32 {
         bail!(
             "the X display has depth {}, 24 or 32 is needed",

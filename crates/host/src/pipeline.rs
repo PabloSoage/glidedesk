@@ -22,6 +22,8 @@ pub struct Shared {
     pub wanted_size: Mutex<Option<(u32, u32)>>,
     /// Size currently being captured.
     pub current_size: Mutex<(u32, u32)>,
+    /// Refresh rate of the client's screen (native clients say it; RDP does not).
+    pub wanted_refresh: Mutex<Option<u32>>,
     pub stop: AtomicBool,
     /// Bumped when a client takes over the session; the pipeline then starts over (new
     /// surface, IDR) on the output in `active`.
@@ -174,6 +176,14 @@ impl Pipeline {
 
     pub fn run(mut self) -> Result<()> {
         while !self.shared.stop.load(Ordering::Relaxed) {
+            let refresh = self.shared.wanted_refresh.lock().unwrap().take();
+            if let Some(hz) = refresh
+                && self.source.set_refresh(hz)
+            {
+                info!(hz, "Refresh rate follows the client");
+                let (w, h) = *self.shared.current_size.lock().unwrap();
+                self.source.resize(w, h);
+            }
             if let Some((w, h)) = self.shared.wanted_size.lock().unwrap().take() {
                 let cur = *self.shared.current_size.lock().unwrap();
                 if self.last_frame.as_ref().map(|f| (f.width, f.height)) != Some((w, h))

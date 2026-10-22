@@ -380,6 +380,7 @@ where
     let (w, h) = shared
         .session
         .request_size(u32::from(width), u32::from(height));
+    *shared.session.wanted_refresh.lock().unwrap() = Some(refresh);
     info!(%peer, user, w, h, refresh, codec = ?codec.0, "Native client logged in");
 
     let key: [u8; 32] = glidedesk_proto::random();

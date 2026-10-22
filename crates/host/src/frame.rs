@@ -109,4 +109,10 @@ pub trait Source: Send {
     /// Asks for a new desktop size; sources with a fixed size ignore it (frames carry
     /// their real size).
     fn resize(&self, width: u32, height: u32);
+
+    /// Sets the refresh rate used from the next negotiation on; true when it changed.
+    /// Sources that cannot change it ignore it.
+    fn set_refresh(&self, _hz: u32) -> bool {
+        false
+    }
 }
