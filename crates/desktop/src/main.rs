@@ -261,7 +261,13 @@ impl ApplicationHandler<Event> for App {
             Event::Cursor(c) => {
                 let Some(win) = &self.window else { return };
                 match c {
-                    glidedesk_proto::Cursor::Hidden => win.set_cursor_visible(false),
+                    // A transparent cursor rather than set_cursor_visible: on Windows a
+                    // hidden cursor may not come back until the pointer leaves the window.
+                    glidedesk_proto::Cursor::Hidden => {
+                        if let Ok(src) = CustomCursor::from_rgba(vec![0; 4], 1, 1, 0, 0) {
+                            win.set_cursor(el.create_custom_cursor(src));
+                        }
+                    }
                     glidedesk_proto::Cursor::Shape {
                         width,
                         height,
@@ -273,7 +279,6 @@ impl ApplicationHandler<Event> for App {
                         {
                             let cursor = el.create_custom_cursor(src);
                             win.set_cursor(cursor.clone());
-                            win.set_cursor_visible(true);
                             self.cursor = Some(cursor);
                         }
                     }

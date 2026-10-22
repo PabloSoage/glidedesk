@@ -11,7 +11,7 @@
 
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use cudarc::driver::CudaContext;
@@ -20,7 +20,7 @@ use pw::spa;
 use pw::spa::buffer::meta::{MetaCursor, MetaVideoDamage};
 use pw::spa::pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value};
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 pub use crate::frame::{
     CursorEvent, CursorShape, Frame, FrameData, FrameSender, Rect, latest_frame,
@@ -29,6 +29,8 @@ use crate::gpu::{DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DmabufImporter, Pixel
 
 /// Largest cursor image requested from Mutter (the RDP large pointer limit).
 const MAX_CURSOR: usize = 384;
+/// How long Mutter must send only empty pointer sprites before the pointer is hidden.
+const HIDE_AFTER: Duration = Duration::from_millis(150);
 /// Damage rectangles requested per frame; Mutter merges beyond this.
 const MAX_DAMAGE: usize = 32;
 
@@ -110,6 +112,8 @@ struct StreamState {
     format: spa::param::video::VideoInfoRaw,
     sinks: Sinks,
     dropped: u64,
+    /// Since when Mutter has sent only empty pointer sprites.
+    hidden_since: Option<Instant>,
     /// DMA-BUF import, when a GPU was given and the modifiers could be queried.
     gpu: Option<(DmabufImporter, Pool)>,
     /// The negotiated format carries a modifier: buffers are DMA-BUFs.
@@ -360,6 +364,7 @@ fn run(
         format: Default::default(),
         sinks,
         dropped: 0,
+        hidden_since: None,
         gpu,
         dmabuf: false,
         copy_errors: 0,
@@ -419,20 +424,32 @@ fn run(
                 return;
             };
 
-            // Mutter gives every sprite the same id and attaches a bitmap only when the
-            // image changed (an empty one while no pointer is on the monitor), so every
-            // bitmap is news; repeats are filtered by content.
+            // Mutter gives every sprite the same id and attaches a bitmap when the image
+            // may have changed, so bitmaps are compared by content. It also sends an empty
+            // sprite now and then for a single frame while the pointer moves: the pointer
+            // is hidden only when empty sprites keep coming for `HIDE_AFTER`.
             if let Some(cursor) = buffer.find_meta::<MetaCursor>()
                 && cursor.is_valid()
                 && let Some(ev) = cursor_shape(cursor)
             {
-                st.sinks.cursor.send_if_modified(|cur| {
-                    if cur.as_ref() == Some(&ev) {
-                        return false;
-                    }
-                    *cur = Some(ev);
+                trace!(hidden = ev == CursorEvent::Hidden, "Pointer sprite");
+                let show = if ev == CursorEvent::Hidden {
+                    let since = *st.hidden_since.get_or_insert_with(Instant::now);
+                    since.elapsed() >= HIDE_AFTER
+                } else {
+                    st.hidden_since = None;
                     true
-                });
+                };
+                if show {
+                    st.sinks.cursor.send_if_modified(|cur| {
+                        if cur.as_ref() == Some(&ev) {
+                            return false;
+                        }
+                        debug!(hidden = ev == CursorEvent::Hidden, "Pointer image");
+                        *cur = Some(ev);
+                        true
+                    });
+                }
             }
             let damage = buffer.find_meta::<MetaVideoDamage>().map(|d| {
                 d.iter()
