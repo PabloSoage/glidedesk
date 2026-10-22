@@ -73,7 +73,12 @@ impl Shared {
 
 pub struct NativeOutput {
     shared: Arc<Shared>,
+    /// Since when frames have been held back for lack of acknowledgements.
+    busy_since: Option<std::time::Instant>,
 }
+
+/// Longest wait for acknowledgements before starting over from a keyframe.
+const STALL: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Output for NativeOutput {
     fn prepare(&mut self, w: u32, h: u32, max_in_flight: u32) -> Result<Prepared> {
@@ -93,12 +98,25 @@ impl Output for NativeOutput {
             });
             new_surface = true;
         }
-        let in_flight = link
-            .frame_id
-            .wrapping_sub(self.shared.acked_id.load(Ordering::SeqCst));
+        let acked = self.shared.acked_id.load(Ordering::SeqCst);
+        let in_flight = link.frame_id.wrapping_sub(acked);
         if !new_surface && in_flight >= max_in_flight {
-            return Ok(Prepared::Busy);
+            let since = *self.busy_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < STALL {
+                return Ok(Prepared::Busy);
+            }
+            // No acknowledgement for a long time while frames wait: whatever got lost,
+            // start over from a keyframe rather than freeze the picture.
+            warn!(
+                sent = link.frame_id,
+                acked,
+                ms = since.elapsed().as_millis() as u64,
+                "No acknowledgements: resending a keyframe"
+            );
+            self.shared.acked_id.store(link.frame_id, Ordering::SeqCst);
+            new_surface = true;
         }
+        self.busy_since = None;
         Ok(Prepared::Ready {
             new_surface,
             avc444: false,
@@ -222,6 +240,7 @@ pub async fn new(
     Ok((
         NativeOutput {
             shared: Arc::clone(&shared),
+            busy_since: None,
         },
         Server { shared, tcp },
     ))

@@ -5,8 +5,8 @@
 //! frames take from sending to the client's acknowledgement:
 //!
 //! - The least delay seen recently is the link's floor (round trip plus decoding).
-//! - When the typical delay rises clearly above the floor, frames are queuing somewhere
-//!   (Wi-Fi, a mobile link, a slow uplink): the ceiling drops at once.
+//! - When even the fastest frame of a period is clearly above the floor, frames are
+//!   queuing somewhere (Wi-Fi, a mobile link, a slow uplink): the ceiling drops at once.
 //! - While the delay stays near the floor and frames actually use the ceiling, it climbs
 //!   back step by step, up to the user's limit (`--max-bitrate`) if any.
 
@@ -128,7 +128,9 @@ impl Rate {
             return None;
         }
         delays.sort();
-        let typical = delays[delays.len() / 2];
+        // The fastest frame of the period: a large frame (a keyframe, a quality pass) takes
+        // longer by itself, but when even the fastest one is late the link is queuing.
+        let fastest = delays[0];
         self.mins.push_back((now, delays[0]));
         while self
             .mins
@@ -139,7 +141,7 @@ impl Rate {
         }
         let floor = self.mins.iter().map(|(_, d)| *d).min().unwrap_or(delays[0]);
 
-        if typical > floor + QUEUING {
+        if fastest > floor + QUEUING {
             self.clean_since = now;
             if now.duration_since(self.last_cut) < CUT_HOLD {
                 return None;
@@ -148,7 +150,7 @@ impl Rate {
             let bps = (self.bps / 10 * 7).max(MIN_BPS);
             return self.set(bps);
         }
-        if typical > floor + QUEUING / 2 {
+        if fastest > floor + QUEUING / 2 {
             self.clean_since = now;
             return None;
         }
