@@ -25,6 +25,8 @@ use crate::session::Input;
 const KEYFRAME_RETRY: Duration = Duration::from_millis(150);
 /// A frame with no packet for this long when the server says it sent it is not coming.
 const SYNC_QUIET: Duration = Duration::from_millis(15);
+/// With frames waiting for the decoder, look this often whether they can be acknowledged.
+const ACK_POLL: Duration = Duration::from_millis(2);
 /// Socket buffers for UDP: a large frame arrives as a burst of hundreds of packets.
 pub const UDP_BUFFER: usize = 8 << 20;
 
@@ -284,8 +286,21 @@ pub async fn run(
                 .unwrap_or(0);
             let mut rng = 0x9e37_79b9_7f4a_7c15u64;
             let (mut got, mut lost, mut since) = (0u32, 0u32, Instant::now());
+            // Received frames not acknowledged yet, oldest first.
+            let mut held = std::collections::VecDeque::new();
             loop {
-                let Ok(n) = udp.recv(&mut buf).await else {
+                let received = if held.is_empty() {
+                    udp.recv(&mut buf).await
+                } else {
+                    match tokio::time::timeout(ACK_POLL, udp.recv(&mut buf)).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            release_acks(&mut held, &sink, &ctl);
+                            continue;
+                        }
+                    }
+                };
+                let Ok(n) = received else {
                     continue;
                 };
                 let Some((seq, plain)) = key.open(Direction::ToClient, &buf[..n]) else {
@@ -332,7 +347,7 @@ pub async fn run(
                                         asked = Instant::now();
                                         let _ = ctl.send(ClientMsg::RequestKeyframe);
                                     }
-                                    let _ = ctl.send(ClientMsg::FrameAck { frame_id });
+                                    held.push_back(frame_id);
                                 }
                                 fec::Event::Lost { frame_id } => {
                                     lost += 1;
@@ -353,6 +368,7 @@ pub async fn run(
                     }
                     _ => {}
                 }
+                release_acks(&mut held, &sink, &ctl);
                 if since.elapsed() >= Duration::from_secs(5) {
                     info!(frames = got, lost, "Media");
                     (got, lost, since) = (0, 0, Instant::now());
@@ -398,6 +414,25 @@ pub async fn run(
     hello.abort();
     media.abort();
     result.map(|()| fingerprint)
+}
+
+/// Acknowledges the received frames the decoder has caught up with. One may still be
+/// decoding, so the server can already send the next one.
+fn release_acks(
+    held: &mut std::collections::VecDeque<u32>,
+    sink: &SharedSink,
+    ctl: &mpsc::UnboundedSender<ClientMsg>,
+) {
+    if held.is_empty() {
+        return;
+    }
+    let waiting = sink.lock().unwrap().backlog().saturating_sub(1);
+    while held.len() > waiting {
+        let Some(frame_id) = held.pop_front() else {
+            break;
+        };
+        let _ = ctl.send(ClientMsg::FrameAck { frame_id });
+    }
 }
 
 fn now_us() -> u64 {

@@ -33,6 +33,12 @@ pub trait VideoSink: Send {
     fn audio(&mut self, _pcm: &[u8]) {}
     /// Text copied in the session (native protocol).
     fn clipboard(&mut self, _text: &str) {}
+    /// Access units handed over and not decoded yet. The native client acknowledges frames
+    /// only as they are decoded, so a slow decoder makes the server send fewer instead of a
+    /// queue (and the delay) growing.
+    fn backlog(&self) -> usize {
+        0
+    }
 }
 
 pub type SharedSink = Arc<Mutex<dyn VideoSink>>;

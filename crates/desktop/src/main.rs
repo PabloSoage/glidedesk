@@ -230,9 +230,17 @@ impl ApplicationHandler<Event> for App {
         };
         platform::add_menu(&window, self.proxy.clone());
         let instance = self.instance.get_or_insert_with(|| {
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(
-                Box::new(el.owned_display_handle()),
-            ))
+            #[allow(unused_mut)]
+            let mut desc = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
+                el.owned_display_handle(),
+            ));
+            // Direct3D 12 on Windows: Intel's Vulkan driver (HD 630) hangs creating the
+            // device for a window as large as the screen. WGPU_BACKEND still overrides it.
+            #[cfg(windows)]
+            {
+                desc.backends = wgpu::Backends::DX12;
+            }
+            wgpu::Instance::new(desc.with_env())
         });
         match render::Renderer::new(instance, Arc::clone(&window)) {
             Ok(r) => self.renderer = Some(r),

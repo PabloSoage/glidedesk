@@ -2,6 +2,7 @@
 //! GPU's decoder, or FFmpeg in software), which keeps only the newest decoded picture and
 //! wakes the window to show it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -50,6 +51,8 @@ enum Unit {
 /// audio to the player.
 pub struct Sink {
     units: mpsc::Sender<Unit>,
+    /// Access units sent to the decoder thread and not decoded yet.
+    queued: Arc<AtomicUsize>,
     notify: Notify,
     audio: Option<crate::audio::Player>,
 }
@@ -60,7 +63,18 @@ impl VideoSink for Sink {
     }
 
     fn frame(&mut self, data: &[u8]) {
-        let _ = self.units.send(Unit::Data(data.to_vec(), Instant::now()));
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        if self
+            .units
+            .send(Unit::Data(data.to_vec(), Instant::now()))
+            .is_err()
+        {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn backlog(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
     }
 
     fn cursor(&mut self, cursor: &glidedesk_proto::Cursor) {
@@ -88,12 +102,15 @@ pub fn start(
 ) -> Sink {
     let (tx, rx) = mpsc::channel::<Unit>();
     let n = Arc::clone(&notify);
+    let queued = Arc::new(AtomicUsize::new(0));
+    let q = Arc::clone(&queued);
     std::thread::Builder::new()
         .name("decoder".into())
-        .spawn(move || decode_loop(&rx, &slot, &n, hardware))
+        .spawn(move || decode_loop(&rx, &slot, &n, &q, hardware))
         .expect("spawning the decoder thread");
     Sink {
         units: tx,
+        queued,
         notify,
         audio,
     }
@@ -103,6 +120,7 @@ fn decode_loop(
     rx: &mpsc::Receiver<Unit>,
     slot: &Mutex<Option<Picture>>,
     notify: &Notify,
+    queued: &AtomicUsize,
     hardware: bool,
 ) {
     let mut decoder: Option<Decoder> = None;
@@ -124,10 +142,13 @@ fn decode_loop(
             }
             Unit::Data(data, received) => {
                 let Some(dec) = decoder.as_mut() else {
+                    queued.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 };
                 let t = Instant::now();
-                match dec.decode(&data, received) {
+                let decoded = dec.decode(&data, received);
+                queued.fetch_sub(1, Ordering::Relaxed);
+                match decoded {
                     Ok(Some((pic, gpu))) => {
                         decode_us += t.elapsed().as_micros();
                         frames += 1;
