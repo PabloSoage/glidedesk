@@ -31,6 +31,7 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
 | Transport | TCP (TLS) | video over UDP with FEC, the rest over TLS |
 | On a lossy link (Wi-Fi, mobile) | a lost packet stalls everything until it is resent | the picture keeps going |
 | Codec | H.264 4:2:0 | HEVC (where the client decodes it in hardware) or H.264 |
+| Decoding | the client's | on the GPU (D3D11VA on Windows, VA-API or NVDEC on Linux, MediaCodec on Android) |
 | Refresh rate | the server's (`--refresh`, default 120) | the client's screen (60, 120, 144 Hz...) |
 | Desktop follows the window | FreeRDP: yes. `mstsc`: not yet | yes |
 | Sound | yes | yes (desktop and Termux clients) |
@@ -113,8 +114,10 @@ you need. On Linux give it with `--password` or the `GLIDEDESK_PASSWORD` variabl
 menu (right click on the title bar) has **Full screen** and **Show log**; the log is in
 `%LOCALAPPDATA%\glidedesk\glidedesk.log` (Linux: `~/.local/state/glidedesk/glidedesk.log`).
 
-The remote desktop takes the window's size and follows it when you resize. Decoding is in
-software (OpenH264) for now.
+The remote desktop takes the window's size and follows it when you resize. Video is decoded
+on the GPU (D3D11VA on Windows, with NVIDIA, AMD and Intel alike; VA-API or NVDEC on Linux),
+in HEVC when the GPU decodes HEVC, else H.264; without a usable GPU decoder FFmpeg decodes in
+software. `--software-decode` forces the CPU (and H.264).
 
 ### Android
 
@@ -161,8 +164,12 @@ sudo apt install libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang libegl-de
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
   libavdevice-dev libswresample-dev libva-dev libasound2-dev pkg-config
 cargo build --release -p glidedesk-host --features x11
-# Desktop client (Windows or Linux):
+# Desktop client, Linux (FFmpeg from the system: libavcodec-dev, plus libva for VA-API):
 cargo build --release -p glidedesk-desktop
+# Desktop client, Windows: FFmpeg is linked in from vcpkg (vcpkg.json). Needs Visual Studio
+# or Build Tools with the "vcpkg package manager" component, and LLVM (winget install
+# LLVM.LLVM) for the bindings. The first run builds FFmpeg (~10 minutes).
+scripts\build-windows.ps1
 # Termux client, cross-compiled:
 cargo ndk -t arm64-v8a build --release -p glidedesk-x11
 # Android app (Gradle; builds the Rust core with cargo-ndk):

@@ -9,6 +9,7 @@
 
 mod audio;
 mod clip;
+mod decode;
 mod keymap;
 mod platform;
 mod render;
@@ -61,6 +62,9 @@ struct Args {
     /// No sound.
     #[arg(long)]
     mute: bool,
+    /// Decode on the CPU even when the GPU could (H.264 only then).
+    #[arg(long)]
+    software_decode: bool,
 }
 
 /// Wait this long after the last window resize before asking the server for the new size
@@ -118,6 +122,7 @@ impl App {
             Arc::clone(&self.slot),
             Arc::clone(&notify),
             player,
+            !self.args.software_decode,
         )));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if !self.args.rdp {
@@ -133,6 +138,8 @@ impl App {
             .and_then(|w| w.current_monitor())
             .and_then(|m| m.refresh_rate_millihertz())
             .map_or(60, |mhz| (mhz + 500) / 1000);
+        // HEVC (fewer bits for the same picture) only where the GPU decodes it.
+        let hevc = !self.args.rdp && !self.args.software_decode && decode::hardware_hevc();
         self.runtime.spawn(async move {
             let r = if a.rdp {
                 let opts = glidedesk_client::session::ConnectOptions {
@@ -152,7 +159,11 @@ impl App {
                     password: a.password.unwrap_or_default(),
                     width: w as u16,
                     height: h as u16,
-                    codecs: vec![VideoCodec::H264],
+                    codecs: if hevc {
+                        vec![VideoCodec::Hevc, VideoCodec::H264]
+                    } else {
+                        vec![VideoCodec::H264]
+                    },
                     refresh,
                     pinned: None,
                 };

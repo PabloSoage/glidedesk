@@ -44,4 +44,4 @@ x11rb = { version = "0.14", default-features = false, features = ["damage", "xfi
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rayon = "1"
 # Bindings to the system FFmpeg (libavcodec-dev): VA-API and software encoders.
-ffmpeg-sys-next = { version = "7", default-features = false, features = ["avcodec"] }
+ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec"] }

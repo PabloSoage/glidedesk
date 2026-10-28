@@ -1,4 +1,4 @@
-//! Presents decoded pictures: three plane textures (Y, U, V), converted to RGB in the
+//! Presents decoded pictures: two plane textures (Y, interleaved UV), converted to RGB in the
 //! fragment shader (full-range BT.709, as the server encodes) and drawn over the window.
 //! The swap chain does not wait for vblank when the platform allows it (lowest latency).
 
@@ -26,17 +26,17 @@ fn vs(@builtin(vertex_index) i: u32) -> Out {
 }
 
 @group(0) @binding(0) var ty: texture_2d<f32>;
-@group(0) @binding(1) var tu: texture_2d<f32>;
-@group(0) @binding(2) var tv: texture_2d<f32>;
-@group(0) @binding(3) var s: sampler;
+@group(0) @binding(1) var tuv: texture_2d<f32>;
+@group(0) @binding(2) var s: sampler;
 // Picture size over the texture size (the planes are as wide as their stride).
-@group(0) @binding(4) var<uniform> scale: vec4<f32>;
+@group(0) @binding(3) var<uniform> scale: vec4<f32>;
 
 @fragment
 fn fs(i: Out) -> @location(0) vec4<f32> {
     let y = textureSample(ty, s, i.uv * scale.xy).r;
-    let u = textureSample(tu, s, i.uv * scale.zw).r - 0.5;
-    let v = textureSample(tv, s, i.uv * scale.zw).r - 0.5;
+    let c = textureSample(tuv, s, i.uv * scale.zw).rg - vec2<f32>(0.5);
+    let u = c.x;
+    let v = c.y;
     // Full-range BT.709.
     let r = y + 1.5748 * v;
     let g = y - 0.1873 * u - 0.4681 * v;
@@ -47,8 +47,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
 
 struct Planes {
     y: wgpu::Texture,
-    u: wgpu::Texture,
-    v: wgpu::Texture,
+    uv: wgpu::Texture,
     bind: wgpu::BindGroup,
     /// (Y stride, UV stride, width, height) these were made for.
     key: (u32, u32, u32, u32),
@@ -125,15 +124,14 @@ impl Renderer {
             entries: &[
                 tex_entry(0),
                 tex_entry(1),
-                tex_entry(2),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3,
+                    binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 4,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -202,7 +200,7 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn plane(&self, w: u32, h: u32) -> wgpu::Texture {
+    fn plane(&self, w: u32, h: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -213,7 +211,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
@@ -223,10 +221,9 @@ impl Renderer {
         let key = (p.y_stride, p.uv_stride, p.width, p.height);
         if self.planes.as_ref().is_none_or(|pl| pl.key != key) {
             let ch = p.height.div_ceil(2);
-            let (y, u, v) = (
-                self.plane(p.y_stride, p.height),
-                self.plane(p.uv_stride, ch),
-                self.plane(p.uv_stride, ch),
+            let (y, uv) = (
+                self.plane(p.y_stride, p.height, wgpu::TextureFormat::R8Unorm),
+                self.plane(p.uv_stride / 2, ch, wgpu::TextureFormat::Rg8Unorm),
             );
             let view = |t: &wgpu::Texture| t.create_view(&Default::default());
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -239,18 +236,14 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view(&u)),
+                        resource: wgpu::BindingResource::TextureView(&view(&uv)),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&view(&v)),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 4,
+                        binding: 3,
                         resource: self.uniform.as_entire_binding(),
                     },
                 ],
@@ -258,19 +251,18 @@ impl Renderer {
             let scale = [
                 p.width as f32 / p.y_stride as f32,
                 1.0,
-                (p.width as f32 / 2.0) / p.uv_stride as f32,
+                p.width as f32 / p.uv_stride as f32,
                 1.0,
             ];
             let bytes: Vec<u8> = scale.iter().flat_map(|f| f.to_le_bytes()).collect();
             self.queue.write_buffer(&self.uniform, 0, &bytes);
-            self.planes = Some(Planes { y, u, v, bind, key });
+            self.planes = Some(Planes { y, uv, bind, key });
         }
         let pl = self.planes.as_ref().expect("created above");
         let ch = p.height.div_ceil(2);
-        for (tex, data, stride, rows) in [
-            (&pl.y, &p.y, p.y_stride, p.height),
-            (&pl.u, &p.u, p.uv_stride, ch),
-            (&pl.v, &p.v, p.uv_stride, ch),
+        for (tex, data, stride, texels, rows) in [
+            (&pl.y, &p.y, p.y_stride, p.y_stride, p.height),
+            (&pl.uv, &p.uv, p.uv_stride, p.uv_stride / 2, ch),
         ] {
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -286,7 +278,7 @@ impl Renderer {
                     rows_per_image: Some(rows),
                 },
                 wgpu::Extent3d {
-                    width: stride,
+                    width: texels,
                     height: rows,
                     depth_or_array_layers: 1,
                 },

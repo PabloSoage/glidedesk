@@ -21,11 +21,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = "0.30"
 wgpu = "30"
 pollster = "1"
-openh264 = "0.9"
+ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec"] }
+libc = "0.2"
 cpal = "0.18"
 arboard = { version = "3", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+# FFmpeg linked in (vcpkg.json; scripts/build-windows.ps1): one .exe, nothing to install.
+ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec", "static"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",

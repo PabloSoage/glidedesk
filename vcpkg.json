@@ -1,0 +1,15 @@
+{
+  "name": "glidedesk",
+  "version-string": "0.1.0",
+  "description": "Native libraries for the Windows desktop client: FFmpeg's decoders with D3D11VA (linked statically)",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec"
+      ]
+    }
+  ],
+  "builtin-baseline": "866e9e258a76437074a5cf02d4c2d71b53bff2f8"
+}
