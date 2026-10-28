@@ -124,7 +124,7 @@ fn yuv_to_bgrx(yuv: &impl YUVSource, out: &mut Vec<u8>) {
         .for_each(|(row, line)| {
             let (yr, cr) = (&y[row * ys..], row / 2);
             let (ur, vr) = (&u[cr * us..], &v[cr * vs..]);
-            for (x, px) in line.chunks_exact_mut(4).enumerate() {
+            for (x, px) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let yy = i32::from(yr[x]) << 8;
                 let uu = i32::from(ur[x / 2]) - 128;
                 let vv = i32::from(vr[x / 2]) - 128;
@@ -256,7 +256,9 @@ pub fn main() -> Result<()> {
     let icon: Vec<u32> = [64, 64]
         .into_iter()
         .chain(
-            ICON.chunks_exact(4)
+            ICON.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|p| u32::from_be_bytes([p[3], p[0], p[1], p[2]])),
         )
         .collect();
