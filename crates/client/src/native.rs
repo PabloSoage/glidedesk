@@ -23,6 +23,8 @@ use crate::session::Input;
 
 /// While waiting for an IDR, ask again after this long.
 const KEYFRAME_RETRY: Duration = Duration::from_millis(150);
+/// A frame with no packet for this long when the server says it sent it is not coming.
+const SYNC_QUIET: Duration = Duration::from_millis(15);
 /// Socket buffers for UDP: a large frame arrives as a burst of hundreds of packets.
 pub const UDP_BUFFER: usize = 8 << 20;
 
@@ -301,9 +303,19 @@ pub async fn run(
                     }
                 }
                 flowing.store(true, Ordering::Relaxed);
+                let events = match plain.first() {
+                    Some(&fec::VIDEO) => frames.push(&plain),
+                    // The server waits for acknowledgements: frames it sent that have not
+                    // come (and are not still coming) are lost.
+                    Some(&fec::SYNC) => match fec::parse_sync(&plain) {
+                        Some(last) => frames.sync(last, SYNC_QUIET),
+                        None => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
                 match plain.first() {
-                    Some(&fec::VIDEO) => {
-                        for ev in frames.push(&plain) {
+                    Some(&fec::VIDEO | &fec::SYNC) => {
+                        for ev in events {
                             match ev {
                                 fec::Event::Frame {
                                     frame_id,

@@ -10,13 +10,16 @@
 //!          | parity_shards u8 | frame_len u32 | block_len u32 | shard bytes
 //! AUDIO u8 | seq u32 | PCM S16LE 48 kHz stereo
 //! HELLO u8 | token [16]
+//! SYNC  u8 | last_frame_id u32   (server: frames are held back waiting for acknowledgements)
 //! ```
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 pub const VIDEO: u8 = 1;
 pub const AUDIO: u8 = 2;
 pub const HELLO: u8 = 3;
+pub const SYNC: u8 = 4;
 
 /// Shard payload: with the headers and encryption a packet stays under 1200 bytes, below
 /// the MTU of any usual path (VPNs included).
@@ -108,6 +111,8 @@ struct Partial {
     keyframe: bool,
     len: usize,
     blocks: Vec<Option<Block>>,
+    /// When its last packet arrived.
+    seen: Instant,
 }
 
 /// Rebuilds frames from video packets in any order, with up to `parity` losses per block.
@@ -152,7 +157,9 @@ impl Reassembler {
             keyframe: flags & FLAG_KEYFRAME != 0,
             len: frame_len,
             blocks: (0..blocks).map(|_| None).collect(),
+            seen: Instant::now(),
         });
+        part.seen = Instant::now();
         if part.blocks.len() != blocks {
             return events;
         }
@@ -235,6 +242,55 @@ impl Reassembler {
         }
         events
     }
+
+    /// The server says it sent up to `last_sent` and waits for acknowledgements. Frames up to
+    /// there that are missing, and have had no packet for `quiet` (so are not still on
+    /// their way), are lost: without this, losing the last frames before the server stops
+    /// would leave both sides waiting.
+    pub fn sync(&mut self, last_sent: u32, quiet: Duration) -> Vec<Event> {
+        if self.last.is_some_and(|l| !after(last_sent, l)) {
+            return Vec::new(); // everything up to there arrived
+        }
+        let pending: Vec<u32> = self
+            .partial
+            .keys()
+            .copied()
+            .filter(|&id| !after(id, last_sent))
+            .collect();
+        if pending
+            .iter()
+            .any(|id| self.partial[id].seen.elapsed() < quiet)
+        {
+            return Vec::new();
+        }
+        for id in &pending {
+            self.partial.remove(id);
+        }
+        let mut events = Vec::new();
+        let mut id = self.last.map_or(last_sent, |l| l.wrapping_add(1));
+        loop {
+            events.push(Event::Lost { frame_id: id });
+            if id == last_sent || events.len() > 64 {
+                break;
+            }
+            id = id.wrapping_add(1);
+        }
+        self.last = Some(last_sent);
+        events
+    }
+}
+
+pub fn sync_packet(last_frame_id: u32) -> Vec<u8> {
+    let mut p = vec![SYNC];
+    p.extend_from_slice(&last_frame_id.to_le_bytes());
+    p
+}
+
+pub fn parse_sync(p: &[u8]) -> Option<u32> {
+    if p.len() != 5 || p[0] != SYNC {
+        return None;
+    }
+    Some(u32::from_le_bytes(p[1..5].try_into().ok()?))
 }
 
 /// Fills in the missing data shards of a block from the ones received (at least
@@ -367,6 +423,27 @@ mod tests {
             .flat_map(|p| frames_of(r.push(p)))
             .collect();
         assert_eq!(got, vec![(9, data)]);
+    }
+
+    #[test]
+    fn sync_declares_the_last_frames_lost() {
+        let mut r = Reassembler::default();
+        for p in packetize(1, true, &[1; 3000], 20) {
+            r.push(&p);
+        }
+        // Frame 2 never arrives; frame 3 only in part.
+        let three = packetize(3, false, &[3; 5000], 0);
+        r.push(&three[0]);
+        // Still arriving: nothing yet.
+        assert!(r.sync(3, Duration::from_secs(5)).is_empty());
+        let ev = r.sync(3, Duration::ZERO);
+        assert_eq!(
+            ev,
+            vec![Event::Lost { frame_id: 2 }, Event::Lost { frame_id: 3 }]
+        );
+        // Nothing missing any more.
+        assert!(r.sync(3, Duration::ZERO).is_empty());
+        assert_eq!(parse_sync(&sync_packet(7)), Some(7));
     }
 }
 

@@ -75,7 +75,13 @@ pub struct NativeOutput {
     shared: Arc<Shared>,
     /// Since when frames have been held back for lack of acknowledgements.
     busy_since: Option<std::time::Instant>,
+    /// Last SYNC sent while held back.
+    synced: Option<std::time::Instant>,
 }
+
+/// While held back, how often the client is told which frame was the last (so it can tell
+/// the last frames were lost instead of waiting for more).
+const SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Longest wait for acknowledgements before starting over from a keyframe.
 const STALL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -103,6 +109,14 @@ impl Output for NativeOutput {
         if !new_surface && in_flight >= max_in_flight {
             let since = *self.busy_since.get_or_insert_with(std::time::Instant::now);
             if since.elapsed() < STALL {
+                if since.elapsed() >= SYNC_EVERY
+                    && self.synced.is_none_or(|t| t.elapsed() >= SYNC_EVERY)
+                    && let Some(peer) = link.peer
+                {
+                    self.synced = Some(std::time::Instant::now());
+                    let last = link.frame_id;
+                    Shared::seal_and_send(link, &self.shared.udp, peer, &fec::sync_packet(last));
+                }
                 return Ok(Prepared::Busy);
             }
             // No acknowledgement for a long time while frames wait: whatever got lost,
@@ -117,6 +131,7 @@ impl Output for NativeOutput {
             new_surface = true;
         }
         self.busy_since = None;
+        self.synced = None;
         Ok(Prepared::Ready {
             new_surface,
             avc444: false,
@@ -241,6 +256,7 @@ pub async fn new(
         NativeOutput {
             shared: Arc::clone(&shared),
             busy_since: None,
+            synced: None,
         },
         Server { shared, tcp },
     ))
