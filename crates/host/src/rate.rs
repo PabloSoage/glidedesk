@@ -168,6 +168,16 @@ impl Rate {
         None
     }
 
+    /// The transport's own estimate of the link (WebRTC's congestion control) instead of
+    /// acknowledgement delays: the ceiling follows it, ignoring changes under 10 %.
+    pub fn follow(&mut self, estimate_bps: u32) -> Option<u32> {
+        let bps = estimate_bps.clamp(MIN_BPS, self.max);
+        if bps.abs_diff(self.bps) * 10 < self.bps {
+            return None;
+        }
+        self.set(bps)
+    }
+
     fn set(&mut self, bps: u32) -> Option<u32> {
         (bps != self.bps).then(|| {
             self.bps = bps;
@@ -231,6 +241,15 @@ mod tests {
             }
         }
         assert_eq!(r.bps(), 60_000_000);
+    }
+
+    #[test]
+    fn rate_follows_a_transport_estimate() {
+        let mut r = Rate::new(Some(80_000_000));
+        assert_eq!(r.follow(52_000_000), None); // within 10 %
+        assert_eq!(r.follow(20_000_000), Some(20_000_000));
+        assert_eq!(r.follow(500_000_000), Some(80_000_000)); // the user's limit
+        assert_eq!(r.follow(10), Some(MIN_BPS));
     }
 
     #[test]

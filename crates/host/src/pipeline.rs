@@ -98,6 +98,11 @@ pub trait Output: Send {
     fn wants_refresh(&self) -> bool {
         false
     }
+    /// The transport's own estimate of the link in bits per second (WebRTC), used instead
+    /// of the acknowledgement delays when there is one.
+    fn link_estimate(&mut self) -> Option<u32> {
+        None
+    }
 }
 
 pub struct Options {
@@ -282,7 +287,11 @@ impl Pipeline {
         let Some(output) = self.outputs.get_mut(index) else {
             return;
         };
-        if let Some(bps) = self.rate.update(output.take_delays()) {
+        let changed = match output.link_estimate() {
+            Some(estimate) => self.rate.follow(estimate),
+            None => self.rate.update(output.take_delays()),
+        };
+        if let Some(bps) = changed {
             debug!(mbps = bps / 1_000_000, "Bitrate ceiling");
             if let Err(e) = self.backend.set_max_bitrate(bps) {
                 warn!(%e, "Changing the bitrate failed");

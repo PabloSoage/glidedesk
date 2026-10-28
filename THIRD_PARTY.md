@@ -8,6 +8,8 @@
 | [zbus](https://github.com/dbus2/zbus) | dependency | MIT |
 | [cudarc](https://github.com/coreylowman/cudarc) | dependency | MIT or Apache-2.0 |
 | [FFmpeg](https://ffmpeg.org) (libavcodec, libavutil) | host encoders (system library); desktop client decoders, linked statically into the Windows build (vcpkg, decoders only, no GPL parts) | LGPL-2.1-or-later |
+| [str0m](https://github.com/algesten/str0m) (WebRTC) | host dependency (web front end) | MIT |
+| [opus](https://github.com/SpaceManiac/opus-rs) bindings, libopus | host dependency (web front end sound) | MIT or Apache-2.0; libopus BSD-3-Clause |
 | `crates/desktop/src/probe.hevc`: a 256×144 HEVC test frame made with FFmpeg's `testsrc2` | desktop client | generated, no license |
 
 Code adapted from [Sunshine](https://github.com/LizardByte/Sunshine) or

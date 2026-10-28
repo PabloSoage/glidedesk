@@ -40,6 +40,9 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// Native protocol (TCP + UDP); `None` turns it off.
     pub native_bind: Option<SocketAddr>,
+    /// Web client (HTTPS + WebRTC); `None` turns it off.
+    #[cfg(feature = "web")]
+    pub web_bind: Option<SocketAddr>,
     pub gpu: usize,
     /// Video encoder (NVENC, VA-API or software).
     pub encoder: encoder::Choice,
@@ -54,9 +57,8 @@ pub struct ServeOptions {
     pub state_dir: PathBuf,
 }
 
-/// Output indexes in the pipeline.
+/// Output index of RDP in the pipeline (the others follow in the order they are added).
 const RDP: usize = 0;
-const NATIVE: usize = 1;
 
 /// What a session backend provides to the front ends.
 struct Parts {
@@ -192,12 +194,24 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let mut outputs: Vec<Box<dyn Output>> = vec![Box::new(rdp_output)];
     let native = match opts.native_bind {
         Some(bind) => {
-            let (output, server) = crate::native::new(Arc::clone(&shared), NATIVE, bind).await?;
+            let (output, server) =
+                crate::native::new(Arc::clone(&shared), outputs.len(), bind).await?;
             outputs.push(Box::new(output));
             Some((server, bind))
         }
         None => None,
     };
+    #[cfg(feature = "web")]
+    let web = match opts.web_bind {
+        Some(bind) => {
+            let (output, server) =
+                crate::web::new(Arc::clone(&shared), outputs.len(), bind).await?;
+            outputs.push(Box::new(output));
+            Some((server, bind))
+        }
+        None => None,
+    };
+    let max_bitrate = opts.pipeline.max_bitrate;
     let pipeline = Pipeline::new(
         Arc::clone(&shared),
         parts.source,
@@ -241,9 +255,33 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             None => std::future::pending().await,
         }
     };
+    #[cfg(feature = "web")]
+    let web = async {
+        match web {
+            Some((server, bind)) => {
+                server
+                    .run(crate::web::Front {
+                        bind,
+                        username: opts.username.clone(),
+                        password: opts.password.clone(),
+                        state_dir: opts.state_dir.clone(),
+                        hevc,
+                        max_bitrate,
+                        cursor: parts.cursor.clone(),
+                        audio: parts.audio.clone(),
+                        input: input.clone(),
+                    })
+                    .await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    #[cfg(not(feature = "web"))]
+    let web = std::future::pending::<Result<()>>();
     let r = tokio::select! {
         r = rdp => r,
         r = native => r,
+        r = web => r,
     };
     shared.stop.store(true, Ordering::Relaxed);
     let _ = pipeline_thread.join();

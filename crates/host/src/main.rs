@@ -28,6 +28,8 @@ mod rate;
 mod rdp;
 mod serve;
 mod sound;
+#[cfg(feature = "web")]
+mod web;
 #[cfg(feature = "x11")]
 mod x11session;
 
@@ -66,6 +68,14 @@ enum Command {
         /// Only RDP.
         #[arg(long)]
         no_native: bool,
+        /// Web client address: the page over HTTPS (TCP) and WebRTC media (UDP).
+        #[cfg(feature = "web")]
+        #[arg(long, default_value = "0.0.0.0:3390")]
+        web_bind: std::net::SocketAddr,
+        /// No web client.
+        #[cfg(feature = "web")]
+        #[arg(long)]
+        no_web: bool,
         /// CUDA device index (NVENC).
         #[arg(long, default_value_t = 0)]
         gpu: usize,
@@ -160,6 +170,10 @@ async fn main() -> Result<()> {
             bind,
             native_bind,
             no_native,
+            #[cfg(feature = "web")]
+            web_bind,
+            #[cfg(feature = "web")]
+            no_web,
             gpu,
             encoder,
             render_node,
@@ -203,6 +217,8 @@ async fn main() -> Result<()> {
                 },
                 bind,
                 native_bind: (!no_native).then_some(native_bind),
+                #[cfg(feature = "web")]
+                web_bind: (!no_web).then_some(web_bind),
                 gpu,
                 encoder,
                 render_node,

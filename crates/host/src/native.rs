@@ -246,7 +246,7 @@ pub async fn new(
     ))
 }
 
-fn tls_config(dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
+pub(crate) fn tls_config(dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     // The RDP front end creates the self-signed identity; both use it.
@@ -536,7 +536,7 @@ where
 }
 
 /// Native input through the same translation as RDP input.
-fn forward_input(input: &mut InputForwarder, pos: &mut (u16, u16), ev: InputEvent) {
+pub(crate) fn forward_input(input: &mut InputForwarder, pos: &mut (u16, u16), ev: InputEvent) {
     match ev {
         InputEvent::MouseMove { x, y } => {
             *pos = (x, y);

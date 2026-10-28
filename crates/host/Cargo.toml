@@ -7,11 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["gnome"]
+default = ["gnome", "web"]
 # Headless GNOME sessions through Mutter and PipeWire.
 gnome = ["dep:zbus", "dep:pipewire", "dep:futures-util"]
 # Existing X11 displays (Termux's termux-x11, X11 desktops).
 x11 = ["dep:x11rb"]
+# Browsers over WebRTC (page, signalling and media on one port).
+web = ["dep:str0m", "dep:serde", "dep:serde_json", "dep:opus"]
 
 [dependencies]
 anyhow = "1"
@@ -45,3 +47,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rayon = "1"
 # Bindings to the system FFmpeg (libavcodec-dev): VA-API and software encoders.
 ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec"] }
+str0m = { version = "0.24", default-features = false, features = ["openssl"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+opus = { version = "0.4", optional = true }
