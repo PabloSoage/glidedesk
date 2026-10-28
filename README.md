@@ -24,7 +24,7 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
   almost nothing; only the ceiling a frame may reach follows the link, from the measured
   delay (it drops as soon as frames queue, and climbs back while the link is clean).
 
-**Status: early development (v0.1).** Tested on Ubuntu 24.04 (GNOME 46) with NVIDIA GPUs.
+**Status: early development (v0.2).** Tested on Ubuntu 24.04 (GNOME 46) with NVIDIA GPUs.
 
 ## Which client?
 
@@ -53,7 +53,7 @@ Prebuilt binaries are on the [releases page](https://github.com/PabloSoage/glide
 | `glidedesk-host-linux-x86_64` | the server (Ubuntu 24.04 / GNOME 46, x86-64) |
 | `glidedesk-session.sh` | starts the headless GNOME session the server runs in |
 | `glidedesk-windows-x86_64.exe` | desktop client for Windows |
-| `glidedesk-linux-x86_64` | desktop client for Linux (Wayland or X11) |
+| `glidedesk-linux-x86_64` | desktop client for Linux (Wayland or X11; uses the system FFmpeg 6, as on Ubuntu 24.04: `sudo apt install libavcodec60`) |
 | `glidedesk-android.apk` | Android client (RDP or native protocol) |
 | `glidedesk-x11-termux-aarch64` | client for Termux with termux-x11 (Android, arm64) |
 | `glidedesk-x11-linux-x86_64` | the same small X11 client for Linux machines without a GPU |
@@ -64,7 +64,7 @@ Requirements: Ubuntu 24.04 with GNOME 46 (other distributions with GNOME 46+ sho
 for hardware encoding the NVIDIA driver (570 or later) or Mesa / Intel media VA-API drivers.
 
 ```sh
-sudo apt install gnome-shell pipewire wireplumber dbus-daemon ffmpeg
+sudo apt install gnome-shell pipewire wireplumber dbus-daemon ffmpeg libopus0
 chmod +x glidedesk-host-linux-x86_64 glidedesk-session.sh
 # Your Linux user name and a password for remote clients (not your login password,
 # unless you want it to be):

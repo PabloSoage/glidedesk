@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "glidedesk-android"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "glidedesk-client",
@@ -1794,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "glidedesk-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1823,7 +1823,7 @@ dependencies = [
 
 [[package]]
 name = "glidedesk-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "glidedesk-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "glidedesk-probe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1894,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "glidedesk-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.3.4",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "glidedesk-x11"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3305,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "nvenc-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bindgen 0.73.2",
 ]
