@@ -65,6 +65,19 @@ struct Args {
     /// Decode on the CPU even when the GPU could (H.264 only then).
     #[arg(long)]
     software_decode: bool,
+    /// Decode and draw on this GPU (amd, intel, nvidia) instead of the default one.
+    #[arg(long, value_parser = parse_vendor)]
+    gpu: Option<u32>,
+}
+
+/// A GPU maker's name as its PCI vendor id.
+fn parse_vendor(s: &str) -> Result<u32, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "amd" => Ok(0x1002),
+        "intel" => Ok(0x8086),
+        "nvidia" => Ok(decode::VENDOR_NVIDIA),
+        _ => Err("amd, intel or nvidia".into()),
+    }
 }
 
 /// Wait this long after the last window resize before asking the server for the new size
@@ -242,7 +255,7 @@ impl ApplicationHandler<Event> for App {
             }
             wgpu::Instance::new(desc.with_env())
         });
-        match render::Renderer::new(instance, Arc::clone(&window)) {
+        match render::Renderer::new(instance, Arc::clone(&window), self.args.gpu) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
                 platform::show_error(&format!("Graphics: {e:#}"));
@@ -446,6 +459,9 @@ fn main() -> Result<()> {
         }
     };
     let mut args = args;
+    if let Some(v) = args.gpu {
+        decode::use_gpu(v);
+    }
     if args.password.is_none() {
         let Some((user, password)) = platform::credentials(&args.host, args.user.as_deref()) else {
             if !cfg!(windows) {

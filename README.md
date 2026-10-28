@@ -84,7 +84,7 @@ Useful options of `serve` (`--help` lists them all):
 
 | Option | Default | |
 |---|---|---|
-| `--encoder auto\|nvenc\|vaapi\|software` | `auto` | NVENC if there is an NVIDIA GPU, else VA-API, else x264 |
+| `--encoder auto\|nvenc\|vaapi\|software` | `auto` | NVENC if there is an NVIDIA GPU, else VA-API, else x264; an encoder that cannot do HEVC (or hangs on it) serves H.264 |
 | `--max-bitrate BPS` | none | a ceiling for metered or slow links (e.g. `8000000` for mobile data); without it the link decides |
 | `--refresh HZ` | 120 | refresh rate for RDP clients (native clients use their own screen's) |
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
@@ -122,7 +122,9 @@ menu (right click on the title bar) has **Full screen** and **Show log**; the lo
 The remote desktop takes the window's size and follows it when you resize. Video is decoded
 on the GPU (D3D11VA on Windows, with NVIDIA, AMD and Intel alike; VA-API or NVDEC on Linux),
 in HEVC when the GPU decodes HEVC, else H.264; without a usable GPU decoder FFmpeg decodes in
-software. `--software-decode` forces the CPU (and H.264).
+software. `--software-decode` forces the CPU (and H.264). With more than one GPU, `--gpu amd`,
+`--gpu intel` or `--gpu nvidia` picks the one that decodes and draws (a laptop's integrated GPU,
+say); the picture still shows on whichever screen the window is on.
 
 ### Any browser
 

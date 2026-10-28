@@ -7,8 +7,9 @@
 //! out per access unit. If the GPU refuses a stream (an unsupported profile or size), FFmpeg
 //! asks for a format again without the hardware one and decoding continues in software.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, CString, c_void};
 use std::ptr;
+use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 use ffmpeg_sys_next as ff;
@@ -16,6 +17,63 @@ use glidedesk_client::gfx::VideoCodec;
 use tracing::{debug, info};
 
 use crate::video::Picture;
+
+/// PCI vendor of the GPU to decode on (`--gpu`); unset: the system's default one.
+static GPU: OnceLock<u32> = OnceLock::new();
+
+pub const VENDOR_NVIDIA: u32 = 0x10de;
+
+/// Decode on the first GPU of this PCI vendor (`--gpu`). Call before the first decoder.
+pub fn use_gpu(vendor: u32) {
+    let _ = GPU.set(vendor);
+}
+
+/// What `av_hwdevice_ctx_create` gets to open the `--gpu` one.
+#[derive(Default)]
+struct DeviceArgs {
+    /// The device string (VA-API: a render node).
+    node: Option<CString>,
+    /// D3D11VA's `vendor_id` option.
+    vendor_id: Option<String>,
+}
+
+/// `None` when that kind of decoder cannot run on the `--gpu` one.
+fn device_for(ty: ff::AVHWDeviceType) -> Option<DeviceArgs> {
+    let Some(&vendor) = GPU.get() else {
+        return Some(DeviceArgs::default());
+    };
+    match ty {
+        ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA => Some(DeviceArgs {
+            vendor_id: Some(vendor.to_string()),
+            ..DeviceArgs::default()
+        }),
+        ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA => {
+            (vendor == VENDOR_NVIDIA).then(DeviceArgs::default)
+        }
+        ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI => render_node(vendor).map(|n| DeviceArgs {
+            node: Some(n),
+            ..DeviceArgs::default()
+        }),
+        _ => Some(DeviceArgs::default()),
+    }
+}
+
+/// The DRM render node of the first GPU of a PCI vendor (VA-API opens a device by node).
+fn render_node(vendor: u32) -> Option<CString> {
+    let mut nodes: Vec<_> = std::fs::read_dir("/sys/class/drm")
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("renderD"))
+        .collect();
+    nodes.sort();
+    nodes.into_iter().find_map(|n| {
+        let v = std::fs::read_to_string(format!("/sys/class/drm/{n}/device/vendor")).ok()?;
+        (u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()? == vendor)
+            .then(|| CString::new(format!("/dev/dri/{n}")).ok())
+            .flatten()
+    })
+}
 
 /// Hardware decoders to try, in order.
 #[cfg(windows)]
@@ -126,14 +184,23 @@ impl Decoder {
             c.opaque = usize::MAX as *mut c_void; // no hardware format
             if hardware {
                 for &(ty, fmt, name) in HARDWARE {
+                    let Some(DeviceArgs { node, vendor_id }) = device_for(ty) else {
+                        continue;
+                    };
+                    let mut opts = ptr::null_mut();
+                    if let Some(v) = vendor_id {
+                        let v = CString::new(v)?;
+                        ff::av_dict_set(&mut opts, c"vendor_id".as_ptr(), v.as_ptr(), 0);
+                    }
                     let mut device = ptr::null_mut();
                     let e = ff::av_hwdevice_ctx_create(
                         &mut device,
                         ty,
-                        ptr::null(),
-                        ptr::null_mut(),
+                        node.as_ref().map_or(ptr::null(), |n| n.as_ptr()),
+                        opts,
                         0,
                     );
+                    ff::av_dict_free(&mut opts);
                     if e < 0 {
                         debug!(name, error = averror(e), "No hardware decoder");
                         continue;

@@ -8,6 +8,7 @@
 //! view (AVC420, or the first stream of AVC444v2) and optionally the auxiliary view.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use cudarc::driver::CudaContext;
@@ -213,19 +214,24 @@ pub struct Ffmpeg {
 
 impl Ffmpeg {
     pub fn new(kind: Kind, device: String, fps: u32, bitrate: u32) -> Result<Self> {
-        // Open a small encoder once so a missing driver or codec shows up at start.
-        FfEncoder::new(
+        // Encode a few small frames once so a missing driver or codec shows up at start.
+        trial(
             kind,
             &device,
             config(Codec::H264, 256, 256, false, fps, bitrate),
         )
         .with_context(|| format!("{kind:?} encoder on {device}"))?;
-        let hevc = FfEncoder::new(
+        let hevc = match trial(
             kind,
             &device,
             config(Codec::Hevc, 256, 256, false, fps, bitrate),
-        )
-        .is_ok();
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                info!(error = format!("{e:#}"), "No HEVC from this encoder");
+                false
+            }
+        };
         Ok(Self {
             hevc,
             kind,
@@ -236,6 +242,40 @@ impl Ffmpeg {
             fps,
             bitrate,
         })
+    }
+}
+
+/// How long a trial may take: Mesa's d3d12 VA-API driver (WSL, 26.0) opens HEVC encoders
+/// but never finishes the second frame. (Opening the first one can take a few seconds.)
+const TRIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Opens an encoder and encodes a few frames on a thread of its own, within
+/// [`TRIAL_TIMEOUT`]. A driver that hangs keeps that thread; the encoder is not used.
+///
+/// The thread never ends: VA drivers leave thread-local destructors behind, and closing the
+/// encoder unloads the driver, so a thread exiting afterwards would jump into unmapped code.
+fn trial(kind: Kind, device: &str, cfg: EncoderConfig) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let device = device.to_owned();
+    std::thread::Builder::new()
+        .name("encoder-trial".into())
+        .spawn(move || {
+            let r = (|| {
+                let frame = Nv12Frame::new(cfg.width, cfg.height);
+                let mut enc = FfEncoder::new(kind, &device, cfg)?;
+                for _ in 0..4 {
+                    enc.encode(&frame)?;
+                }
+                anyhow::Ok(())
+            })();
+            let _ = tx.send(r);
+            loop {
+                std::thread::park();
+            }
+        })?;
+    match rx.recv_timeout(TRIAL_TIMEOUT) {
+        Ok(r) => r,
+        Err(_) => bail!("the driver did not finish a test frame in {TRIAL_TIMEOUT:?}"),
     }
 }
 

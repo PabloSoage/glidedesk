@@ -66,16 +66,29 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(instance: &wgpu::Instance, window: Arc<Window>) -> Result<Self> {
+    /// `vendor`: draw on the first GPU of this PCI vendor (`--gpu`) that can show the window.
+    pub fn new(
+        instance: &wgpu::Instance,
+        window: Arc<Window>,
+        vendor: Option<u32>,
+    ) -> Result<Self> {
         let size = window.inner_size();
         let surface = instance.create_surface(window)?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .context("no graphics adapter")?;
+        let chosen = vendor.and_then(|v| {
+            pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+                .into_iter()
+                .find(|a| a.get_info().vendor == v && a.is_surface_supported(&surface))
+        });
+        let adapter = match chosen {
+            Some(a) => a,
+            None => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            }))
+            .context("no graphics adapter")?,
+        };
         tracing::info!(adapter = ?adapter.get_info().name, backend = ?adapter.get_info().backend, "Graphics");
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
