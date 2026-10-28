@@ -292,6 +292,7 @@ pub struct Front {
     pub cursor: watch::Receiver<Option<CursorEvent>>,
     pub audio: Option<broadcast::Sender<Vec<u8>>>,
     pub input: InputForwarder,
+    pub clipboard: Option<Arc<dyn crate::native::TextClipboard>>,
 }
 
 pub struct Server {
@@ -504,6 +505,16 @@ async fn notes_task(
     let mut input = front.input.clone();
     let mut pos = (0u16, 0u16);
     let mut cursor = front.cursor.clone();
+    let mut clip = front.clipboard.as_ref().map(|c| c.subscribe());
+    let send_bytes = |shared: &Shared, msg: &[u8]| {
+        let mut guard = shared.peer.lock().unwrap();
+        let Some(p) = guard.as_mut() else { return };
+        let Some(id) = p.channel else { return };
+        if let Some(mut ch) = p.rtc.channel(id) {
+            let _ = ch.write(true, msg);
+        }
+        shared.drive(p);
+    };
     let send_cursor = |shared: &Shared, ev: Option<&CursorEvent>| {
         let Some(ev) = ev else { return };
         let msg = cursor_bytes(ev);
@@ -527,6 +538,11 @@ async fn notes_task(
                         InputMsg::Size { w, h } => {
                             shared.session.request_size(w, h);
                         }
+                        InputMsg::Clip { text } => {
+                            if let Some(c) = &front.clipboard {
+                                c.set(text);
+                            }
+                        }
                         InputMsg::Text { ch } => {
                             for down in [true, false] {
                                 crate::native::forward_input(&mut input, &mut pos, InputEvent::Unicode { ch, down });
@@ -549,6 +565,16 @@ async fn notes_task(
                 let ev = cursor.borrow_and_update().clone();
                 send_cursor(&shared, ev.as_ref());
             }
+            t = async { match clip.as_mut() { Some(c) => c.recv().await, None => std::future::pending().await } } => match t {
+                Ok(text) => {
+                    // [2, UTF-8]: text copied in the session.
+                    let mut msg = vec![2];
+                    msg.extend_from_slice(text.as_bytes());
+                    send_bytes(&shared, &msg);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => clip = None,
+            },
         }
     }
 }
@@ -578,13 +604,35 @@ fn cursor_bytes(ev: &CursorEvent) -> Vec<u8> {
 #[derive(Deserialize, Debug)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum InputMsg {
-    Move { x: u16, y: u16 },
-    Button { b: u8, down: bool },
-    Wheel { v: bool, units: i16 },
-    Key { sc: u8, ext: bool, down: bool },
-    Text { ch: char },
+    Move {
+        x: u16,
+        y: u16,
+    },
+    Button {
+        b: u8,
+        down: bool,
+    },
+    Wheel {
+        v: bool,
+        units: i16,
+    },
+    Key {
+        sc: u8,
+        ext: bool,
+        down: bool,
+    },
+    Text {
+        ch: char,
+    },
+    /// Text copied in the browser.
+    Clip {
+        text: String,
+    },
     Release,
-    Size { w: u32, h: u32 },
+    Size {
+        w: u32,
+        h: u32,
+    },
 }
 
 impl InputMsg {
@@ -599,7 +647,7 @@ impl InputMsg {
                 down,
             },
             Self::Release => InputEvent::ReleaseAll,
-            Self::Text { .. } | Self::Size { .. } => return None,
+            Self::Text { .. } | Self::Clip { .. } | Self::Size { .. } => return None,
         })
     }
 }
@@ -614,6 +662,9 @@ struct OfferMsg {
     sdp: String,
     width: u32,
     height: u32,
+    /// The browser's screen refresh rate, measured by the page.
+    #[serde(default)]
+    refresh: Option<u32>,
 }
 
 /// One request per connection: `GET /` or `POST /offer`.
@@ -733,6 +784,9 @@ fn offer(
         .context("accepting the offer")?;
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     shared.session.request_size(m.width, m.height);
+    if let Some(hz) = m.refresh.filter(|hz| (24..=500).contains(hz)) {
+        *shared.session.wanted_refresh.lock().unwrap() = Some(hz);
+    }
     shared.estimate.store(0, Ordering::Relaxed);
     let previous = shared.peer.lock().unwrap().replace(Peer {
         rtc,
@@ -749,6 +803,6 @@ fn offer(
     if previous.is_some() {
         info!("A new browser takes over from the previous one");
     }
-    info!(%peer, user = m.user, w = m.width, h = m.height, "Browser logged in");
+    info!(%peer, user = m.user, w = m.width, h = m.height, refresh = m.refresh, "Browser logged in");
     Ok(serde_json::json!({ "sdp": answer.to_sdp_string() }).to_string())
 }

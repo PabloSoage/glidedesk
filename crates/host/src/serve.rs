@@ -270,6 +270,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                         cursor: parts.cursor.clone(),
                         audio: parts.audio.clone(),
                         input: input.clone(),
+                        clipboard: parts.text_clipboard.clone(),
                     })
                     .await
             }

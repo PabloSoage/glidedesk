@@ -85,7 +85,16 @@ async function connect(user, password) {
   }
   dc = pc.createDataChannel("input", { ordered: true });
   dc.binaryType = "arraybuffer";
-  dc.onmessage = (e) => { if (e.data instanceof ArrayBuffer) setCursor(new DataView(e.data)); };
+  dc.onmessage = (e) => {
+    if (!(e.data instanceof ArrayBuffer)) return;
+    const d = new DataView(e.data);
+    if (d.getUint8(0) === 2) {
+      // Text copied in the session.
+      const text = new TextDecoder().decode(new Uint8Array(e.data, 1));
+      lastClip = text;
+      navigator.clipboard && navigator.clipboard.writeText(text).catch(() => {});
+    } else setCursor(d);
+  };
   pc.ontrack = (e) => {
     // As little buffering as the browser allows: this is a desktop, not a film.
     try { e.receiver.jitterBufferTarget = 0; } catch (_) {}
@@ -99,12 +108,41 @@ async function connect(user, password) {
   };
   await pc.setLocalDescription(await pc.createOffer());
   const size = desktopSize();
+  const refresh = await measureRefresh();
   const r = await fetch("/offer", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ user, password, sdp: pc.localDescription.sdp, width: size.w, height: size.h }) });
+    body: JSON.stringify({ user, password, sdp: pc.localDescription.sdp, width: size.w, height: size.h, refresh }) });
   if (!r.ok) throw new Error(await r.text() || r.statusText);
   const { sdp } = await r.json();
   await pc.setRemoteDescription({ type: "answer", sdp });
 }
+
+// The screen's refresh rate from animation frames (the session then runs as fast).
+function measureRefresh() {
+  return new Promise((resolve) => {
+    const t = [];
+    const step = (now) => {
+      t.push(now);
+      if (t.length < 31) return requestAnimationFrame(step);
+      const d = t.slice(1).map((v, i) => v - t[i]).sort((a, b) => a - b);
+      const hz = Math.round(1000 / d[d.length >> 1]);
+      resolve(hz >= 24 && hz <= 500 ? hz : undefined);
+    };
+    requestAnimationFrame(step);
+    setTimeout(() => resolve(undefined), 1500);
+  });
+}
+
+// Clipboard: the browser's text goes to the session when the page gets focus or on paste
+// shortcuts (reading it may ask for permission once); the session's comes back on copy.
+let lastClip = null;
+async function pushClipboard() {
+  if (!navigator.clipboard || !navigator.clipboard.readText) return;
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text && text !== lastClip) { lastClip = text; send({ t: "clip", text }); }
+  } catch (_) {}
+}
+addEventListener("focus", pushClipboard);
 
 function end(reason) {
   if (pc) { pc.close(); pc = null; }
@@ -156,19 +194,21 @@ video.addEventListener("wheel", (e) => {
   e.preventDefault();
 }, { passive: false });
 
-function key(e, down) {
+async function key(e, down) {
   if (!pc) return;
   const sc = SC[e.code];
+  if (down && (e.ctrlKey || e.metaKey) && e.code === "KeyV") await pushClipboard();
   if (sc !== undefined) {
     if (down) pressed.add(e.code); else pressed.delete(e.code);
     send({ t: "key", sc: sc & 0xff, ext: sc > 0xff, down });
   } else if (down && e.key && e.key.length === 1) {
     send({ t: "text", ch: e.key });
   }
-  e.preventDefault();
 }
-addEventListener("keydown", (e) => key(e, true));
-addEventListener("keyup", (e) => key(e, false));
+// Keys go out in order even while a paste waits for the clipboard.
+let keys = Promise.resolve();
+addEventListener("keydown", (e) => { if (pc) e.preventDefault(); keys = keys.then(() => key(e, true)); });
+addEventListener("keyup", (e) => { if (pc) e.preventDefault(); keys = keys.then(() => key(e, false)); });
 addEventListener("blur", () => { if (pressed.size) send({ t: "release" }); pressed.clear(); });
 
 let resizeTimer;
