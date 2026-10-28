@@ -94,7 +94,8 @@ Useful options of `serve` (`--help` lists them all):
 The TLS certificate is self-signed, created in `~/.config/glidedesk/` on first start.
 
 If the "Stop screen sharing" button in GNOME's top bar is pressed, the server starts a new
-session by itself; clients stay connected.
+session by itself within about a second; clients stay connected. Windows that were full
+screen or maximized come back as normal windows (Mutter moves them off the closed monitor).
 
 ## Clients
 

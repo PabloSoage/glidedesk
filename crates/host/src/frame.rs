@@ -57,18 +57,30 @@ pub enum CursorEvent {
 pub struct LatestFrame {
     slot: std::sync::Mutex<(Option<Frame>, bool)>,
     ready: std::sync::Condvar,
+    /// Live senders: the mailbox closes when the last one goes (a capture that replaces
+    /// another holds a copy of the same sender).
+    senders: std::sync::atomic::AtomicUsize,
 }
 
 pub fn latest_frame() -> (FrameSender, FrameReceiver) {
     let shared = Arc::new(LatestFrame {
         slot: std::sync::Mutex::new((None, false)),
         ready: std::sync::Condvar::new(),
+        senders: std::sync::atomic::AtomicUsize::new(1),
     });
     (FrameSender(Arc::clone(&shared)), FrameReceiver(shared))
 }
 
-#[derive(Clone)]
 pub struct FrameSender(Arc<LatestFrame>);
+
+impl Clone for FrameSender {
+    fn clone(&self) -> Self {
+        self.0
+            .senders
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(&self.0))
+    }
+}
 
 impl FrameSender {
     /// Hands over `frame`; returns whether it replaced one the encoder had not taken.
@@ -82,8 +94,15 @@ impl FrameSender {
 
 impl Drop for FrameSender {
     fn drop(&mut self) {
-        self.0.slot.lock().unwrap().1 = true;
-        self.0.ready.notify_one();
+        if self
+            .0
+            .senders
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.slot.lock().unwrap().1 = true;
+            self.0.ready.notify_one();
+        }
     }
 }
 
@@ -115,5 +134,42 @@ pub trait Source: Send {
     /// Sources that cannot change it ignore it.
     fn set_refresh(&self, _hz: u32) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame() -> Frame {
+        Frame {
+            width: 2,
+            height: 2,
+            data: FrameData::Cpu {
+                data: vec![0; 16],
+                stride: 8,
+            },
+            damage: None,
+            captured: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn mailbox_stays_open_while_a_copy_of_the_sender_lives() {
+        let (tx, rx) = latest_frame();
+        let new_capture = tx.clone();
+        // The old capture goes away after the new one started (GNOME session restart).
+        drop(tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        new_capture.send(frame());
+        assert!(rx.recv_timeout(Duration::from_millis(1)).is_ok());
+        drop(new_capture);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

@@ -37,7 +37,9 @@ export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-GNOME}" XDG_SESSION_TYPE=wayl
 # Full redraws: with clipped redraws the software cursor painted over the previous frame stays
 # in the parts of the framebuffer that are not repainted, and the zero-copy capture (a blit of
 # that framebuffer) would carry it although the client draws its own pointer.
-CLUTTER_PAINT="${CLUTTER_PAINT:-disable-clipped-redraws}" gnome-shell --headless --no-x11 $mode >"$log" 2>&1 &
+# GLIDEDESK_SHELL_ARGS: extra gnome-shell flags for tests (e.g. --unsafe-mode for Shell.Eval).
+# shellcheck disable=SC2086
+CLUTTER_PAINT="${CLUTTER_PAINT:-disable-clipped-redraws}" gnome-shell --headless --no-x11 $mode ${GLIDEDESK_SHELL_ARGS:-} >"$log" 2>&1 &
 shell=$!
 trap 'kill -9 $shell $helpers 2>/dev/null || true' EXIT INT TERM
 
