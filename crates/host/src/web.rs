@@ -54,6 +54,8 @@ struct Peer {
     /// The host candidate it was given: where its packets arrive.
     local: SocketAddr,
     connected: bool,
+    /// When the UDP thread plans to wake up next.
+    loop_wake: Instant,
 }
 
 /// What the network side hands to the async side.
@@ -69,6 +71,8 @@ struct Shared {
     index: usize,
     udp: UdpSocket,
     local_port: u16,
+    /// Where an empty datagram wakes the UDP thread.
+    wake_addr: SocketAddr,
     peer: Mutex<Option<Peer>>,
     next_id: AtomicU64,
     keyframe: AtomicBool,
@@ -102,6 +106,16 @@ impl Shared {
                 }
                 RtcOutput::Event(e) => self.event(p, e),
             }
+        }
+    }
+
+    /// `drive` from outside the UDP thread: wakes that thread when str0m now wants it sooner
+    /// than it planned (paced video would otherwise wait for the browser's next packet).
+    fn drive_elsewhere(&self, p: &mut Peer) {
+        let t = self.drive(p);
+        if t < p.loop_wake {
+            p.loop_wake = t;
+            let _ = self.udp.send_to(&[], self.wake_addr);
         }
     }
 
@@ -250,7 +264,7 @@ impl Output for WebOutput {
             )
             .context("writing video")?;
         self.shared.sent.fetch_add(1, Ordering::Relaxed);
-        self.shared.drive(p);
+        self.shared.drive_elsewhere(p);
         Ok(true)
     }
 
@@ -323,13 +337,21 @@ pub async fn new(
             .with_context(|| format!("binding UDP {bind}"))?;
         UdpSocket::from(s)
     };
-    let local_port = udp.local_addr()?.port();
+    let mut wake_addr = udp.local_addr()?;
+    let local_port = wake_addr.port();
+    if wake_addr.ip().is_unspecified() {
+        wake_addr.set_ip(match wake_addr {
+            SocketAddr::V4(_) => IpAddr::from([127, 0, 0, 1]),
+            SocketAddr::V6(_) => IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]),
+        });
+    }
     let (notes_tx, notes) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
         session,
         index,
         udp,
         local_port,
+        wake_addr,
         peer: Mutex::new(None),
         next_id: AtomicU64::new(1),
         keyframe: AtomicBool::new(false),
@@ -401,7 +423,10 @@ fn udp_loop(shared: &Shared) {
             let mut guard = shared.peer.lock().unwrap();
             match guard.as_mut() {
                 Some(p) => {
-                    let wake = shared.drive(p);
+                    let wake = shared
+                        .drive(p)
+                        .min(Instant::now() + Duration::from_millis(50));
+                    p.loop_wake = wake;
                     if !p.rtc.is_alive() {
                         info!(id = p.id, "Browser disconnected");
                         let _ = shared.notes.send(Note::Closed);
@@ -412,15 +437,23 @@ fn udp_loop(shared: &Shared) {
                 None => Instant::now() + Duration::from_millis(50),
             }
         };
+        // The pacer can be due again at once (bandwidth probes go out one padding packet per
+        // timeout): waiting a whole millisecond each time capped the probes at a few Mbit/s.
         let wait = wake
             .saturating_duration_since(Instant::now())
-            .clamp(Duration::from_millis(1), Duration::from_millis(50));
-        let _ = shared.udp.set_read_timeout(Some(wait));
-        let received = shared.udp.recv_from(&mut buf);
+            .min(Duration::from_millis(50));
+        let received = if wait.is_zero() {
+            Err(std::io::ErrorKind::TimedOut.into())
+        } else {
+            let _ = shared.udp.set_read_timeout(Some(wait));
+            shared.udp.recv_from(&mut buf)
+        };
         let mut guard = shared.peer.lock().unwrap();
         let Some(p) = guard.as_mut() else { continue };
         let now = Instant::now();
         let input = match received {
+            // Empty: drive_elsewhere woke us up.
+            Ok((0, _)) | Err(_) => Input::Timeout(now),
             Ok((n, source)) => {
                 let Ok(contents) = buf[..n].try_into() else {
                     continue;
@@ -440,7 +473,6 @@ fn udp_loop(shared: &Shared) {
                 }
                 input
             }
-            Err(_) => Input::Timeout(now),
         };
         if let Err(e) = p.rtc.handle_input(input) {
             debug!(%e, "WebRTC input");
@@ -491,7 +523,7 @@ fn audio_loop(shared: &Shared, audio: &broadcast::Sender<Vec<u8>>) {
                     debug!(%e, "Writing audio");
                 }
             }
-            shared.drive(p);
+            shared.drive_elsewhere(p);
         }
     }
 }
@@ -513,7 +545,7 @@ async fn notes_task(
         if let Some(mut ch) = p.rtc.channel(id) {
             let _ = ch.write(true, msg);
         }
-        shared.drive(p);
+        shared.drive_elsewhere(p);
     };
     let send_cursor = |shared: &Shared, ev: Option<&CursorEvent>| {
         let Some(ev) = ev else { return };
@@ -524,7 +556,7 @@ async fn notes_task(
         if let Some(mut ch) = p.rtc.channel(id) {
             let _ = ch.write(true, &msg);
         }
-        shared.drive(p);
+        shared.drive_elsewhere(p);
     };
     loop {
         tokio::select! {
@@ -799,6 +831,7 @@ fn offer(
         epoch: now,
         local,
         connected: false,
+        loop_wake: now,
     });
     if previous.is_some() {
         info!("A new browser takes over from the previous one");
