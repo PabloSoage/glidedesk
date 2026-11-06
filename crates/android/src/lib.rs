@@ -66,6 +66,19 @@ mod android {
                 && codec.start().is_ok()
             {
                 self.mc = Some(codec);
+            } else if let Some(fallback) = MediaCodec::from_decoder_type(mime) {
+                // Fallback without optional low-latency/priority keys for codecs that reject them (e.g. WSA, emulator).
+                let mut fallback_format = MediaFormat::new();
+                fallback_format.set_str("mime", mime);
+                fallback_format.set_i32("width", w as i32);
+                fallback_format.set_i32("height", h as i32);
+                if fallback
+                    .configure(&fallback_format, Some(window), MediaCodecDirection::Decoder)
+                    .is_ok()
+                    && fallback.start().is_ok()
+                {
+                    self.mc = Some(fallback);
+                }
             }
         }
     }
