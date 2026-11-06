@@ -1879,6 +1879,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "x11rb 0.14.0",
  "zbus",
 ]

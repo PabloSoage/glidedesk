@@ -32,6 +32,8 @@ pub enum SessionKind {
     Gnome,
     #[cfg(feature = "x11")]
     X11 { display: Option<String> },
+    #[cfg(target_os = "windows")]
+    Windows,
 }
 
 pub struct ServeOptions {
@@ -166,6 +168,22 @@ fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
     })
 }
 
+#[cfg(target_os = "windows")]
+fn windows(opts: &ServeOptions) -> Result<Parts> {
+    let s = crate::winsession::start(opts.gpu, opts.fps)?;
+    Ok(Parts {
+        size: s.size,
+        source: Box::new(s.source),
+        frames: s.frames,
+        cursor: s.cursor,
+        input: Box::new(s.input),
+        audio: None,
+        clipboard: None,
+        text_clipboard: None,
+        stop: None,
+    })
+}
+
 pub async fn serve(opts: ServeOptions) -> Result<()> {
     let (backend, cuda) = encoder::select(
         opts.encoder,
@@ -184,6 +202,11 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         SessionKind::X11 { display } => {
             drop(cuda);
             x11(display.as_deref(), opts.fps)?
+        }
+        #[cfg(target_os = "windows")]
+        SessionKind::Windows => {
+            drop(cuda);
+            windows(&opts)?
         }
     };
     let shared = Arc::new(pipeline::Shared::default());
@@ -211,6 +234,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         }
         None => None,
     };
+    #[cfg(feature = "web")]
     let max_bitrate = opts.pipeline.max_bitrate;
     let pipeline = Pipeline::new(
         Arc::clone(&shared),

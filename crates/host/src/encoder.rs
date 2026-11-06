@@ -49,10 +49,12 @@ pub struct EncodedFrame {
 /// Which encoder to use (`--encoder`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Choice {
-    /// NVENC if there is an NVIDIA GPU, else VA-API, else software.
+    /// NVENC if there is an NVIDIA GPU, else VA-API/QSV/AMF, else software.
     Auto,
     Nvenc,
     Vaapi,
+    Qsv,
+    Amf,
     Software,
 }
 
@@ -283,6 +285,8 @@ impl Backend for Ffmpeg {
     fn name(&self) -> &'static str {
         match self.kind {
             Kind::Vaapi => "vaapi",
+            Kind::Qsv => "qsv",
+            Kind::Amf => "amf",
             Kind::Software => "software",
         }
     }
@@ -365,20 +369,27 @@ impl Backend for Ffmpeg {
 /// A backend and, for NVENC, the CUDA context the capture imports DMA-BUFs onto.
 pub type Selected = (Box<dyn Backend>, Option<Arc<CudaContext>>);
 
-/// First DRM render node, for VA-API.
+/// First DRM render node, for VA-API (Linux) or default device name.
 pub fn default_render_node() -> String {
-    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path().display().to_string())
-        .filter(|p| p.contains("renderD"))
-        .collect();
-    nodes.sort();
-    nodes
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "/dev/dri/renderD128".into())
+    #[cfg(unix)]
+    {
+        let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().display().to_string())
+            .filter(|p| p.contains("renderD"))
+            .collect();
+        nodes.sort();
+        nodes
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "/dev/dri/renderD128".into())
+    }
+    #[cfg(not(unix))]
+    {
+        "".into()
+    }
 }
 
 /// The backend for `choice`, and the CUDA context when NVENC is used (the capture then
@@ -405,11 +416,28 @@ pub fn select(
     match choice {
         Choice::Nvenc => nvenc(),
         Choice::Vaapi => ffmpeg(Kind::Vaapi),
+        Choice::Qsv => ffmpeg(Kind::Qsv),
+        Choice::Amf => ffmpeg(Kind::Amf),
         Choice::Software => ffmpeg(Kind::Software),
-        Choice::Auto => nvenc()
-            .inspect_err(|e| warn!(%e, "No NVENC"))
-            .or_else(|_| ffmpeg(Kind::Vaapi))
-            .inspect_err(|e| warn!(%e, "No VA-API encoder, encoding on the CPU"))
-            .or_else(|_| ffmpeg(Kind::Software)),
+        Choice::Auto => {
+            #[cfg(target_os = "windows")]
+            {
+                nvenc()
+                    .inspect_err(|e| warn!(%e, "No NVENC"))
+                    .or_else(|_| ffmpeg(Kind::Qsv))
+                    .inspect_err(|e| warn!(%e, "No QSV"))
+                    .or_else(|_| ffmpeg(Kind::Amf))
+                    .inspect_err(|e| warn!(%e, "No AMF, encoding on the CPU"))
+                    .or_else(|_| ffmpeg(Kind::Software))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                nvenc()
+                    .inspect_err(|e| warn!(%e, "No NVENC"))
+                    .or_else(|_| ffmpeg(Kind::Vaapi))
+                    .inspect_err(|e| warn!(%e, "No VA-API encoder, encoding on the CPU"))
+                    .or_else(|_| ffmpeg(Kind::Software))
+            }
+        }
     }
 }

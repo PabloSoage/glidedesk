@@ -30,6 +30,8 @@ mod serve;
 mod sound;
 #[cfg(feature = "web")]
 mod web;
+#[cfg(target_os = "windows")]
+mod winsession;
 #[cfg(feature = "x11")]
 mod x11session;
 
@@ -255,11 +257,13 @@ async fn main() -> Result<()> {
     }
 }
 
-/// The session served when no other is chosen: a headless GNOME Shell.
+/// The session served when no other is chosen: Windows desktop on Windows, headless GNOME on Linux.
 fn default_session() -> Result<serve::SessionKind> {
+    #[cfg(target_os = "windows")]
+    return Ok(serve::SessionKind::Windows);
     #[cfg(feature = "gnome")]
     return Ok(serve::SessionKind::Gnome);
-    #[cfg(not(feature = "gnome"))]
+    #[cfg(all(not(target_os = "windows"), not(feature = "gnome")))]
     anyhow::bail!("this build serves X11 displays only: pass --x11 DISPLAY")
 }
 

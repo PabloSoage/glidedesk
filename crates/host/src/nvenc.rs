@@ -49,8 +49,12 @@ pub fn probe() -> Result<()> {
 impl Api {
     fn load() -> Result<Self> {
         // SAFETY: loading the NVIDIA driver library; its initialisers have no preconditions.
-        let lib = unsafe { libloading::Library::new("libnvidia-encode.so.1") }
-            .context("loading libnvidia-encode.so.1 (NVIDIA driver)")?;
+        #[cfg(target_os = "windows")]
+        let lib_name = "nvEncodeAPI64.dll";
+        #[cfg(not(target_os = "windows"))]
+        let lib_name = "libnvidia-encode.so.1";
+        let lib = unsafe { libloading::Library::new(lib_name) }
+            .with_context(|| format!("loading {lib_name} (NVIDIA driver)"))?;
         let mut f = nv::NV_ENCODE_API_FUNCTION_LIST {
             version: nv::NV_ENCODE_API_FUNCTION_LIST_VER,
             ..Default::default()
@@ -499,7 +503,8 @@ impl Encoder {
             ..Default::default()
         };
         if self.force_idr {
-            pic.encodePicFlags = nv::NV_ENC_PIC_FLAG_FORCEIDR | nv::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+            pic.encodePicFlags =
+                (nv::NV_ENC_PIC_FLAG_FORCEIDR | nv::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) as u32;
         }
         let r = call!(self.api, nvEncEncodePicture, self.enc, &mut pic);
         let out = r.and_then(|_| {

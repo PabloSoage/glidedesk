@@ -10,7 +10,10 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(not(unix))]
+type RawFd = i32;
 use std::ptr;
 use std::sync::Arc;
 

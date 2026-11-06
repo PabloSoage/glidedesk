@@ -2,3 +2,4 @@
 *.stackdump
 /dist/
 /vcpkg_installed
+/vcpkg_installed_host

@@ -19,6 +19,10 @@ use crate::encoder::{Codec, EncodedFrame, EncoderConfig};
 pub enum Kind {
     /// Hardware encoder of the GPU behind a DRM render node.
     Vaapi,
+    /// Quick Sync Video (Intel QSV via libvpl / D3D11).
+    Qsv,
+    /// Advanced Media Framework (AMD AMF).
+    Amf,
     /// libx264 on the CPU: works anywhere, costs CPU time.
     Software,
 }
@@ -69,6 +73,10 @@ impl FfEncoder {
         let name = match (kind, cfg.codec) {
             (Kind::Vaapi, Codec::H264) => "h264_vaapi",
             (Kind::Vaapi, Codec::Hevc) => "hevc_vaapi",
+            (Kind::Qsv, Codec::H264) => "h264_qsv",
+            (Kind::Qsv, Codec::Hevc) => "hevc_qsv",
+            (Kind::Amf, Codec::H264) => "h264_amf",
+            (Kind::Amf, Codec::Hevc) => "hevc_amf",
             (Kind::Software, Codec::H264) => "libx264",
             (Kind::Software, Codec::Hevc) => "libx265",
         };
@@ -144,6 +152,17 @@ impl FfEncoder {
                     set(&mut opts, "async_depth", "1");
                     set(&mut opts, "sei", "0");
                     set(&mut opts, "aud", "0");
+                }
+                Kind::Qsv => {
+                    c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+                    set(&mut opts, "preset", "veryfast");
+                    set(&mut opts, "low_power", "1");
+                    set(&mut opts, "forced_idr", "1");
+                }
+                Kind::Amf => {
+                    c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+                    set(&mut opts, "usage", "ultralowlatency");
+                    set(&mut opts, "quality", "speed");
                 }
                 Kind::Software => {
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
@@ -221,7 +240,7 @@ impl FfEncoder {
                 ff::AVPictureType::AV_PICTURE_TYPE_NONE
             };
             let input = match self.kind {
-                Kind::Software => self.sw_frame,
+                Kind::Software | Kind::Qsv | Kind::Amf => self.sw_frame,
                 Kind::Vaapi => {
                     ff::av_frame_unref(self.hw_frame);
                     check(

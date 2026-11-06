@@ -1,7 +1,7 @@
 {
   "name": "glidedesk",
   "version-string": "0.2.0",
-  "description": "Native libraries for the Windows desktop client: FFmpeg's decoders with D3D11VA (linked statically)",
+  "description": "Native libraries for the Windows builds: FFmpeg's decoders with D3D11VA for the desktop client, and its hardware encoders for the host (linked statically)",
   "dependencies": [
     {
       "name": "ffmpeg",
@@ -11,5 +11,24 @@
       ]
     }
   ],
+  "features": {
+    "host": {
+      "description": "Encoders for the Windows host: AMF (AMD), Quick Sync (Intel), NVENC (NVIDIA), Media Foundation and x264",
+      "dependencies": [
+        {
+          "name": "ffmpeg",
+          "default-features": false,
+          "features": [
+            "avcodec",
+            "amf",
+            "qsv",
+            "nvcodec",
+            "x264",
+            "gpl"
+          ]
+        }
+      ]
+    }
+  },
   "builtin-baseline": "866e9e258a76437074a5cf02d4c2d71b53bff2f8"
 }
