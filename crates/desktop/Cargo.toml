@@ -25,6 +25,12 @@ ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcode
 libc = "0.2"
 cpal = "0.18"
 arboard = { version = "3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+hex = "0.4"
+egui = "0.37"
+egui-winit = { version = "0.37", default-features = false }
+egui-wgpu = { version = "0.37", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # FFmpeg linked in (vcpkg.json; scripts/build-windows.ps1): one .exe, nothing to install.

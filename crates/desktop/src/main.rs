@@ -11,7 +11,9 @@ mod audio;
 mod clip;
 mod decode;
 mod keymap;
+mod launcher;
 mod platform;
+mod profile;
 mod render;
 mod video;
 
@@ -40,8 +42,8 @@ const ICON: &[u8] = include_bytes!("../../../assets/logo/glidedesk-64.rgba");
 #[derive(Parser, Clone)]
 #[command(version, about = "glidedesk remote desktop client")]
 struct Args {
-    /// Server host name or address.
-    host: String,
+    /// Server host name or address (or path to a .glidedesk profile). If omitted, opens launcher.
+    host: Option<String>,
     /// Without a password, the saved credentials or the Windows sign-in dialog are used.
     #[arg(long)]
     user: Option<String>,
@@ -86,6 +88,7 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(250);
 
 struct App {
     args: Args,
+    launcher_state: Option<launcher::LauncherState>,
     proxy: EventLoopProxy<Event>,
     instance: Option<wgpu::Instance>,
     window: Option<Arc<Window>>,
@@ -154,10 +157,16 @@ impl App {
         // HEVC (fewer bits for the same picture) only where the GPU decodes it.
         let hevc = !self.args.rdp && !self.args.software_decode && decode::hardware_hevc();
         self.runtime.spawn(async move {
+            let host_str = a.host.clone().unwrap_or_default();
+            let default_port = if a.rdp { 3389 } else { glidedesk_proto::DEFAULT_PORT };
+            let port_num = a.port.unwrap_or(default_port);
+            let pinned = profile::KnownHosts::load().get(&host_str, port_num);
+            let host_copy = host_str.clone();
+
             let r = if a.rdp {
                 let opts = glidedesk_client::session::ConnectOptions {
-                    host: a.host,
-                    port: a.port.unwrap_or(3389),
+                    host: host_str,
+                    port: port_num,
                     username: a.user.unwrap_or_default(),
                     password: a.password.unwrap_or_default(),
                     width: w as u16,
@@ -166,8 +175,8 @@ impl App {
                 glidedesk_client::session::run(opts, sink, rx).await
             } else {
                 let opts = glidedesk_client::native::NativeOptions {
-                    host: a.host,
-                    port: a.port.unwrap_or(glidedesk_proto::DEFAULT_PORT),
+                    host: host_str,
+                    port: port_num,
                     username: a.user.unwrap_or_default(),
                     password: a.password.unwrap_or_default(),
                     width: w as u16,
@@ -178,11 +187,14 @@ impl App {
                         vec![VideoCodec::H264]
                     },
                     refresh,
-                    pinned: None,
+                    pinned,
                 };
-                glidedesk_client::native::run(opts, sink, rx)
-                    .await
-                    .map(|_| ())
+                let res = glidedesk_client::native::run(opts, sink, rx).await;
+                if let Ok(fp) = &res {
+                    let mut known = profile::KnownHosts::load();
+                    known.set(&host_copy, port_num, fp);
+                }
+                res.map(|_| ())
             };
             notify(Event::Ended(match r {
                 Ok(()) => "Session ended".into(),
@@ -221,16 +233,26 @@ impl ApplicationHandler<Event> for App {
         if self.window.is_some() {
             return;
         }
+        let is_launcher = self.args.host.is_none();
+        let (win_w, win_h, title) = if is_launcher {
+            (520, 480, "glidedesk".to_string())
+        } else {
+            (
+                self.args.width,
+                self.args.height,
+                format!("glidedesk - {}", self.args.host.as_deref().unwrap_or_default()),
+            )
+        };
         let mut attrs = Window::default_attributes()
-            .with_title(format!("glidedesk - {}", self.args.host))
+            .with_title(title)
             .with_window_icon(Icon::from_rgba(ICON.to_vec(), 64, 64).ok())
-            .with_inner_size(PhysicalSize::new(self.args.width, self.args.height));
+            .with_inner_size(PhysicalSize::new(win_w, win_h));
         #[cfg(windows)]
         {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs = attrs.with_taskbar_icon(Icon::from_rgba(ICON.to_vec(), 64, 64).ok());
         }
-        if self.args.fullscreen {
+        if !is_launcher && self.args.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
         let window = match el.create_window(attrs) {
@@ -265,8 +287,14 @@ impl ApplicationHandler<Event> for App {
         }
         let size = window.inner_size();
         self.desktop = (size.width, size.height);
+        if is_launcher {
+            let ren = self.renderer.as_ref().unwrap();
+            self.launcher_state = Some(launcher::LauncherState::new(&window, ren.device(), ren.format()));
+            window.request_redraw();
+        } else {
+            self.start_session(size);
+        }
         self.window = Some(window);
-        self.start_session(size);
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: Event) {
@@ -322,8 +350,10 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             Event::Ended(reason) => {
-                if reason.contains("wrong user name or password") {
-                    platform::forget_credentials(&self.args.host);
+                if reason.contains("wrong user name or password")
+                    && let Some(h) = &self.args.host
+                {
+                    platform::forget_credentials(h);
                 }
                 if self.closing {
                     info!("{reason}");
@@ -343,6 +373,76 @@ impl ApplicationHandler<Event> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        if let Some(ls) = &mut self.launcher_state {
+            let _ = ls.on_event(window, &event);
+            match event {
+                WindowEvent::CloseRequested => {
+                    self.closing = true;
+                    el.exit();
+                }
+                WindowEvent::RedrawRequested => {
+                    let mut action = launcher::LauncherAction::None;
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.render_frame(|dev, q, view| {
+                            action = ls.draw(window, dev, q, view);
+                        });
+                    }
+                    match action {
+                        launcher::LauncherAction::None => {}
+                        launcher::LauncherAction::Exit => {
+                            self.closing = true;
+                            el.exit();
+                        }
+                        launcher::LauncherAction::Connect => {
+                            let mut args = ls.launcher.build_args();
+                            if args.password.is_none() {
+                                let host_str = args.host.as_deref().unwrap_or_default();
+                                let Some((user, password)) = platform::credentials(host_str, args.user.as_deref()) else {
+                                    if !cfg!(windows) {
+                                        platform::show_error("--user and --password (or GLIDEDESK_PASSWORD) are needed");
+                                    }
+                                    return;
+                                };
+                                args.user = Some(user);
+                                args.password = Some(password);
+                            }
+                            if let Some(v) = args.gpu {
+                                decode::use_gpu(v);
+                            }
+                            self.args = args;
+                            self.launcher_state = None;
+
+                            let _ = window.request_inner_size(PhysicalSize::new(self.args.width, self.args.height));
+                            if self.args.fullscreen {
+                                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                            }
+                            window.set_title(&format!("glidedesk - {}", self.args.host.as_deref().unwrap_or_default()));
+                            let size = window.inner_size();
+                            if let Some(r) = self.renderer.as_mut() {
+                                r.resize(size.width, size.height);
+                            }
+                            self.desktop = (size.width, size.height);
+                            self.start_session(size);
+                        }
+                    }
+                }
+                WindowEvent::Resized(size) => {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.resize(size.width, size.height);
+                    }
+                    window.request_redraw();
+                }
+                _ => {
+                    window.request_redraw();
+                }
+            }
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 self.closing = true;
@@ -459,22 +559,49 @@ fn main() -> Result<()> {
         }
     };
     let mut args = args;
-    if let Some(v) = args.gpu {
-        decode::use_gpu(v);
-    }
-    if args.password.is_none() {
-        let Some((user, password)) = platform::credentials(&args.host, args.user.as_deref()) else {
-            if !cfg!(windows) {
-                platform::show_error("--user and --password (or GLIDEDESK_PASSWORD) are needed");
+    let is_launcher = args.host.is_none();
+    if let Some(ref h) = args.host {
+        let p = std::path::Path::new(h);
+        if (h.ends_with(".glidedesk") || p.is_file())
+            && let Ok(prof) = profile::Profile::load_file(p)
+        {
+            args.host = Some(prof.host);
+            if let Some(u) = prof.user { args.user = Some(u); }
+            if let Some(port) = prof.port { args.port = Some(port); }
+            if let Some(rdp) = prof.rdp { args.rdp = rdp; }
+            if let (Some(w), Some(h)) = (prof.width, prof.height) {
+                args.width = w;
+                args.height = h;
             }
-            return Ok(());
-        };
-        args.user = Some(user);
-        args.password = Some(password);
+            if let Some(fs) = prof.fullscreen { args.fullscreen = fs; }
+            if let Some(m) = prof.mute { args.mute = m; }
+            if let Some(sw) = prof.software_decode { args.software_decode = sw; }
+            if let Some(g) = prof.gpu {
+                args.gpu = parse_vendor(&g).ok();
+            }
+        }
+    }
+
+    if !is_launcher {
+        if let Some(v) = args.gpu {
+            decode::use_gpu(v);
+        }
+        if args.password.is_none() {
+            let host_str = args.host.as_deref().unwrap_or_default();
+            let Some((user, password)) = platform::credentials(host_str, args.user.as_deref()) else {
+                if !cfg!(windows) {
+                    platform::show_error("--user and --password (or GLIDEDESK_PASSWORD) are needed");
+                }
+                return Ok(());
+            };
+            args.user = Some(user);
+            args.password = Some(password);
+        }
     }
     let event_loop = EventLoop::<Event>::with_user_event().build()?;
     let mut app = App {
         args,
+        launcher_state: None,
         proxy: event_loop.create_proxy(),
         instance: None,
         window: None,

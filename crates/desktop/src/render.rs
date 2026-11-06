@@ -213,6 +213,39 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    #[allow(dead_code)]
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
+    /// Renders a frame using a custom drawing closure onto the swapchain.
+    pub fn render_frame<F>(&mut self, draw_fn: F) -> bool
+    where
+        F: FnOnce(&wgpu::Device, &wgpu::Queue, &wgpu::TextureView),
+    {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return false;
+            }
+            _ => return false,
+        };
+        let view = frame.texture.create_view(&Default::default());
+        draw_fn(&self.device, &self.queue, &view);
+        self.queue.present(frame);
+        true
+    }
+
     fn plane(&self, w: u32, h: u32, format: wgpu::TextureFormat) -> wgpu::Texture {
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
