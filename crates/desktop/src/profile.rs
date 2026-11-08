@@ -17,6 +17,7 @@ pub struct Profile {
     pub mute: Option<bool>,
     pub software_decode: Option<bool>,
     pub gpu: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 impl Profile {
@@ -160,6 +161,7 @@ mod tests {
             mute: Some(false),
             software_decode: Some(false),
             gpu: Some("nvidia".into()),
+            fingerprint: Some("eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573".into()),
         };
 
         let temp_dir = std::env::temp_dir().join("glidedesk_test");
@@ -175,6 +177,10 @@ mod tests {
         assert_eq!(loaded.width, Some(1920));
         assert_eq!(loaded.height, Some(1080));
         assert_eq!(loaded.gpu.as_deref(), Some("nvidia"));
+        assert_eq!(
+            loaded.fingerprint.as_deref(),
+            Some("eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573")
+        );
 
         let _ = fs::remove_file(file);
     }

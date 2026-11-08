@@ -70,6 +70,9 @@ struct Args {
     /// Decode and draw on this GPU (amd, intel, nvidia) instead of the default one.
     #[arg(long, value_parser = parse_vendor)]
     gpu: Option<u32>,
+    /// SHA-256 fingerprint of the server certificate to pin (64 hex characters).
+    #[arg(long)]
+    fingerprint: Option<String>,
 }
 
 /// A GPU maker's name as its PCI vendor id.
@@ -160,7 +163,19 @@ impl App {
             let host_str = a.host.clone().unwrap_or_default();
             let default_port = if a.rdp { 3389 } else { glidedesk_proto::DEFAULT_PORT };
             let port_num = a.port.unwrap_or(default_port);
-            let pinned = profile::KnownHosts::load().get(&host_str, port_num);
+            let pinned = if let Some(fp_hex) = &a.fingerprint {
+                hex::decode(fp_hex.trim()).ok().and_then(|b| {
+                    if b.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                profile::KnownHosts::load().get(&host_str, port_num)
+            };
             let host_copy = host_str.clone();
 
             let r = if a.rdp {
@@ -576,6 +591,7 @@ fn main() -> Result<()> {
             if let Some(fs) = prof.fullscreen { args.fullscreen = fs; }
             if let Some(m) = prof.mute { args.mute = m; }
             if let Some(sw) = prof.software_decode { args.software_decode = sw; }
+            if let Some(fp) = prof.fingerprint { args.fingerprint = Some(fp); }
             if let Some(g) = prof.gpu {
                 args.gpu = parse_vendor(&g).ok();
             }

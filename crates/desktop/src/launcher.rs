@@ -64,6 +64,7 @@ pub struct Launcher {
     pub multimon: bool,
     pub history: History,
     pub known_hosts: KnownHosts,
+    pub fingerprint: String,
     pub profile_path: String,
     pub status_msg: Option<(String, bool)>,
 }
@@ -94,6 +95,7 @@ impl Launcher {
             multimon: false,
             history,
             known_hosts,
+            fingerprint: String::new(),
             profile_path: default_profile,
             status_msg: None,
         }
@@ -127,6 +129,7 @@ impl Launcher {
                 _ => GpuOption::Auto,
             };
         }
+        if let Some(fp) = p.fingerprint { self.fingerprint = fp; } else { self.fingerprint.clear(); }
         self.profile_path = path.to_string_lossy().to_string();
         self.status_msg = Some((format!("Perfil cargado: {}", path.display()), false));
         Ok(())
@@ -158,6 +161,7 @@ impl Launcher {
             mute: if self.mute { Some(true) } else { None },
             software_decode: if self.software_decode { Some(true) } else { None },
             gpu: gpu_str,
+            fingerprint: if self.fingerprint.trim().is_empty() { None } else { Some(self.fingerprint.trim().to_string()) },
         };
         p.save_file(path).map_err(|e| e.to_string())
     }
@@ -202,6 +206,7 @@ impl Launcher {
             mute: self.mute,
             software_decode: self.software_decode,
             gpu,
+            fingerprint: if self.fingerprint.trim().is_empty() { None } else { Some(self.fingerprint.trim().to_owned()) },
         }
     }
 }
@@ -470,6 +475,17 @@ pub fn render_ui(launcher: &mut Launcher, ui: &mut egui::Ui) -> LauncherAction {
                             launcher.known_hosts.forget(h, port);
                         }
                     }
+                });
+
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new("Huella digital del servidor (SHA-256)").strong());
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Fijar huella manualmente para este perfil (64 caracteres hex):").size(11.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut launcher.fingerprint)
+                            .hint_text("vacío = usar TOFU (huella conocida)")
+                    );
                 });
 
                 ui.add_space(6.0);
