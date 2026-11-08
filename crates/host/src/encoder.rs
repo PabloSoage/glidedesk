@@ -176,6 +176,9 @@ impl Backend for Nvenc {
                 self.fps,
                 self.bitrate,
             );
+            // The old session goes first: the driver crashes (in a thread of its own) when a
+            // session is destroyed after another one was opened on the same context.
+            self.encoder = None;
             self.encoder = Some((
                 Encoder::new(Arc::clone(&self.ctx), cfg)?,
                 (req.codec, req.avc444),
@@ -437,6 +440,87 @@ pub fn select(
                     .or_else(|_| ffmpeg(Kind::Vaapi))
                     .inspect_err(|e| warn!(%e, "No VA-API encoder, encoding on the CPU"))
                     .or_else(|_| ffmpeg(Kind::Software))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encodes synthetic frames from system memory with each encoder this machine has:
+    /// `cargo test -p glidedesk-host encoders_on_this_machine -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn encoders_on_this_machine() {
+        let (w, h) = (1920u32, 1080u32);
+        let choices = [
+            Choice::Nvenc,
+            Choice::Vaapi,
+            Choice::Qsv,
+            Choice::Amf,
+            Choice::Software,
+        ];
+        for choice in choices {
+            let mut backend = match select(choice, 0, None, 60, 20_000_000) {
+                Ok((b, _)) => b,
+                Err(e) => {
+                    println!("{choice:?}: not available ({e:#})");
+                    continue;
+                }
+            };
+            for codec in [Codec::H264, Codec::Hevc] {
+                if codec == Codec::Hevc && !backend.supports_hevc() {
+                    println!("{choice:?} {codec:?}: not offered");
+                    continue;
+                }
+                backend.request_keyframe();
+                let start = std::time::Instant::now();
+                let (mut bytes, mut first_key) = (0, None);
+                for i in 0..60u32 {
+                    // A gradient that moves: every frame differs.
+                    let mut data = vec![0u8; (w * h * 4) as usize];
+                    for (p, px) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        let (x, y) = (p as u32 % w, p as u32 / w);
+                        *px = [(x + i * 8) as u8, (y + i * 4) as u8, (x ^ y) as u8, 0];
+                    }
+                    let frame = Frame {
+                        width: w,
+                        height: h,
+                        data: FrameData::Cpu {
+                            data,
+                            stride: w * 4,
+                        },
+                        damage: None,
+                        captured: std::time::Instant::now(),
+                    };
+                    let req = Request {
+                        codec,
+                        avc444: false,
+                        main: true,
+                        aux: false,
+                        const_qp: None,
+                    };
+                    let (main, _) = backend.encode(&frame, &req).expect("encoding");
+                    assert!(
+                        !main.data.is_empty(),
+                        "{choice:?} {codec:?}: empty picture {i}"
+                    );
+                    first_key.get_or_insert(main.keyframe);
+                    bytes += main.data.len();
+                }
+                assert_eq!(
+                    first_key,
+                    Some(true),
+                    "{choice:?} {codec:?}: first picture not a keyframe"
+                );
+                println!(
+                    "{} {codec:?}: 60 frames 1080p in {:.0} ms (with the CPU colour conversion), {} kB",
+                    backend.name(),
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    bytes / 1000
+                );
             }
         }
     }
