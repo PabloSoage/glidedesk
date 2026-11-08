@@ -156,7 +156,11 @@ impl FfEncoder {
                 Kind::Qsv => {
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
                     set(&mut opts, "preset", "veryfast");
-                    set(&mut opts, "low_power", "1");
+                    // The fixed-function (VDENC) path: H.264 since Skylake, HEVC only since Ice
+                    // Lake, so HEVC takes the default one.
+                    if cfg.codec == Codec::H264 {
+                        set(&mut opts, "low_power", "1");
+                    }
                     set(&mut opts, "forced_idr", "1");
                 }
                 Kind::Amf => {

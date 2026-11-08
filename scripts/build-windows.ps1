@@ -1,4 +1,4 @@
-# Builds the Windows desktop client with FFmpeg linked in (one .exe).
+# Builds the Windows desktop client (or, with --host, the host) with FFmpeg linked in.
 #
 # FFmpeg comes from vcpkg (vcpkg.json, triplet x64-windows-static-md): the vcpkg that ships
 # with Visual Studio / Build Tools (component "vcpkg package manager"), or any vcpkg on PATH
@@ -6,6 +6,7 @@
 #
 #   scripts\build-windows.ps1            # release build: target\release\glidedesk.exe
 #   scripts\build-windows.ps1 --debug    # (any other arguments go to cargo)
+#   scripts\build-windows.ps1 --host     # target\release\glidedesk-host.exe
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
@@ -25,10 +26,20 @@ function Find-Vcpkg {
 }
 
 $vcpkg = Find-Vcpkg
-& $vcpkg install --triplet $triplet --x-manifest-root=$repo --x-install-root="$repo\vcpkg_installed"
+# The host (--host) needs FFmpeg's encoders too: the manifest's "host" feature, installed apart.
+$hostBuild = $args -contains '--host'
+$rest = $args | Where-Object { $_ -ne '--host' }
+$installRoot = if ($hostBuild) { "$repo\vcpkg_installed_host" } else { "$repo\vcpkg_installed" }
+[string[]]$features = if ($hostBuild) { '--x-feature=host' } else { @() }
+& $vcpkg install --triplet $triplet --x-manifest-root=$repo --x-install-root=$installRoot @features
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-$env:FFMPEG_DIR = "$repo\vcpkg_installed\$triplet"
-$cargoArgs = @(if ($args -contains '--debug') { $args | Where-Object { $_ -ne '--debug' } } else { @('--release') + $args })
-cargo build -p glidedesk-desktop @cargoArgs
+$env:FFMPEG_DIR = "$installRoot\$triplet"
+$cargoArgs = @(if ($rest -contains '--debug') { $rest | Where-Object { $_ -ne '--debug' } } else { @('--release') + $rest })
+if ($hostBuild) {
+    # No GNOME and no web front end on Windows yet.
+    cargo build -p glidedesk-host --no-default-features @cargoArgs
+} else {
+    cargo build -p glidedesk-desktop @cargoArgs
+}
 exit $LASTEXITCODE

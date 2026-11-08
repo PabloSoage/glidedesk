@@ -32,6 +32,10 @@ mod sound;
 #[cfg(feature = "web")]
 mod web;
 #[cfg(target_os = "windows")]
+mod winaudio;
+#[cfg(target_os = "windows")]
+mod winclip;
+#[cfg(target_os = "windows")]
 mod winsession;
 #[cfg(feature = "x11")]
 mod x11session;
@@ -202,13 +206,15 @@ async fn main() -> Result<()> {
             };
             #[cfg(not(feature = "x11"))]
             let session = default_session()?;
-            let state_dir = std::env::var_os("XDG_CONFIG_HOME")
+            #[cfg(windows)]
+            let config = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+            #[cfg(not(windows))]
+            let config = std::env::var_os("XDG_CONFIG_HOME")
                 .map(std::path::PathBuf::from)
                 .or_else(|| {
                     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-                })
-                .unwrap_or_else(|| ".".into())
-                .join("glidedesk");
+                });
+            let state_dir = config.unwrap_or_else(|| ".".into()).join("glidedesk");
             serve::serve(serve::ServeOptions {
                 session,
                 pipeline: pipeline::Options {
@@ -230,7 +236,7 @@ async fn main() -> Result<()> {
                 width,
                 height,
                 username: user
-                    .or_else(|| std::env::var("USER").ok())
+                    .or_else(|| std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).ok())
                     .unwrap_or_default(),
                 password,
                 state_dir,

@@ -503,8 +503,10 @@ impl Encoder {
             ..Default::default()
         };
         if self.force_idr {
-            pic.encodePicFlags =
-                nv::NV_ENC_PIC_FLAG_FORCEIDR | nv::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+            // C enums are signed with MSVC, unsigned with GCC.
+            #[allow(clippy::unnecessary_cast)]
+            let flags = (nv::NV_ENC_PIC_FLAG_FORCEIDR | nv::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) as u32;
+            pic.encodePicFlags = flags;
         }
         let r = call!(self.api, nvEncEncodePicture, self.enc, &mut pic);
         let out = r.and_then(|_| {

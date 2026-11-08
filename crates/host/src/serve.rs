@@ -169,17 +169,24 @@ fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows(opts: &ServeOptions) -> Result<Parts> {
-    let s = crate::winsession::start(opts.gpu, opts.fps)?;
+fn windows() -> Result<Parts> {
+    let s = crate::winsession::start()?;
+    let clipboard = crate::winclip::WinClipboard::start()
+        .map_err(|e| warn!(%e, "No clipboard"))
+        .ok();
     Ok(Parts {
         size: s.size,
         source: Box::new(s.source),
         frames: s.frames,
         cursor: s.cursor,
         input: Box::new(s.input),
-        audio: None,
-        clipboard: None,
-        text_clipboard: None,
+        audio: crate::winaudio::start()
+            .map_err(|e| warn!(error = format!("{e:#}"), "No audio"))
+            .ok(),
+        clipboard: clipboard
+            .clone()
+            .map(|c| Box::new(c) as Box<dyn ironrdp_server::CliprdrServerFactory>),
+        text_clipboard: clipboard.map(|c| Arc::new(c) as Arc<dyn crate::native::TextClipboard>),
         stop: None,
     })
 }
@@ -206,7 +213,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         #[cfg(target_os = "windows")]
         SessionKind::Windows => {
             drop(cuda);
-            windows(&opts)?
+            windows()?
         }
     };
     let shared = Arc::new(pipeline::Shared::default());
