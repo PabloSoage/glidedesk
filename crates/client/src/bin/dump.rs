@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
                 vec![VideoCodec::H264]
             },
             refresh: 60,
-            pinned: None,
+            trust: Default::default(),
         };
         tokio::spawn(async move {
             glidedesk_client::native::run(opts, shared, rx)
@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
             password: a.password,
             width: a.width,
             height: a.height,
+            trust: Default::default(),
         };
         tokio::spawn(run(opts, shared, rx))
     };

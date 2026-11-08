@@ -3,3 +3,4 @@
 pub mod gfx;
 pub mod native;
 pub mod session;
+pub mod trust;

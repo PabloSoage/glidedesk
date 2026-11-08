@@ -27,6 +27,8 @@ pub struct ConnectOptions {
     pub password: String,
     pub width: u16,
     pub height: u16,
+    /// Which server certificate to accept.
+    pub trust: crate::trust::Trust,
 }
 
 /// What the platform sends into a running session.
@@ -155,9 +157,13 @@ pub async fn run(
     let mut connector = ClientConnector::new(config(&opts), local).with_static_channel(drdynvc);
     let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector).await?;
     let tcp = framed.into_inner_no_leftover();
-    // The host certificate is self-signed; it is pinned on first use by the platform layer
-    // (to do). The TLS public key still binds NLA to this connection.
+    // The host certificate is self-signed: checked against the pin before NLA sends the
+    // credentials. Its public key also binds NLA to this connection.
     let (tls, cert) = ironrdp_tls::upgrade(tcp, &opts.host).await.context("TLS")?;
+    let der = x509_cert::der::Encode::to_der(&cert).context("encoding the server certificate")?;
+    opts.trust
+        .check(&crate::trust::fingerprint(&der))
+        .map_err(anyhow::Error::msg)?;
     let public_key = ironrdp_tls::extract_tls_server_public_key(&cert)
         .context("no public key in the server certificate")?
         .to_owned();

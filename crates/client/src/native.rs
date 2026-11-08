@@ -41,15 +41,15 @@ pub struct NativeOptions {
     pub codecs: Vec<Codec>,
     /// Refresh rate of the client's display.
     pub refresh: u32,
-    /// SHA-256 of the server certificate seen before; `None` accepts any (and logs it).
-    pub pinned: Option<[u8; 32]>,
+    /// Which server certificate to accept.
+    pub trust: crate::trust::Trust,
 }
 
-/// Accepts the server's self-signed certificate if it matches the pinned fingerprint (or
-/// any, the first time), and remembers what it saw.
+/// Accepts the server's self-signed certificate if [`Trust`](crate::trust::Trust) does, and
+/// remembers what it saw.
 #[derive(Debug)]
 struct Pin {
-    pinned: Option<[u8; 32]>,
+    trust: crate::trust::Trust,
     seen: std::sync::Mutex<Option<[u8; 32]>>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
@@ -63,15 +63,12 @@ impl rustls::client::danger::ServerCertVerifier for Pin {
         _ocsp: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        use sha2::Digest;
-        let fp: [u8; 32] = sha2::Sha256::digest(end_entity.as_ref()).into();
+        let fp = crate::trust::fingerprint(end_entity.as_ref());
         *self.seen.lock().unwrap() = Some(fp);
-        match self.pinned {
-            Some(p) if p != fp => Err(rustls::Error::General(
-                "the server certificate changed since the last connection".into(),
-            )),
-            _ => Ok(rustls::client::danger::ServerCertVerified::assertion()),
-        }
+        self.trust
+            .check(&fp)
+            .map(|()| rustls::client::danger::ServerCertVerified::assertion())
+            .map_err(rustls::Error::General)
     }
 
     fn verify_tls12_signature(
@@ -107,10 +104,6 @@ impl rustls::client::danger::ServerCertVerifier for Pin {
             .signature_verification_algorithms
             .supported_schemes()
     }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn input_event(i: Input) -> Option<ClientMsg> {
@@ -163,7 +156,7 @@ pub async fn run(
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let pin = Arc::new(Pin {
-        pinned: opts.pinned,
+        trust: opts.trust.clone(),
         seen: std::sync::Mutex::new(None),
         provider: Arc::clone(&provider),
     });
@@ -178,12 +171,6 @@ pub async fn run(
         .await
         .context("TLS handshake")?;
     let fingerprint = pin.seen.lock().unwrap().context("no server certificate")?;
-    if opts.pinned.is_none() {
-        info!(
-            fingerprint = hex(&fingerprint),
-            "Server certificate (first connection)"
-        );
-    }
     let (mut rd, mut wr) = tokio::io::split(tls);
 
     glidedesk_proto::write_msg(

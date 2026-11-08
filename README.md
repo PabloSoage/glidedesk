@@ -107,7 +107,14 @@ not change the remote resolution yet (FreeRDP's `/dynamic-resolution` does).
 
 ### Windows and Linux: `glidedesk`
 
+Started with no arguments it opens a connection window in the manner of `mstsc`: computer
+(with the recent ones), user, and the options in tabs (protocol and port, size and full
+screen, codec, GPU, sound, clipboard, trusted servers). The options can be saved as a
+`.glidedesk` file and opened again, or given on the command line:
+
 ```sh
+glidedesk                                    # the connection window
+glidedesk work.glidedesk                     # a saved connection
 glidedesk <server> --user <user>             # native protocol (UDP), the default
 glidedesk <server> --user <user> --rdp       # RDP instead
 glidedesk <server> --user <user> --fullscreen --width 1920 --height 1080
@@ -124,7 +131,16 @@ on the GPU (D3D11VA on Windows, with NVIDIA, AMD and Intel alike; VA-API or NVDE
 in HEVC when the GPU decodes HEVC, else H.264; without a usable GPU decoder FFmpeg decodes in
 software. `--software-decode` forces the CPU (and H.264). With more than one GPU, `--gpu amd`,
 `--gpu intel` or `--gpu nvidia` picks the one that decodes and draws (a laptop's integrated GPU,
-say); the picture still shows on whichever screen the window is on.
+say); the picture still shows on whichever screen the window is on. `--codec h264` or
+`--codec hevc` overrides the automatic choice; `--no-clipboard` keeps the clipboard local.
+
+The first connection to a server shows the SHA-256 fingerprint of its certificate and asks
+whether to trust it, before any password is sent; the answer is remembered
+(`%APPDATA%\glidedesk\known_hosts.toml`; on Linux, `~/.config/glidedesk/known_hosts.toml`,
+where there is no dialog yet and the first certificate is trusted). A server that later shows
+a different certificate is refused until it is forgotten (the **Advanced** tab of the
+connection window). `--fingerprint <hex>` pins one without asking. To read it on the server:
+`openssl x509 -in ~/.config/glidedesk/cert.pem -outform der | sha256sum`.
 
 ### Any browser
 
@@ -170,6 +186,24 @@ GLIDEDESK_PASSWORD='...' target/release/glidedesk-host serve --x11 :0 --encoder 
 
 The display keeps its own size; input goes through XTEST, sound through PulseAudio.
 
+## Serving a Windows desktop (preview)
+
+The server also runs on Windows 10/11 and shares the desktop of the signed-in user: Desktop
+Duplication for the picture, NVENC, Quick Sync or AMF for the video (x264 without them), the
+default output for sound, and the clipboard (text). Clients connect with the native protocol
+or RDP; the web client is not there yet.
+
+```powershell
+$env:GLIDEDESK_PASSWORD = '...'
+glidedesk-host serve --bind 0.0.0.0:3392    # 3389 belongs to Windows' own Remote Desktop
+```
+
+The user name is the Windows one. Allow the program in the firewall (3391 TCP and UDP, and
+the RDP port). It is an ordinary program for now: it cannot see or drive the lock screen or
+UAC prompts, the desktop keeps the monitor's size (with several monitors, the primary one is
+shared), and the PC needs a monitor or a dummy plug. Inside a Remote Desktop session it works
+only while that session is shown: a minimized `mstsc` window stops its drawing.
+
 ## Building from source
 
 ```sh
@@ -185,6 +219,8 @@ cargo build --release -p glidedesk-desktop
 # or Build Tools with the "vcpkg package manager" component, and LLVM (winget install
 # LLVM.LLVM) for the bindings. The first run builds FFmpeg (~10 minutes).
 scripts\build-windows.ps1
+# Server, Windows: the same, with FFmpeg's encoders (the "host" feature of vcpkg.json).
+scripts\build-windows.ps1 --host
 # Termux client, cross-compiled:
 cargo ndk -t arm64-v8a build --release -p glidedesk-x11
 # Android app (Gradle; builds the Rust core with cargo-ndk):

@@ -176,6 +176,7 @@ mod android {
             password: string(&mut env, &password),
             width: width.clamp(200, 8192) as u16 & !1,
             height: height.clamp(200, 8192) as u16 & !1,
+            trust: Default::default(),
         };
         let native = native != 0;
         let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
@@ -212,7 +213,7 @@ mod android {
                     height: opts.height,
                     codecs: vec![VideoCodec::Hevc, VideoCodec::H264],
                     refresh: refresh.clamp(30, 240) as u32,
-                    pinned: None,
+                    trust: Default::default(),
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await

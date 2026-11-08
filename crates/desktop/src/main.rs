@@ -25,6 +25,7 @@ use anyhow::Result;
 use clap::Parser;
 use glidedesk_client::gfx::{SharedSink, VideoCodec};
 use glidedesk_client::session::Input;
+use glidedesk_client::trust::{self, Trust};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
@@ -70,9 +71,27 @@ struct Args {
     /// Decode and draw on this GPU (amd, intel, nvidia) instead of the default one.
     #[arg(long, value_parser = parse_vendor)]
     gpu: Option<u32>,
-    /// SHA-256 fingerprint of the server certificate to pin (64 hex characters).
+    /// SHA-256 fingerprint of the server certificate to pin (64 hex digits; colons allowed).
+    /// Without it, the one trusted at the first connection is used.
     #[arg(long)]
     fingerprint: Option<String>,
+    /// Video codec to ask for (the native protocol; RDP is always H.264).
+    #[arg(long, value_enum, default_value_t = CodecChoice::Auto)]
+    codec: CodecChoice,
+    /// Do not share the clipboard.
+    #[arg(long)]
+    no_clipboard: bool,
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CodecChoice {
+    /// HEVC where the GPU decodes it, else H.264.
+    Auto,
+    H264,
+    Hevc,
 }
 
 /// A GPU maker's name as its PCI vendor id.
@@ -83,6 +102,84 @@ fn parse_vendor(s: &str) -> Result<u32, String> {
         "nvidia" => Ok(decode::VENDOR_NVIDIA),
         _ => Err("amd, intel or nvidia".into()),
     }
+}
+
+/// A `.glidedesk` profile over the command line's defaults.
+fn apply_profile(args: &mut Args, prof: profile::Profile) -> Result<()> {
+    args.host = Some(prof.host);
+    if let Some(u) = prof.user {
+        args.user = Some(u);
+    }
+    if let Some(port) = prof.port {
+        args.port = Some(port);
+    }
+    if let Some(rdp) = prof.rdp {
+        args.rdp = rdp;
+    }
+    if let (Some(w), Some(h)) = (prof.width, prof.height) {
+        args.width = w;
+        args.height = h;
+    }
+    if let Some(fs) = prof.fullscreen {
+        args.fullscreen = fs;
+    }
+    if let Some(m) = prof.mute {
+        args.mute = m;
+    }
+    if let Some(sw) = prof.software_decode {
+        args.software_decode = sw;
+    }
+    if let Some(fp) = prof.fingerprint {
+        args.fingerprint = Some(fp);
+    }
+    if let Some(c) = prof.codec {
+        args.codec = c;
+    }
+    if let Some(c) = prof.clipboard {
+        args.no_clipboard = !c;
+    }
+    if let Some(g) = prof.gpu {
+        args.gpu =
+            Some(parse_vendor(&g).map_err(|e| anyhow::anyhow!("gpu = {g:?} in the profile: {e}"))?);
+    }
+    Ok(())
+}
+
+/// How to trust the server: the fingerprint given (`--fingerprint` or the profile), else the one
+/// saved at the first connection, else ask the user and save the answer.
+fn trust_for(a: &Args, host: &str, port: u16) -> Result<Trust, String> {
+    if let Some(fp) = &a.fingerprint {
+        return Ok(Trust {
+            pinned: Some(trust::parse_fingerprint(fp)?),
+            confirm: None,
+        });
+    }
+    let (host, protocol) = (host.to_owned(), if a.rdp { "RDP" } else { "glidedesk" });
+    Ok(Trust {
+        pinned: profile::KnownHosts::load().get(&host, port),
+        confirm: Some(Arc::new(move |fp| {
+            let ok = platform::confirm(&format!(
+                "First connection to {host}:{port} ({protocol}).
+
+\n                 Server certificate SHA-256:
+{}
+
+\n                 Compare it with the one the server logs at start (or its owner gives you). Trust this server?",
+                trust::hex(fp)
+            ));
+            if ok {
+                let mut known = profile::KnownHosts::load();
+                known.set(&host, port, fp);
+                if let Err(e) = known.save() {
+                    warn!(
+                        error = format!("{e:#}"),
+                        "Could not save the server fingerprint"
+                    );
+                }
+            }
+            ok
+        })),
+    })
 }
 
 /// Wait this long after the last window resize before asking the server for the new size
@@ -144,7 +241,7 @@ impl App {
             !self.args.software_decode,
         )));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        if !self.args.rdp {
+        if !self.args.rdp && !self.args.no_clipboard {
             self.clipboard = Some(clip::Clipboard::start(tx.clone()));
         }
         self.input = Some(tx);
@@ -158,25 +255,32 @@ impl App {
             .and_then(|m| m.refresh_rate_millihertz())
             .map_or(60, |mhz| (mhz + 500) / 1000);
         // HEVC (fewer bits for the same picture) only where the GPU decodes it.
-        let hevc = !self.args.rdp && !self.args.software_decode && decode::hardware_hevc();
+        let can_hevc = !self.args.rdp && !self.args.software_decode && decode::hardware_hevc();
+        let hevc = match self.args.codec {
+            CodecChoice::Auto => can_hevc,
+            CodecChoice::H264 => false,
+            CodecChoice::Hevc => {
+                if !can_hevc {
+                    warn!("HEVC asked for, but this client cannot decode it here: H.264");
+                }
+                can_hevc
+            }
+        };
         self.runtime.spawn(async move {
             let host_str = a.host.clone().unwrap_or_default();
-            let default_port = if a.rdp { 3389 } else { glidedesk_proto::DEFAULT_PORT };
-            let port_num = a.port.unwrap_or(default_port);
-            let pinned = if let Some(fp_hex) = &a.fingerprint {
-                hex::decode(fp_hex.trim()).ok().and_then(|b| {
-                    if b.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&b);
-                        Some(arr)
-                    } else {
-                        None
-                    }
-                })
+            let default_port = if a.rdp {
+                3389
             } else {
-                profile::KnownHosts::load().get(&host_str, port_num)
+                glidedesk_proto::DEFAULT_PORT
             };
-            let host_copy = host_str.clone();
+            let port_num = a.port.unwrap_or(default_port);
+            let trust = match trust_for(&a, &host_str, port_num) {
+                Ok(t) => t,
+                Err(e) => {
+                    notify(Event::Ended(e));
+                    return;
+                }
+            };
 
             let r = if a.rdp {
                 let opts = glidedesk_client::session::ConnectOptions {
@@ -186,6 +290,7 @@ impl App {
                     password: a.password.unwrap_or_default(),
                     width: w as u16,
                     height: h as u16,
+                    trust,
                 };
                 glidedesk_client::session::run(opts, sink, rx).await
             } else {
@@ -202,14 +307,11 @@ impl App {
                         vec![VideoCodec::H264]
                     },
                     refresh,
-                    pinned,
+                    trust,
                 };
-                let res = glidedesk_client::native::run(opts, sink, rx).await;
-                if let Ok(fp) = &res {
-                    let mut known = profile::KnownHosts::load();
-                    known.set(&host_copy, port_num, fp);
-                }
-                res.map(|_| ())
+                glidedesk_client::native::run(opts, sink, rx)
+                    .await
+                    .map(|_| ())
             };
             notify(Event::Ended(match r {
                 Ok(()) => "Session ended".into(),
@@ -255,7 +357,10 @@ impl ApplicationHandler<Event> for App {
             (
                 self.args.width,
                 self.args.height,
-                format!("glidedesk - {}", self.args.host.as_deref().unwrap_or_default()),
+                format!(
+                    "glidedesk - {}",
+                    self.args.host.as_deref().unwrap_or_default()
+                ),
             )
         };
         let mut attrs = Window::default_attributes()
@@ -304,7 +409,11 @@ impl ApplicationHandler<Event> for App {
         self.desktop = (size.width, size.height);
         if is_launcher {
             let ren = self.renderer.as_ref().unwrap();
-            self.launcher_state = Some(launcher::LauncherState::new(&window, ren.device(), ren.format()));
+            self.launcher_state = Some(launcher::LauncherState::new(
+                &window,
+                ren.device(),
+                ren.format(),
+            ));
             window.request_redraw();
         } else {
             self.start_session(size);
@@ -412,13 +521,17 @@ impl ApplicationHandler<Event> for App {
                             self.closing = true;
                             el.exit();
                         }
-                        launcher::LauncherAction::Connect => {
-                            let mut args = ls.launcher.build_args();
+                        launcher::LauncherAction::Connect(args) => {
+                            let mut args = *args;
                             if args.password.is_none() {
                                 let host_str = args.host.as_deref().unwrap_or_default();
-                                let Some((user, password)) = platform::credentials(host_str, args.user.as_deref()) else {
+                                let Some((user, password)) =
+                                    platform::credentials(host_str, args.user.as_deref())
+                                else {
                                     if !cfg!(windows) {
-                                        platform::show_error("--user and --password (or GLIDEDESK_PASSWORD) are needed");
+                                        platform::show_error(
+                                            "--user and --password (or GLIDEDESK_PASSWORD) are needed",
+                                        );
                                     }
                                     return;
                                 };
@@ -428,15 +541,35 @@ impl ApplicationHandler<Event> for App {
                             if let Some(v) = args.gpu {
                                 decode::use_gpu(v);
                             }
+                            let window = Arc::clone(window);
+                            // Drawing on the GPU chosen in the options.
+                            if args.gpu.is_some()
+                                && let Some(instance) = self.instance.as_ref()
+                            {
+                                self.renderer = None;
+                                match render::Renderer::new(instance, Arc::clone(&window), args.gpu)
+                                {
+                                    Ok(r) => self.renderer = Some(r),
+                                    Err(e) => {
+                                        platform::show_error(&format!("Graphics: {e:#}"));
+                                        el.exit();
+                                        return;
+                                    }
+                                }
+                            }
                             self.args = args;
                             self.launcher_state = None;
 
-                            let _ = window.request_inner_size(PhysicalSize::new(self.args.width, self.args.height));
+                            let wanted = PhysicalSize::new(self.args.width, self.args.height);
+                            // Applied now, or later with a Resized event (the session then follows).
+                            let size = window.request_inner_size(wanted).unwrap_or(wanted);
                             if self.args.fullscreen {
                                 window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                             }
-                            window.set_title(&format!("glidedesk - {}", self.args.host.as_deref().unwrap_or_default()));
-                            let size = window.inner_size();
+                            window.set_title(&format!(
+                                "glidedesk - {}",
+                                self.args.host.as_deref().unwrap_or_default()
+                            ));
                             if let Some(r) = self.renderer.as_mut() {
                                 r.resize(size.width, size.height);
                             }
@@ -575,27 +708,20 @@ fn main() -> Result<()> {
     };
     let mut args = args;
     let is_launcher = args.host.is_none();
-    if let Some(ref h) = args.host {
-        let p = std::path::Path::new(h);
-        if (h.ends_with(".glidedesk") || p.is_file())
-            && let Ok(prof) = profile::Profile::load_file(p)
-        {
-            args.host = Some(prof.host);
-            if let Some(u) = prof.user { args.user = Some(u); }
-            if let Some(port) = prof.port { args.port = Some(port); }
-            if let Some(rdp) = prof.rdp { args.rdp = rdp; }
-            if let (Some(w), Some(h)) = (prof.width, prof.height) {
-                args.width = w;
-                args.height = h;
-            }
-            if let Some(fs) = prof.fullscreen { args.fullscreen = fs; }
-            if let Some(m) = prof.mute { args.mute = m; }
-            if let Some(sw) = prof.software_decode { args.software_decode = sw; }
-            if let Some(fp) = prof.fingerprint { args.fingerprint = Some(fp); }
-            if let Some(g) = prof.gpu {
-                args.gpu = parse_vendor(&g).ok();
-            }
-        }
+    // A profile given as the host (double-clicked, or on the command line).
+    if let Some(h) = args.host.clone()
+        && h.ends_with(".glidedesk")
+        && let Err(e) = profile::Profile::load_file(std::path::Path::new(&h))
+            .and_then(|prof| apply_profile(&mut args, prof))
+    {
+        platform::show_error(&format!("{e:#}"));
+        return Ok(());
+    }
+    if let Some(fp) = &args.fingerprint
+        && let Err(e) = trust::parse_fingerprint(fp)
+    {
+        platform::show_error(&format!("--fingerprint: {e}"));
+        return Ok(());
     }
 
     if !is_launcher {
@@ -604,9 +730,12 @@ fn main() -> Result<()> {
         }
         if args.password.is_none() {
             let host_str = args.host.as_deref().unwrap_or_default();
-            let Some((user, password)) = platform::credentials(host_str, args.user.as_deref()) else {
+            let Some((user, password)) = platform::credentials(host_str, args.user.as_deref())
+            else {
                 if !cfg!(windows) {
-                    platform::show_error("--user and --password (or GLIDEDESK_PASSWORD) are needed");
+                    platform::show_error(
+                        "--user and --password (or GLIDEDESK_PASSWORD) are needed",
+                    );
                 }
                 return Ok(());
             };

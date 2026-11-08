@@ -1,9 +1,10 @@
-//! Profiles (.glidedesk), connection history, and known host fingerprints.
+//! Profiles (.glidedesk), connection history, and known host fingerprints. The history and
+//! the fingerprints change in memory; `save` writes them.
 
-use std::fs;
-use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Profile {
@@ -18,22 +19,22 @@ pub struct Profile {
     pub software_decode: Option<bool>,
     pub gpu: Option<String>,
     pub fingerprint: Option<String>,
+    pub codec: Option<crate::CodecChoice>,
+    pub clipboard: Option<bool>,
 }
 
 impl Profile {
     pub fn load_file(path: &std::path::Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading profile {}", path.display()))?;
-        let p: Profile = toml::from_str(&text)
-            .with_context(|| format!("parsing profile {}", path.display()))?;
+        let p: Profile =
+            toml::from_str(&text).with_context(|| format!("parsing profile {}", path.display()))?;
         Ok(p)
     }
 
     pub fn save_file(&self, path: &std::path::Path) -> Result<()> {
-        let text = toml::to_string_pretty(self)
-            .context("serializing profile")?;
-        fs::write(path, text)
-            .with_context(|| format!("writing profile {}", path.display()))?;
+        let text = toml::to_string_pretty(self).context("serializing profile")?;
+        fs::write(path, text).with_context(|| format!("writing profile {}", path.display()))?;
         Ok(())
     }
 }
@@ -50,9 +51,7 @@ pub fn config_dir() -> PathBuf {
     {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
-            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
             .unwrap_or_else(|| ".".into())
             .join("glidedesk")
     }
@@ -74,7 +73,9 @@ impl History {
     }
 
     pub fn add(&mut self, host: &str, user: Option<&str>) {
-        if host.is_empty() { return; }
+        if host.is_empty() {
+            return;
+        }
         self.hosts.retain(|h| h != host);
         self.hosts.insert(0, host.to_owned());
         if self.hosts.len() > 10 {
@@ -83,7 +84,6 @@ impl History {
         if let Some(u) = user {
             self.last_user = Some(u.to_owned());
         }
-        let _ = self.save();
     }
 
     pub fn save(&self) -> Result<()> {
@@ -126,13 +126,11 @@ impl KnownHosts {
     pub fn set(&mut self, host: &str, port: u16, fp: &[u8; 32]) {
         let key = format!("{host}:{port}");
         self.hosts.insert(key, hex::encode(fp));
-        let _ = self.save();
     }
 
     pub fn forget(&mut self, host: &str, port: u16) {
         let key = format!("{host}:{port}");
         self.hosts.remove(&key);
-        let _ = self.save();
     }
 
     pub fn save(&self) -> Result<()> {
@@ -161,10 +159,14 @@ mod tests {
             mute: Some(false),
             software_decode: Some(false),
             gpu: Some("nvidia".into()),
-            fingerprint: Some("eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573".into()),
+            codec: Some(crate::CodecChoice::Hevc),
+            clipboard: Some(false),
+            fingerprint: Some(
+                "eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573".into(),
+            ),
         };
 
-        let temp_dir = std::env::temp_dir().join("glidedesk_test");
+        let temp_dir = std::env::temp_dir().join(format!("glidedesk-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let file = temp_dir.join("test.glidedesk");
 
@@ -177,12 +179,14 @@ mod tests {
         assert_eq!(loaded.width, Some(1920));
         assert_eq!(loaded.height, Some(1080));
         assert_eq!(loaded.gpu.as_deref(), Some("nvidia"));
+        assert_eq!(loaded.codec, Some(crate::CodecChoice::Hevc));
+        assert_eq!(loaded.clipboard, Some(false));
         assert_eq!(
             loaded.fingerprint.as_deref(),
             Some("eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573")
         );
 
-        let _ = fs::remove_file(file);
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]

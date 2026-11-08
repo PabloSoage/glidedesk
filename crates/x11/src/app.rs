@@ -368,6 +368,7 @@ pub fn main() -> Result<()> {
                     password: a.password,
                     width: a.width,
                     height: a.height,
+                    trust: Default::default(),
                 };
                 glidedesk_client::session::run(opts, sink, rx).await
             } else {
@@ -380,7 +381,7 @@ pub fn main() -> Result<()> {
                     height: a.height,
                     codecs: vec![VideoCodec::H264],
                     refresh: 60,
-                    pinned: None,
+                    trust: Default::default(),
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await

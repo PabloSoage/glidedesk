@@ -68,6 +68,18 @@ pub fn show_message(text: &str) {
     win::message_box(text, false);
 }
 
+/// Asks the user a yes/no question: a dialog on Windows. Other systems have no dialog yet:
+/// the answer is yes, and the question goes to the log.
+pub fn confirm(text: &str) -> bool {
+    #[cfg(windows)]
+    return win::confirm(text);
+    #[cfg(not(windows))]
+    {
+        tracing::warn!("{text} (yes: no dialog on this system)");
+        true
+    }
+}
+
 /// Opens the log file with the system's text viewer.
 pub fn open_log() {
     let path = log_path();
@@ -123,8 +135,9 @@ mod win {
     };
     use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, GetSystemMenu, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_SEPARATOR,
-        MF_STRING, MessageBoxW, SW_SHOWNORMAL, WM_SYSCOMMAND,
+        AppendMenuW, GetSystemMenu, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
+        MB_ICONWARNING, MB_OK, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, SW_SHOWNORMAL,
+        WM_SYSCOMMAND,
     };
     use winit::event_loop::EventLoopProxy;
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -158,6 +171,21 @@ mod win {
                 MB_OK | icon,
             );
         }
+    }
+
+    /// A yes/no question; No is the default button.
+    pub fn confirm(text: &str) -> bool {
+        let (text, title) = (wide(OsStr::new(text)), wide(OsStr::new("glidedesk")));
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        let answer = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            )
+        };
+        answer == IDYES
     }
 
     pub fn open(path: &Path) {
