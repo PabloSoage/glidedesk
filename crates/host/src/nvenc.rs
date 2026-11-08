@@ -504,7 +504,7 @@ impl Encoder {
         };
         if self.force_idr {
             pic.encodePicFlags =
-                (nv::NV_ENC_PIC_FLAG_FORCEIDR | nv::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS) as u32;
+                nv::NV_ENC_PIC_FLAG_FORCEIDR | nv::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
         }
         let r = call!(self.api, nvEncEncodePicture, self.enc, &mut pic);
         let out = r.and_then(|_| {

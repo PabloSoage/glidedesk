@@ -307,6 +307,7 @@ pub struct Front {
     pub audio: Option<broadcast::Sender<Vec<u8>>>,
     pub input: InputForwarder,
     pub clipboard: Option<Arc<dyn crate::native::TextClipboard>>,
+    pub auth_limiter: Arc<crate::auth::RateLimiter>,
 }
 
 pub struct Server {
@@ -760,7 +761,9 @@ where
             Err(e) => {
                 let msg = format!("{e:#}");
                 warn!(%peer, error = msg, "Browser refused");
-                let status = if msg.contains("user name or password") {
+                let status = if msg.contains("too many failed attempts") {
+                    "429 Too Many Requests"
+                } else if msg.contains("user name or password") {
                     "403 Forbidden"
                 } else {
                     "400 Bad Request"
@@ -788,10 +791,21 @@ fn offer(
     shared: &Arc<Shared>,
     front: &Front,
 ) -> Result<String> {
+    let ip = peer.ip();
+    if let Some(wait) = front.auth_limiter.check(ip) {
+        bail!("too many failed attempts; try again in {:.0}s", wait.as_secs_f64().max(1.0));
+    }
     let m: OfferMsg = serde_json::from_slice(body).context("reading the offer")?;
-    if m.user != front.username || m.password != front.password {
+    if !crate::auth::verify_credentials(&front.username, &front.password, &m.user, &m.password) {
+        let lockout = front.auth_limiter.record_failure(ip);
+        if let Some(wait) = lockout {
+            warn!(%peer, lockout_secs = wait.as_secs(), "Web authentication failed; backoff applied");
+        } else {
+            warn!(%peer, "Web authentication failed");
+        }
         bail!("wrong user name or password");
     }
+    front.auth_limiter.record_success(ip);
     let offer = SdpOffer::from_sdp_string(&m.sdp).context("parsing the SDP offer")?;
     let now = Instant::now();
     let mut rtc = Rtc::builder()

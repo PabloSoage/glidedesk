@@ -133,3 +133,47 @@ mod tests {
         assert!(!w.accept(12)); // too old
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// `cargo test --release -p glidedesk-proto crypto_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn crypto_speed() {
+        let k = PacketKey::new(&[42; 32]);
+        let packet_size = 1200usize;
+        let count = 100_000usize;
+        let payload = vec![0x5au8; packet_size];
+        let total_bytes = (packet_size * count) as f64;
+
+        // Seal benchmark
+        let t = std::time::Instant::now();
+        let mut sealed = Vec::with_capacity(count);
+        for seq in 0..count as u64 {
+            sealed.push(k.seal(Direction::ToClient, seq, &payload));
+        }
+        let seal_secs = t.elapsed().as_secs_f64();
+        let seal_gbps = (total_bytes / seal_secs) / 1_000_000_000.0;
+        let seal_us = (seal_secs * 1_000_000.0) / count as f64;
+
+        // Open benchmark
+        let t = std::time::Instant::now();
+        let mut opened_count = 0usize;
+        for p in &sealed {
+            if k.open(Direction::ToClient, p).is_some() {
+                opened_count += 1;
+            }
+        }
+        let open_secs = t.elapsed().as_secs_f64();
+        let open_gbps = (total_bytes / open_secs) / 1_000_000_000.0;
+        let open_us = (open_secs * 1_000_000.0) / count as f64;
+
+        assert_eq!(opened_count, count);
+        println!(
+            "ChaCha20-Poly1305 (1200 B packets, {count} iters):\n  Seal: {seal_gbps:.2} GB/s ({seal_us:.2} \u{03bc}s/pkt)\n  Open: {open_gbps:.2} GB/s ({open_us:.2} \u{03bc}s/pkt)"
+        );
+    }
+}
+

@@ -4,6 +4,7 @@
 
 #[cfg(feature = "gnome")]
 mod audio;
+mod auth;
 #[cfg(feature = "gnome")]
 mod capture;
 #[cfg(feature = "gnome")]

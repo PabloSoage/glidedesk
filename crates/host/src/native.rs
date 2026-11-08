@@ -212,6 +212,7 @@ pub struct Front {
     pub audio: Option<broadcast::Sender<Vec<u8>>>,
     pub input: InputForwarder,
     pub clipboard: Option<Arc<dyn TextClipboard>>,
+    pub auth_limiter: Arc<crate::auth::RateLimiter>,
 }
 
 pub struct Server {
@@ -403,14 +404,32 @@ where
     else {
         bail!("expected Hello");
     };
+    let ip = peer.ip();
+    if let Some(wait) = front.auth_limiter.check(ip) {
+        let reason = format!(
+            "too many failed attempts; try again in {:.0}s",
+            wait.as_secs_f64().max(1.0)
+        );
+        glidedesk_proto::write_msg(&mut wr, &ServerMsg::Denied(reason.clone())).await?;
+        bail!("denied for {peer}: {reason}");
+    }
+    let valid_creds =
+        crate::auth::verify_credentials(&front.username, &front.password, &user, &password);
     let deny = if version != glidedesk_proto::VERSION {
         Some(format!(
             "protocol version {version}, server speaks {}",
             glidedesk_proto::VERSION
         ))
-    } else if user != front.username || password != front.password {
+    } else if !valid_creds {
+        let lockout = front.auth_limiter.record_failure(ip);
+        if let Some(wait) = lockout {
+            tracing::warn!(%peer, lockout_secs = wait.as_secs(), "Authentication failed; backoff applied");
+        } else {
+            tracing::warn!(%peer, "Authentication failed");
+        }
         Some("wrong user name or password".to_owned())
     } else {
+        front.auth_limiter.record_success(ip);
         None
     };
     if let Some(reason) = deny {

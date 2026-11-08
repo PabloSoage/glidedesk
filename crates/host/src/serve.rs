@@ -248,6 +248,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .name("pipeline".into())
         .spawn(move || pipeline.run())?;
 
+    let auth_limiter = Arc::new(crate::auth::RateLimiter::new());
     let input = InputForwarder::spawn(parts.input);
     let rdp = rdp_server.run(crate::rdp::Front {
         bind: opts.bind,
@@ -259,6 +260,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         input: input.clone(),
         clipboard: parts.clipboard,
     });
+    let native_limiter = Arc::clone(&auth_limiter);
     let native = async {
         match native {
             Some((server, bind)) => {
@@ -273,12 +275,15 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                         audio: parts.audio.clone(),
                         input: input.clone(),
                         clipboard: parts.text_clipboard.clone(),
+                        auth_limiter: native_limiter,
                     })
                     .await
             }
             None => std::future::pending().await,
         }
     };
+    #[cfg(feature = "web")]
+    let web_limiter = Arc::clone(&auth_limiter);
     #[cfg(feature = "web")]
     let web = async {
         match web {
@@ -295,6 +300,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                         audio: parts.audio.clone(),
                         input: input.clone(),
                         clipboard: parts.text_clipboard.clone(),
+                        auth_limiter: web_limiter,
                     })
                     .await
             }
