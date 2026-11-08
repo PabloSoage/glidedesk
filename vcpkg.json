@@ -1,6 +1,6 @@
 {
   "name": "glidedesk",
-  "version-string": "0.2.0",
+  "version-string": "0.3.0",
   "description": "Native libraries for the Windows builds: FFmpeg's decoders with D3D11VA for the desktop client, and its hardware encoders for the host (linked statically)",
   "dependencies": [
     {

@@ -8,9 +8,10 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
   composited on the GPU, with no physical monitor, dummy plug or virtual display driver.
 - **The desktop follows the client window**: resize the window and the remote resolution
   changes.
-- **Hardware video end to end**: NVENC on NVIDIA, VA-API on AMD and Intel (x264 on the CPU
-  when there is no usable GPU), low-latency settings, frames encoded as soon as the
-  compositor produces them, up to the client's refresh rate (144 Hz and more).
+- **Hardware video end to end**: NVENC on NVIDIA, VA-API on AMD and Intel (Quick Sync and
+  AMF on Windows; x264 on the CPU when there is no usable GPU), low-latency settings, frames
+  encoded as soon as the compositor produces them, up to the client's refresh rate (144 Hz
+  and more).
 - **Two ways in, at the same time**:
   - **Standard RDP** (port 3389): the Windows Remote Desktop client (`mstsc`), Microsoft's
     Windows App (macOS, iOS, Android) and FreeRDP/Remmina work without installing anything.
@@ -24,7 +25,9 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
   almost nothing; only the ceiling a frame may reach follows the link, from the measured
   delay (it drops as soon as frames queue, and climbs back while the link is clean).
 
-**Status: early development (v0.2).** Tested on Ubuntu 24.04 (GNOME 46) with NVIDIA GPUs.
+**Status: v0.3, usable; still young.** The Linux server is tested on Ubuntu 24.04 (GNOME 46)
+with NVIDIA GPUs (VA-API encoding on AMD and Intel through WSL only). The clients run on
+Windows, Linux, Android and Termux. The Windows server is a preview (see below).
 
 ## Which client?
 
@@ -52,6 +55,7 @@ Prebuilt binaries are on the [releases page](https://github.com/PabloSoage/glide
 |---|---|
 | `glidedesk-host-linux-x86_64` | the server (Ubuntu 24.04 / GNOME 46, x86-64) |
 | `glidedesk-session.sh` | starts the headless GNOME session the server runs in |
+| `glidedesk-host-windows-x86_64.exe` | the server for Windows 10/11 (preview: shares the signed-in user's desktop) |
 | `glidedesk-windows-x86_64.exe` | desktop client for Windows |
 | `glidedesk-linux-x86_64` | desktop client for Linux (Wayland or X11; uses the system FFmpeg 6, as on Ubuntu 24.04: `sudo apt install libavcodec60`) |
 | `glidedesk-android.apk` | Android client (RDP or native protocol) |
