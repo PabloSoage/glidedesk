@@ -1,39 +1,67 @@
-//! Authentication utilities: constant-time credential comparison and IP rate-limiting.
+//! Credential checks for the native and web front ends (RDP's go through NLA in IronRDP):
+//! comparison in constant time, and a growing wait for addresses that keep failing.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ring::digest::{digest, SHA256};
+use ring::digest::{SHA256, digest};
 use subtle::ConstantTimeEq;
 
-/// Verify username and password in constant time to prevent timing side channels.
+/// Whether `user` and `password` are the expected ones, in time that does not depend on how
+/// much of them matches (both sides are hashed to the same length first).
 pub fn verify_credentials(
     expected_user: &str,
     expected_pass: &str,
     user: &str,
     password: &str,
 ) -> bool {
-    let exp_u = digest(&SHA256, expected_user.as_bytes());
-    let giv_u = digest(&SHA256, user.as_bytes());
-    let exp_p = digest(&SHA256, expected_pass.as_bytes());
-    let giv_p = digest(&SHA256, password.as_bytes());
-
-    let u_match = exp_u.as_ref().ct_eq(giv_u.as_ref());
-    let p_match = exp_p.as_ref().ct_eq(giv_p.as_ref());
-    bool::from(u_match & p_match)
+    let h = |s: &str| digest(&SHA256, s.as_bytes());
+    let u = h(expected_user).as_ref().ct_eq(h(user).as_ref());
+    let p = h(expected_pass).as_ref().ct_eq(h(password).as_ref());
+    bool::from(u & p)
 }
+
+/// Failures allowed before the first wait.
+const FREE_FAILURES: u32 = 2;
+/// The wait doubles from 1 s with each failure, up to this.
+const MAX_WAIT: Duration = Duration::from_secs(60);
+/// Failures older than this are forgotten.
+const FORGET: Duration = Duration::from_secs(15 * 60);
+/// Addresses remembered at most; beyond it the oldest go.
+const MAX_ENTRIES: usize = 4096;
 
 struct Attempt {
     failures: u32,
-    lockout_until: Option<Instant>,
-    last_attempt: Instant,
+    locked_until: Option<Instant>,
+    last: Instant,
 }
 
+/// Failed logins per client address. IPv6 clients count per /64, the block one host
+/// usually has.
 #[derive(Default)]
 pub struct RateLimiter {
     attempts: Mutex<HashMap<IpAddr, Attempt>>,
+}
+
+fn key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
+    }
+}
+
+/// The wait after `failures` failures.
+fn wait_after(failures: u32) -> Option<Duration> {
+    let n = failures.checked_sub(FREE_FAILURES + 1)?;
+    Some(Duration::from_secs(1u64 << n.min(6)).min(MAX_WAIT))
 }
 
 impl RateLimiter {
@@ -41,61 +69,44 @@ impl RateLimiter {
         Self::default()
     }
 
-    /// Checks whether `ip` is currently locked out.
-    /// Returns `Some(remaining)` if locked out, or `None` if allowed.
+    /// How long `ip` must still wait before trying again, if it must.
     pub fn check(&self, ip: IpAddr) -> Option<Duration> {
         let now = Instant::now();
-        let mut map = self.attempts.lock().unwrap();
-        // Periodically purge entries older than 30 minutes
-        if map.len() > 1024 {
-            map.retain(|_, att| now.duration_since(att.last_attempt) < Duration::from_secs(1800));
-        }
-
-        if let Some(until) = map.get(&ip).and_then(|att| att.lockout_until).filter(|&u| now < u) {
-            return Some(until.duration_since(now));
-        }
-        None
+        let map = self.attempts.lock().unwrap();
+        let until = map.get(&key(ip))?.locked_until?;
+        (now < until).then(|| until - now)
     }
 
-    /// Records a failed authentication attempt and returns the lockout delay applied, if any.
+    /// Records a failed login; returns the wait it imposes, if any.
     pub fn record_failure(&self, ip: IpAddr) -> Option<Duration> {
         let now = Instant::now();
         let mut map = self.attempts.lock().unwrap();
-        let entry = map.entry(ip).or_insert(Attempt {
+        if map.len() >= MAX_ENTRIES {
+            map.retain(|_, a| now.duration_since(a.last) < FORGET);
+            if map.len() >= MAX_ENTRIES
+                && let Some(oldest) = map.iter().min_by_key(|(_, a)| a.last).map(|(k, _)| *k)
+            {
+                map.remove(&oldest);
+            }
+        }
+        let a = map.entry(key(ip)).or_insert(Attempt {
             failures: 0,
-            lockout_until: None,
-            last_attempt: now,
+            locked_until: None,
+            last: now,
         });
-
-        // If the last failure was more than 15 minutes ago, reset count
-        if now.duration_since(entry.last_attempt) > Duration::from_secs(900) {
-            entry.failures = 0;
+        if now.duration_since(a.last) > FORGET {
+            a.failures = 0;
         }
-
-        entry.failures += 1;
-        entry.last_attempt = now;
-
-        // Exponential backoff after 3 failed attempts:
-        // 4 fails: 2s
-        // 5 fails: 4s
-        // 6 fails: 8s
-        // 7 fails: 16s
-        // 8+ fails: 32s (capped at 60s)
-        if entry.failures >= 3 {
-            let backoff_secs = (1u64 << (entry.failures - 3).min(5)).min(60);
-            let duration = Duration::from_secs(backoff_secs);
-            entry.lockout_until = Some(now + duration);
-            Some(duration)
-        } else {
-            entry.lockout_until = None;
-            None
-        }
+        a.failures += 1;
+        a.last = now;
+        let wait = wait_after(a.failures);
+        a.locked_until = wait.map(|w| now + w);
+        wait
     }
 
-    /// Records a successful authentication, clearing any failure record for `ip`.
+    /// A successful login clears the address's failures.
     pub fn record_success(&self, ip: IpAddr) {
-        let mut map = self.attempts.lock().unwrap();
-        map.remove(&ip);
+        self.attempts.lock().unwrap().remove(&key(ip));
     }
 }
 
@@ -104,33 +115,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constant_time_comparison() {
-        assert!(verify_credentials("admin", "secret123", "admin", "secret123"));
+    fn credentials() {
+        assert!(verify_credentials(
+            "admin",
+            "secret123",
+            "admin",
+            "secret123"
+        ));
         assert!(!verify_credentials("admin", "secret123", "admin", "wrong"));
-        assert!(!verify_credentials("admin", "secret123", "root", "secret123"));
-        assert!(!verify_credentials("admin", "secret123", "admin", "secret1234"));
+        assert!(!verify_credentials(
+            "admin",
+            "secret123",
+            "root",
+            "secret123"
+        ));
+        assert!(!verify_credentials(
+            "admin",
+            "secret123",
+            "admin",
+            "secret1234"
+        ));
         assert!(!verify_credentials("admin", "secret123", "", ""));
     }
 
     #[test]
-    fn rate_limiter_backoff() {
+    fn waits_grow_to_a_minute() {
+        let waits: Vec<_> = (1..=10)
+            .map(|n| wait_after(n).map(|d| d.as_secs()))
+            .collect();
+        assert_eq!(
+            waits,
+            [
+                None,
+                None,
+                Some(1),
+                Some(2),
+                Some(4),
+                Some(8),
+                Some(16),
+                Some(32),
+                Some(60),
+                Some(60)
+            ]
+        );
+    }
+
+    #[test]
+    fn limiter() {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
-
-        // First 2 failures: no lockout
-        assert_eq!(limiter.check(ip), None);
+        assert_eq!(limiter.record_failure(ip), None);
         assert_eq!(limiter.record_failure(ip), None);
         assert_eq!(limiter.check(ip), None);
-        assert_eq!(limiter.record_failure(ip), None);
-        assert_eq!(limiter.check(ip), None);
-
-        // 3rd failure: 1s lockout
-        let lockout = limiter.record_failure(ip);
-        assert!(lockout.is_some());
+        assert_eq!(limiter.record_failure(ip), Some(Duration::from_secs(1)));
         assert!(limiter.check(ip).is_some());
-
-        // Success resets lockout
+        // Another address is not affected.
+        assert_eq!(limiter.check("192.0.2.2".parse().unwrap()), None);
         limiter.record_success(ip);
         assert_eq!(limiter.check(ip), None);
+    }
+
+    #[test]
+    fn ipv6_counts_per_64() {
+        let limiter = RateLimiter::new();
+        for i in 1..=3 {
+            limiter.record_failure(format!("2001:db8:1:2::{i}").parse().unwrap());
+        }
+        assert!(limiter.check("2001:db8:1:2::99".parse().unwrap()).is_some());
+        assert_eq!(limiter.check("2001:db8:1:3::1".parse().unwrap()), None);
+        // An IPv4 client on a dual-stack socket is its IPv4 address.
+        limiter.record_failure("::ffff:192.0.2.7".parse().unwrap());
+        assert!(
+            limiter
+                .attempts
+                .lock()
+                .unwrap()
+                .contains_key(&"192.0.2.7".parse().unwrap())
+        );
     }
 }

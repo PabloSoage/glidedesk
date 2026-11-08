@@ -793,7 +793,10 @@ fn offer(
 ) -> Result<String> {
     let ip = peer.ip();
     if let Some(wait) = front.auth_limiter.check(ip) {
-        bail!("too many failed attempts; try again in {:.0}s", wait.as_secs_f64().max(1.0));
+        bail!(
+            "too many failed attempts; try again in {:.0}s",
+            wait.as_secs_f64().max(1.0)
+        );
     }
     let m: OfferMsg = serde_json::from_slice(body).context("reading the offer")?;
     if !crate::auth::verify_credentials(&front.username, &front.password, &m.user, &m.password) {
