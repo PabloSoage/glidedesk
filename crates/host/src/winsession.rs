@@ -52,6 +52,7 @@ use crate::frame::{
     CursorEvent, CursorShape, Frame, FrameData, FrameReceiver, FrameSender, Recycler, Source,
 };
 use crate::input::{Input, InputBackend};
+use crate::wincuda::D3dToCuda;
 
 pub struct WinSession {
     pub size: (u32, u32),
@@ -110,7 +111,8 @@ fn primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
     }
 }
 
-pub fn start() -> Result<WinSession> {
+/// `cuda` is the NVENC encoder's context, if NVENC encodes.
+pub fn start(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<WinSession> {
     // Real pixels: a process that is not DPI aware sees the desktop scaled down (and its
     // input would land scaled too).
     // SAFETY: no preconditions; it fails harmlessly if the awareness was already set.
@@ -140,6 +142,17 @@ pub fn start() -> Result<WinSession> {
         )
         .context("creating the D3D11 device")?;
     }
+    let gpu = cuda.and_then(|ctx| {
+        D3dToCuda::new(ctx, &adapter)
+            .inspect(|_| info!("The desktop goes to NVENC without leaving the GPU"))
+            .map_err(|e| {
+                info!(
+                    reason = format!("{e:#}"),
+                    "The desktop goes to NVENC through system memory"
+                )
+            })
+            .ok()
+    });
     let mut cap = Capture {
         device: device.context("no D3D11 device")?,
         context: context.context("no D3D11 context")?,
@@ -147,6 +160,7 @@ pub fn start() -> Result<WinSession> {
         dupl: None,
         staging: None,
         buffers: Recycler::default(),
+        gpu,
         bounds: Arc::new(Mutex::new(RECT::default())),
         shape: None,
         visible: true,
@@ -186,6 +200,8 @@ struct Capture {
     staging: Option<(ID3D11Texture2D, u32, u32)>,
     /// System-memory buffers the frames are copied into, reused.
     buffers: Recycler,
+    /// The GPU path, when the desktop is on the NVENC GPU.
+    gpu: Option<D3dToCuda>,
     bounds: Bounds,
     shape: Option<CursorShape>,
     visible: bool,
@@ -288,13 +304,51 @@ impl Capture {
                 && let Some(res) = resource
             {
                 let tex: ID3D11Texture2D = res.cast()?;
-                self.read(&tex, frames)?;
+                if !self.read_gpu(&tex, frames) {
+                    self.read(&tex, frames)?;
+                }
             }
             Ok(())
         })();
         // SAFETY: matches the successful acquire above.
         unsafe { dupl.ReleaseFrame()? };
         r
+    }
+
+    /// Hands the desktop texture to the encoder without leaving the GPU, when it is on the
+    /// encoder's. False when the frame must go through system memory instead.
+    fn read_gpu(&mut self, tex: &ID3D11Texture2D, frames: &FrameSender) -> bool {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return false;
+        };
+        let t = Instant::now();
+        match gpu.copy(&self.device, &self.context, tex) {
+            Ok(Some(buf)) => {
+                debug!(
+                    read_ms = t.elapsed().as_secs_f64() * 1e3,
+                    "Desktop read (GPU)"
+                );
+                frames.send(Frame {
+                    width: buf.width,
+                    height: buf.height,
+                    data: FrameData::Gpu(buf),
+                    damage: None,
+                    captured: Instant::now(),
+                    recycle: None,
+                });
+            }
+            // Every buffer is with the encoder: this image is skipped, a newer one follows.
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    "Copying the desktop on the GPU failed; going through system memory"
+                );
+                self.gpu = None;
+                return false;
+            }
+        }
+        true
     }
 
     /// Copies the desktop texture to system memory.

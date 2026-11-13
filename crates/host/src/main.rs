@@ -36,6 +36,8 @@ mod winaudio;
 #[cfg(target_os = "windows")]
 mod winclip;
 #[cfg(target_os = "windows")]
+mod wincuda;
+#[cfg(target_os = "windows")]
 mod winsession;
 #[cfg(feature = "x11")]
 mod x11session;

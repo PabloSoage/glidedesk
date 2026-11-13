@@ -169,8 +169,8 @@ fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows() -> Result<Parts> {
-    let s = crate::winsession::start()?;
+fn windows(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<Parts> {
+    let s = crate::winsession::start(cuda)?;
     let clipboard = crate::winclip::WinClipboard::start()
         .map_err(|e| warn!(%e, "No clipboard"))
         .ok();
@@ -211,10 +211,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             x11(display.as_deref(), opts.fps)?
         }
         #[cfg(target_os = "windows")]
-        SessionKind::Windows => {
-            drop(cuda);
-            windows()?
-        }
+        SessionKind::Windows => windows(cuda)?,
     };
     let shared = Arc::new(pipeline::Shared::default());
     *shared.current_size.lock().unwrap() = parts.size;
