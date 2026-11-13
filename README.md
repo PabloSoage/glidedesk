@@ -16,7 +16,8 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
   - **Standard RDP** (port 3389): the Windows Remote Desktop client (`mstsc`), Microsoft's
     Windows App (macOS, iOS, Android) and FreeRDP/Remmina work without installing anything.
   - **glidedesk's own low-latency protocol** (port 3391): video over UDP with Reed-Solomon
-    FEC (a lost packet never stalls the picture), HEVC or H.264, everything else over TLS.
+    FEC (a lost packet never stalls the picture; a lost frame is recovered without a new
+    keyframe on NVENC), HEVC or H.264, everything else over TLS.
     Used by the glidedesk clients for Windows, Linux, Android and Termux.
   - **Any web browser** (port 3390): open `https://<server>:3390`, log in, done. WebRTC
     carries the same hardware-encoded video (HEVC where the browser decodes it, else H.264),
@@ -194,8 +195,10 @@ The display keeps its own size; input goes through XTEST, sound through PulseAud
 
 The server also runs on Windows 10/11 and shares the desktop of the signed-in user: Desktop
 Duplication for the picture, NVENC, Quick Sync or AMF for the video (x264 without them), the
-default output for sound, and the clipboard (text). Clients connect with the native protocol
-or RDP; the web client is not there yet.
+default output for sound, and the clipboard (text). When the desktop is drawn on the NVENC GPU
+(also inside a Remote Desktop session on Windows Server with an NVIDIA GPU), frames go to the
+encoder without leaving the GPU. Clients connect with the native protocol or RDP; the web
+client is not there yet.
 
 ```powershell
 $env:GLIDEDESK_PASSWORD = '...'
