@@ -103,6 +103,11 @@ pub trait Output: Send {
     fn link_estimate(&mut self) -> Option<u32> {
         None
     }
+    /// The client lost the picture with this [`EncodedFrame::index`] (and so the ones
+    /// after it) and asks for references to be invalidated instead of a keyframe.
+    fn take_lost(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 pub struct Options {
@@ -324,8 +329,14 @@ impl Pipeline {
                     avc444,
                     codec,
                 } => {
+                    let lost = output.take_lost();
                     if new_surface {
                         self.need_full = true;
+                        self.backend.request_keyframe();
+                    } else if let Some(index) = lost
+                        && !self.backend.invalidate_from(index)
+                    {
+                        debug!(index, "Cannot invalidate the lost picture: keyframe");
                         self.backend.request_keyframe();
                     }
                     (

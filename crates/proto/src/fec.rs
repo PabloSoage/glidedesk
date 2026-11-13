@@ -29,10 +29,24 @@ pub const SHARD: usize = 1100;
 pub const MAX_DATA_SHARDS: usize = 200;
 const VIDEO_HEADER: usize = 1 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 4 + 4;
 const FLAG_KEYFRAME: u8 = 1;
+/// (Version 2.) The frame references only frames from before an invalidation.
+const FLAG_RECOVERY: u8 = 2;
 
 /// Splits one encoded frame into packets, with `fec_percent` parity per block (at least one
 /// parity shard when it is not zero).
 pub fn packetize(frame_id: u32, keyframe: bool, data: &[u8], fec_percent: u32) -> Vec<Vec<u8>> {
+    packetize_frame(frame_id, keyframe, false, data, fec_percent)
+}
+
+/// [`packetize`], marking a recovery frame (see [`crate::ClientMsg::InvalidateFrames`]).
+pub fn packetize_frame(
+    frame_id: u32,
+    keyframe: bool,
+    recovery: bool,
+    data: &[u8],
+    fec_percent: u32,
+) -> Vec<Vec<u8>> {
+    let flags = if keyframe { FLAG_KEYFRAME } else { 0 } | if recovery { FLAG_RECOVERY } else { 0 };
     let block_max = SHARD * MAX_DATA_SHARDS;
     let blocks: Vec<&[u8]> = if data.is_empty() {
         vec![&[][..]]
@@ -70,7 +84,7 @@ pub fn packetize(frame_id: u32, keyframe: bool, data: &[u8], fec_percent: u32) -
             let mut p = Vec::with_capacity(VIDEO_HEADER + shard.len());
             p.push(VIDEO);
             p.extend_from_slice(&frame_id.to_le_bytes());
-            p.push(if keyframe { FLAG_KEYFRAME } else { 0 });
+            p.push(flags);
             p.push(bi as u8);
             p.push(blocks.len() as u8);
             p.push(si as u8);
@@ -91,6 +105,8 @@ pub enum Event {
     Frame {
         frame_id: u32,
         keyframe: bool,
+        /// References only frames from before an invalidation (version 2).
+        recovery: bool,
         data: Vec<u8>,
     },
     /// The frame will not be completed (a later one was): its successors may not decode
@@ -109,6 +125,7 @@ struct Block {
 
 struct Partial {
     keyframe: bool,
+    recovery: bool,
     len: usize,
     blocks: Vec<Option<Block>>,
     /// When its last packet arrived.
@@ -155,6 +172,7 @@ impl Reassembler {
         }
         let part = self.partial.entry(frame_id).or_insert_with(|| Partial {
             keyframe: flags & FLAG_KEYFRAME != 0,
+            recovery: flags & FLAG_RECOVERY != 0,
             len: frame_len,
             blocks: (0..blocks).map(|_| None).collect(),
             seen: Instant::now(),
@@ -232,6 +250,7 @@ impl Reassembler {
             events.push(Event::Frame {
                 frame_id,
                 keyframe: part.keyframe,
+                recovery: part.recovery,
                 data,
             });
         }
@@ -423,6 +442,24 @@ mod tests {
             .flat_map(|p| frames_of(r.push(p)))
             .collect();
         assert_eq!(got, vec![(9, data)]);
+    }
+
+    #[test]
+    fn recovery_flag_reaches_the_client() {
+        let mut r = Reassembler::default();
+        let events: Vec<_> = packetize_frame(4, false, true, &frame(5000, 7), 20)
+            .iter()
+            .flat_map(|p| r.push(p))
+            .collect();
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Frame {
+                frame_id: 4,
+                keyframe: false,
+                recovery: true,
+                ..
+            }]
+        ));
     }
 
     #[test]

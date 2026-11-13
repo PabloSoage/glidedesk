@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use cudarc::driver::{CudaContext, sys as cu};
 use nvenc_sys as nv;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub use crate::encoder::{Codec, EncodedFrame, EncoderConfig};
 
@@ -84,7 +84,23 @@ pub struct Encoder {
     force_idr: bool,
     /// Constant QP of a quality pass, `None` for the normal rate control.
     const_qp: Option<u32>,
+    /// Lost pictures can be invalidated (asked for and supported by the GPU).
+    invalidation: bool,
+    /// Index of the last picture encoded ([`EncodedFrame::index`]).
+    last_index: u64,
+    /// The next picture follows an invalidation.
+    recovery_pending: bool,
+    /// Pictures before this one were invalidated already, or are older than the last
+    /// recovery: reports of their loss are stale.
+    recovered_from: u64,
 }
+
+/// Pictures kept in the DPB when invalidation is on (each P-frame still references only
+/// the previous one): a loss up to this many pictures back is recovered without an IDR.
+const INVALIDATION_DPB: u32 = 5;
+
+/// Next [`EncodedFrame::index`]; shared by all encoders so an index is never reused.
+static NEXT_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // The raw handles are only used from the thread that owns the encoder.
 unsafe impl Send for Encoder {}
@@ -125,10 +141,22 @@ impl Encoder {
             frame_idx: 0,
             force_idr: true,
             const_qp: None,
+            invalidation: false,
+            last_index: 0,
+            recovery_pending: false,
+            recovered_from: 0,
         };
+        if cfg.invalidation {
+            let invalidate = this.cap(nv::NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION);
+            let multiple = this.cap(nv::NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES);
+            debug!(invalidate, multiple, "Reference invalidation capabilities");
+            // MULTIPLE_REF_FRAMES is about numRefL0 > 1; each picture here references one,
+            // only the DPB is larger. (Sunshine asks for both; Volta has only the first.)
+            this.invalidation = invalidate > 0;
+        }
         this.initialize()?;
         this.allocate()?;
-        info!(?cfg, "NVENC encoder ready");
+        info!(?cfg, invalidation = this.invalidation, "NVENC encoder ready");
         Ok(this)
     }
 
@@ -136,6 +164,30 @@ impl Encoder {
         match self.cfg.codec {
             Codec::H264 => nv::NV_ENC_CODEC_H264_GUID,
             Codec::Hevc => nv::NV_ENC_CODEC_HEVC_GUID,
+        }
+    }
+
+    /// An encoder capability for this codec (0 when the query fails).
+    fn cap(&self, which: nv::NV_ENC_CAPS) -> i32 {
+        let mut param = nv::NV_ENC_CAPS_PARAM {
+            version: nv::NV_ENC_CAPS_PARAM_VER,
+            capsToQuery: which,
+            ..Default::default()
+        };
+        let mut value = 0;
+        match call!(
+            self.api,
+            nvEncGetEncodeCaps,
+            self.enc,
+            self.codec_guid(),
+            &mut param,
+            &mut value
+        ) {
+            Ok(()) => value,
+            Err(e) => {
+                debug!(%e, "Capability query failed");
+                0
+            }
         }
     }
 
@@ -201,6 +253,10 @@ impl Encoder {
                     if c.refs >= 2 {
                         h.numRefL0 = nv::NV_ENC_NUM_REF_FRAMES_2;
                     }
+                    if self.invalidation {
+                        h.maxNumRefFrames = INVALIDATION_DPB;
+                        h.numRefL0 = nv::NV_ENC_NUM_REF_FRAMES_1;
+                    }
                     let v = &mut h.h264VUIParameters;
                     // Tell decoders there is no reordering (no B-frames): they can output each
                     // frame as soon as it is decoded instead of holding one back.
@@ -218,6 +274,10 @@ impl Encoder {
                     h.idrPeriod = nv::NVENC_INFINITE_GOPLENGTH;
                     h.set_repeatSPSPPS(1);
                     h.set_chromaFormatIDC(1);
+                    if self.invalidation {
+                        h.maxNumRefFramesInDPB = INVALIDATION_DPB;
+                        h.numRefL0 = nv::NV_ENC_NUM_REF_FRAMES_1;
+                    }
                     let v = &mut h.hevcVUIParameters;
                     v.videoSignalTypePresentFlag = 1;
                     v.videoFullRangeFlag = 1;
@@ -345,6 +405,33 @@ impl Encoder {
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Invalidates picture `index` and every one encoded after it (see
+    /// [`crate::encoder::Backend::invalidate_from`]). After Sunshine's `nvenc_base.cpp`.
+    pub fn invalidate_from(&mut self, index: u64) -> bool {
+        if !self.invalidation || index == 0 {
+            return false;
+        }
+        if self.force_idr || index < self.recovered_from || index > self.last_index {
+            // A keyframe is coming anyway, or this loss is covered by the last
+            // invalidation, or the picture is not from this encoder's past.
+            return self.force_idr || index < self.recovered_from;
+        }
+        if self.last_index - index + 1 >= u64::from(INVALIDATION_DPB) {
+            return false;
+        }
+        let _ = self.ctx.bind_to_thread();
+        for i in index..=self.last_index {
+            if let Err(e) = call!(self.api, nvEncInvalidateRefFrames, self.enc, i) {
+                warn!(%e, "Invalidating a reference failed");
+                return false;
+            }
+        }
+        debug!(from = index, to = self.last_index, "References invalidated");
+        self.recovery_pending = true;
+        self.recovered_from = self.last_index + 1;
+        true
     }
 
     /// Switches between the low-latency CBR (`None`) and a constant QP for quality passes
@@ -489,6 +576,7 @@ impl Encoder {
             ..Default::default()
         };
         call!(self.api, nvEncMapInputResource, self.enc, &mut map)?;
+        let index = NEXT_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut pic = nv::NV_ENC_PIC_PARAMS {
             version: nv::NV_ENC_PIC_PARAMS_VER,
             inputWidth: self.cfg.width,
@@ -499,7 +587,7 @@ impl Encoder {
             bufferFmt: format,
             pictureStruct: nv::NV_ENC_PIC_STRUCT_FRAME,
             frameIdx: self.frame_idx,
-            inputTimeStamp: self.frame_idx as u64,
+            inputTimeStamp: index,
             ..Default::default()
         };
         if self.force_idr {
@@ -527,7 +615,13 @@ impl Encoder {
             let keyframe = lock.pictureType == nv::NV_ENC_PIC_TYPE_IDR;
             let qp = lock.frameAvgQP;
             call!(self.api, nvEncUnlockBitstream, self.enc, self.bitstream)?;
-            Ok(EncodedFrame { data, keyframe, qp })
+            Ok(EncodedFrame {
+                data,
+                keyframe,
+                qp,
+                index: if self.invalidation { index } else { 0 },
+                recovery: self.recovery_pending,
+            })
         });
         call!(
             self.api,
@@ -538,6 +632,8 @@ impl Encoder {
         self.frame_idx = self.frame_idx.wrapping_add(1);
         if out.is_ok() {
             self.force_idr = false;
+            self.recovery_pending = false;
+            self.last_index = index;
         }
         out
     }

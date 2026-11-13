@@ -11,8 +11,12 @@ pub mod fec;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Bumped on any incompatible change.
-pub const VERSION: u32 = 1;
+/// Bumped on any change; servers also accept clients from [`MIN_VERSION`] on.
+///
+/// - 2: [`ClientMsg::InvalidateFrames`] and the recovery flag on video packets.
+pub const VERSION: u32 = 2;
+/// Oldest client version a server accepts (it then uses only what that version knows).
+pub const MIN_VERSION: u32 = 1;
 /// Default TCP and UDP port.
 pub const DEFAULT_PORT: u16 = 3391;
 /// Largest control message accepted (a cursor image or clipboard text fits easily).
@@ -71,6 +75,12 @@ pub enum ClientMsg {
     RequestKeyframe,
     Ping {
         t_us: u64,
+    },
+    /// (Version 2.) Frames from `first` on could not be recovered: stop referencing them
+    /// instead of sending an IDR. The client skips frames until one with the recovery flag
+    /// (or a keyframe) arrives; the server answers with a keyframe if it cannot.
+    InvalidateFrames {
+        first: u32,
     },
 }
 

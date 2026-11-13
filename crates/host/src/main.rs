@@ -323,6 +323,7 @@ async fn encode_test(
                 fps: 60,
                 bitrate,
                 refs: 1,
+                invalidation: false,
             },
         )?;
         let mut file = std::fs::File::create(&out)?;

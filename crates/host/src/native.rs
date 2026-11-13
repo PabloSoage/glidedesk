@@ -43,7 +43,15 @@ struct Link {
     control: mpsc::UnboundedSender<ServerMsg>,
     seq: u64,
     frame_id: u32,
+    /// The client speaks protocol version 2: lost frames are invalidated, not answered
+    /// with a keyframe.
+    invalidation: bool,
+    /// Recent frames and their encoder picture index, oldest first.
+    sent: std::collections::VecDeque<(u32, u64)>,
 }
+
+/// Frames remembered for invalidation requests (a loss further back needs a keyframe).
+const SENT_KEPT: usize = 32;
 
 struct Shared {
     session: Arc<pipeline::Shared>,
@@ -54,6 +62,8 @@ struct Shared {
     acked_id: AtomicU32,
     acked: AtomicU64,
     keyframe_requested: AtomicBool,
+    /// Encoder picture index of the oldest frame the client lost and asked to invalidate.
+    lost: Mutex<Option<u64>>,
     /// Send-to-acknowledge delays, for the rate control.
     meter: Mutex<DelayMeter>,
 }
@@ -153,8 +163,20 @@ impl Output for NativeOutput {
             .lock()
             .unwrap()
             .sent(link.frame_id, main.data.len());
+        if main.index != 0 {
+            if link.sent.len() >= SENT_KEPT {
+                link.sent.pop_front();
+            }
+            link.sent.push_back((link.frame_id, main.index));
+        }
         let start = std::time::Instant::now();
-        let packets = fec::packetize(link.frame_id, main.keyframe, &main.data, FEC_PERCENT);
+        let packets = fec::packetize_frame(
+            link.frame_id,
+            main.keyframe,
+            main.recovery && link.invalidation,
+            &main.data,
+            FEC_PERCENT,
+        );
         for (i, p) in packets.iter().enumerate() {
             Shared::seal_and_send(link, &self.shared.udp, peer, p);
             // Pacing: past the first burst, keep to PACE_BITS_PER_SEC so a large frame (an
@@ -187,6 +209,11 @@ impl Output for NativeOutput {
 
     fn wants_refresh(&self) -> bool {
         self.shared.keyframe_requested.load(Ordering::SeqCst)
+            || self.shared.lost.lock().unwrap().is_some()
+    }
+
+    fn take_lost(&mut self) -> Option<u64> {
+        self.shared.lost.lock().unwrap().take()
     }
 }
 
@@ -252,6 +279,7 @@ pub async fn new(
         acked: AtomicU64::new(0),
         meter: Mutex::default(),
         keyframe_requested: AtomicBool::new(false),
+        lost: Mutex::new(None),
     });
     Ok((
         NativeOutput {
@@ -415,9 +443,10 @@ where
     }
     let valid_creds =
         crate::auth::verify_credentials(&front.username, &front.password, &user, &password);
-    let deny = if version != glidedesk_proto::VERSION {
+    let deny = if !(glidedesk_proto::MIN_VERSION..=glidedesk_proto::VERSION).contains(&version) {
         Some(format!(
-            "protocol version {version}, server speaks {}",
+            "protocol version {version}, server speaks {} to {}",
+            glidedesk_proto::MIN_VERSION,
             glidedesk_proto::VERSION
         ))
     } else if !valid_creds {
@@ -464,7 +493,10 @@ where
         control: ctl_tx.clone(),
         seq: 0,
         frame_id: 0,
+        invalidation: version >= 2,
+        sent: Default::default(),
     });
+    *shared.lost.lock().unwrap() = None;
     if let Some(old) = previous {
         let _ = old.control.send(ServerMsg::Denied(format!(
             "another client ({peer}) took over the session"
@@ -549,6 +581,23 @@ where
             }
             ClientMsg::RequestKeyframe => {
                 shared.keyframe_requested.store(true, Ordering::SeqCst);
+            }
+            ClientMsg::InvalidateFrames { first } => {
+                let index = shared.link.lock().unwrap().as_ref().and_then(|l| {
+                    l.sent
+                        .iter()
+                        .find(|&&(id, _)| id == first)
+                        .map(|&(_, index)| index)
+                });
+                debug!(first, ?index, "Client lost frames");
+                match index {
+                    Some(index) => {
+                        let mut lost = shared.lost.lock().unwrap();
+                        *lost = Some(lost.map_or(index, |l| l.min(index)));
+                    }
+                    // Too far back, or not from an encoder that can invalidate.
+                    None => shared.keyframe_requested.store(true, Ordering::SeqCst),
+                }
             }
             ClientMsg::Ping { t_us } => {
                 let _ = ctl_tx.send(ServerMsg::Pong { t_us });

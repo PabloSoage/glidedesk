@@ -141,13 +141,59 @@ fn input_event(i: Input) -> Option<ClientMsg> {
     })
 }
 
+/// What the video waits for before frames can be decoded again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    Nothing,
+    /// An IDR (the first one, or the server could not do better).
+    Keyframe,
+    /// A frame with the recovery flag, after an [`ClientMsg::InvalidateFrames`].
+    Recovery,
+}
+
+/// A server that only speaks protocol version 1 refused version 2 (with the fingerprint of
+/// its certificate, already accepted for this connection).
+#[derive(Debug)]
+struct OldServer([u8; 32]);
+
+impl std::fmt::Display for OldServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server speaks an older protocol version")
+    }
+}
+
+impl std::error::Error for OldServer {}
+
 /// Runs a session until the server closes it or `input` sends [`Input::Disconnect`].
 /// Returns the SHA-256 fingerprint of the server certificate (to pin next time).
 pub async fn run(
-    opts: NativeOptions,
+    mut opts: NativeOptions,
     sink: SharedSink,
     mut input: mpsc::UnboundedReceiver<Input>,
 ) -> Result<[u8; 32]> {
+    let r = session(&opts, &sink, &mut input, glidedesk_proto::VERSION).await;
+    let old = match &r {
+        Err(e) => e.downcast_ref::<OldServer>().map(|o| o.0),
+        Ok(_) => None,
+    };
+    let Some(fingerprint) = old else {
+        return r;
+    };
+    // glidedesk 0.3.0 and older: version 1, no frame invalidation. The certificate was
+    // just accepted, so it is not asked about again.
+    info!("Older server: protocol version 1, lost frames recovered by keyframes");
+    opts.trust.pinned = Some(fingerprint);
+    session(&opts, &sink, &mut input, glidedesk_proto::MIN_VERSION).await
+}
+
+/// One connection, speaking protocol `version`.
+async fn session(
+    opts: &NativeOptions,
+    sink: &SharedSink,
+    input: &mut mpsc::UnboundedReceiver<Input>,
+    version: u32,
+) -> Result<[u8; 32]> {
+    let invalidation = version >= 2;
     let tcp = TcpStream::connect((opts.host.as_str(), opts.port))
         .await
         .with_context(|| format!("connecting to {}:{}", opts.host, opts.port))?;
@@ -176,7 +222,7 @@ pub async fn run(
     glidedesk_proto::write_msg(
         &mut wr,
         &ClientMsg::Hello {
-            version: glidedesk_proto::VERSION,
+            version,
             user: opts.username.clone(),
             password: opts.password.clone(),
             width: opts.width,
@@ -195,6 +241,11 @@ pub async fn run(
             height,
             ..
         } => (key, token, codec, width, height),
+        ServerMsg::Denied(reason)
+            if version > glidedesk_proto::MIN_VERSION && reason.starts_with("protocol version") =>
+        {
+            return Err(OldServer(fingerprint).into());
+        }
         ServerMsg::Denied(reason) => bail!("the server refused the login: {reason}"),
         other => bail!("unexpected first message {other:?}"),
     };
@@ -262,9 +313,10 @@ pub async fn run(
             let mut buf = vec![0u8; 2048];
             let mut replay = ReplayWindow::default();
             let mut frames = fec::Reassembler::default();
-            // Until the first IDR (and after a lost frame) P-frames cannot be decoded. The IDR
-            // can be lost too: the request is repeated while waiting.
-            let mut need_keyframe = true;
+            // Until the first IDR, and after a lost frame until the server's recovery frame
+            // (or an IDR), P-frames cannot be decoded. Either can be lost too: a keyframe is
+            // asked for while waiting too long.
+            let mut wait = Wait::Keyframe;
             let mut asked = Instant::now();
             // GLIDEDESK_DROP=PERCENT throws away that share of the packets, to test recovery.
             let drop: u64 = std::env::var("GLIDEDESK_DROP")
@@ -322,16 +374,21 @@ pub async fn run(
                                 fec::Event::Frame {
                                     frame_id,
                                     keyframe,
+                                    recovery,
                                     data,
                                 } => {
                                     got += 1;
-                                    if keyframe {
-                                        need_keyframe = false;
+                                    if keyframe || (recovery && wait == Wait::Recovery) {
+                                        if wait != Wait::Nothing {
+                                            debug!(frame_id, keyframe, "Recovered");
+                                        }
+                                        wait = Wait::Nothing;
                                     }
-                                    if !need_keyframe {
+                                    if wait == Wait::Nothing {
                                         sink.lock().unwrap().frame(&data);
                                     } else if asked.elapsed() > KEYFRAME_RETRY {
                                         asked = Instant::now();
+                                        wait = Wait::Keyframe;
                                         let _ = ctl.send(ClientMsg::RequestKeyframe);
                                     }
                                     held.push_back(frame_id);
@@ -339,10 +396,30 @@ pub async fn run(
                                 fec::Event::Lost { frame_id } => {
                                     lost += 1;
                                     debug!(frame_id, "Frame lost");
-                                    if !need_keyframe || asked.elapsed() > KEYFRAME_RETRY {
-                                        need_keyframe = true;
-                                        asked = Instant::now();
-                                        let _ = ctl.send(ClientMsg::RequestKeyframe);
+                                    match wait {
+                                        // Version 2: the server stops referencing it. (The
+                                        // wait for recovery keeps its start: a keyframe is
+                                        // still asked for if recovery takes too long.)
+                                        Wait::Nothing | Wait::Recovery if invalidation => {
+                                            if wait == Wait::Nothing {
+                                                asked = Instant::now();
+                                            }
+                                            wait = Wait::Recovery;
+                                            let _ = ctl.send(ClientMsg::InvalidateFrames {
+                                                first: frame_id,
+                                            });
+                                        }
+                                        Wait::Nothing => {
+                                            wait = Wait::Keyframe;
+                                            asked = Instant::now();
+                                            let _ = ctl.send(ClientMsg::RequestKeyframe);
+                                        }
+                                        _ if asked.elapsed() > KEYFRAME_RETRY => {
+                                            wait = Wait::Keyframe;
+                                            asked = Instant::now();
+                                            let _ = ctl.send(ClientMsg::RequestKeyframe);
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }

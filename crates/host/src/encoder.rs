@@ -36,6 +36,8 @@ pub struct EncoderConfig {
     /// Reference frames for P-frames. AVC444 interleaves the two views in one sequence, so
     /// each view needs the picture two back to reference its own previous frame.
     pub refs: u32,
+    /// Keep extra pictures in the DPB so lost ones can be invalidated (NVENC, not AVC444).
+    pub invalidation: bool,
 }
 
 #[derive(Default)]
@@ -44,6 +46,12 @@ pub struct EncodedFrame {
     pub keyframe: bool,
     /// Average QP of the picture, when the encoder reports it.
     pub qp: u32,
+    /// Encoder-wide picture number (never reused, even across encoders), for
+    /// [`Backend::invalidate_from`]. Zero where references cannot be invalidated.
+    pub index: u64,
+    /// The first picture after an invalidation: it references only pictures before the
+    /// lost ones, so a client that dropped them can decode it.
+    pub recovery: bool,
 }
 
 /// Which encoder to use (`--encoder`).
@@ -82,6 +90,12 @@ pub trait Backend: Send {
     fn set_max_bitrate(&mut self, bps: u32) -> Result<()>;
     /// Encodes `frame`; empty pictures for views that were not asked for.
     fn encode(&mut self, frame: &Frame, req: &Request) -> Result<(EncodedFrame, EncodedFrame)>;
+    /// The client lost picture `index` ([`EncodedFrame::index`]) and the ones after it:
+    /// stop referencing them, so the next picture decodes without a keyframe. False when the
+    /// encoder cannot (then a keyframe is needed).
+    fn invalidate_from(&mut self, _index: u64) -> bool {
+        false
+    }
 }
 
 fn config(codec: Codec, w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) -> EncoderConfig {
@@ -93,6 +107,7 @@ fn config(codec: Codec, w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) ->
         fps: if avc444 { fps * 2 } else { fps },
         bitrate,
         refs: if avc444 { 2 } else { 1 },
+        invalidation: !avc444,
     }
 }
 
@@ -143,6 +158,13 @@ impl Backend for Nvenc {
     fn request_keyframe(&mut self) {
         if let Some((e, _, _)) = self.encoder.as_mut() {
             e.request_keyframe();
+        }
+    }
+
+    fn invalidate_from(&mut self, index: u64) -> bool {
+        match self.encoder.as_mut() {
+            Some((e, _, _)) => e.invalidate_from(index),
+            None => false,
         }
     }
 
