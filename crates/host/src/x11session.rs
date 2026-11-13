@@ -161,6 +161,7 @@ pub fn start(display: Option<&str>, fps: u32) -> Result<X11Session> {
                     },
                     damage: None,
                     captured: last,
+                    recycle: None,
                 });
             }
         })?;

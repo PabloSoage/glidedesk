@@ -400,6 +400,10 @@ pub async fn run(
     };
     hello.abort();
     media.abort();
+    if result.is_ok() {
+        // Leaving on purpose: close TLS properly so the server sees a clean end.
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;
+    }
     result.map(|()| fingerprint)
 }
 

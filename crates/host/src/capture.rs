@@ -533,6 +533,7 @@ fn run(
                 data,
                 damage: damage.filter(|d| !d.is_empty()),
                 captured: Instant::now(),
+                 recycle: None,
             };
             st.stats_frames += 1;
             st.stats_copy_us += copy_start.elapsed().as_micros();

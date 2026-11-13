@@ -159,7 +159,10 @@ impl Backend for Nvenc {
         let src = match &frame.data {
             FrameData::Gpu(b) => Arc::clone(b),
             FrameData::Cpu { data, stride } => {
-                crate::gpu::upload(&mut self.upload, data, *stride as usize, w, h)?
+                let t = std::time::Instant::now();
+                let b = crate::gpu::upload(&mut self.upload, data, *stride as usize, w, h)?;
+                tracing::debug!(upload_ms = t.elapsed().as_secs_f64() * 1e3, "Upload");
+                b
             }
         };
         let size = color::coded_size(w, h);
@@ -494,6 +497,7 @@ mod tests {
                         },
                         damage: None,
                         captured: std::time::Instant::now(),
+                        recycle: None,
                     };
                     let req = Request {
                         codec,

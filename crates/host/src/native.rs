@@ -519,6 +519,10 @@ where
     let result = loop {
         let msg: ClientMsg = match glidedesk_proto::read_msg(&mut rd).await {
             Ok(m) => m,
+            // The client closed the connection between messages: it left.
+            Err(glidedesk_proto::Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break Ok(());
+            }
             Err(e) => break Err(anyhow::Error::from(e)),
         };
         // A newer client took over: stop serving this one.

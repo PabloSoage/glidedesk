@@ -49,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::Interface;
 
 use crate::frame::{
-    CursorEvent, CursorShape, Frame, FrameData, FrameReceiver, FrameSender, Source,
+    CursorEvent, CursorShape, Frame, FrameData, FrameReceiver, FrameSender, Recycler, Source,
 };
 use crate::input::{Input, InputBackend};
 
@@ -118,6 +118,11 @@ pub fn start() -> Result<WinSession> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     let (adapter, output) = primary_output()?;
+    // SAFETY: plain DXGI call on a live interface.
+    if let Ok(d) = unsafe { adapter.GetDesc1() } {
+        let name = String::from_utf16_lossy(&d.Description);
+        debug!(adapter = name.trim_end_matches('\0'), "Display adapter");
+    }
     let mut device = None;
     let mut context = None;
     // SAFETY: creates a device on the adapter that owns the output.
@@ -141,6 +146,7 @@ pub fn start() -> Result<WinSession> {
         output,
         dupl: None,
         staging: None,
+        buffers: Recycler::default(),
         bounds: Arc::new(Mutex::new(RECT::default())),
         shape: None,
         visible: true,
@@ -178,6 +184,8 @@ struct Capture {
     dupl: Option<IDXGIOutputDuplication>,
     /// CPU-readable copy of the desktop, and its size.
     staging: Option<(ID3D11Texture2D, u32, u32)>,
+    /// System-memory buffers the frames are copied into, reused.
+    buffers: Recycler,
     bounds: Bounds,
     shape: Option<CursorShape>,
     visible: bool,
@@ -320,20 +328,25 @@ impl Capture {
             let Some((staging, _, _)) = &self.staging else {
                 return Ok(());
             };
+            let t = Instant::now();
             self.context.CopyResource(staging, tex);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            // Waits for the copy.
             self.context
                 .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let stride = mapped.RowPitch;
-            let data = std::slice::from_raw_parts(mapped.pData as *const u8, (stride * h) as usize)
-                .to_vec();
+            let len = (stride * h) as usize;
+            let mut data = self.buffers.take(len);
+            data.extend_from_slice(std::slice::from_raw_parts(mapped.pData as *const u8, len));
             self.context.Unmap(staging, 0);
+            debug!(read_ms = t.elapsed().as_secs_f64() * 1e3, "Desktop read");
             frames.send(Frame {
                 width: w,
                 height: h,
                 data: FrameData::Cpu { data, stride },
                 damage: None,
                 captured: Instant::now(),
+                recycle: Some(self.buffers.clone()),
             });
         }
         Ok(())

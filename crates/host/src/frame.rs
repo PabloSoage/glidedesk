@@ -32,6 +32,45 @@ pub struct Frame {
     pub damage: Option<Vec<Rect>>,
     /// When the frame was dequeued from PipeWire.
     pub captured: Instant,
+    /// Where the system-memory buffer goes back when the frame is dropped.
+    pub recycle: Option<Recycler>,
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if let (Some(r), FrameData::Cpu { data, .. }) = (&self.recycle, &mut self.data) {
+            r.put(std::mem::take(data));
+        }
+    }
+}
+
+/// Spare system-memory frame buffers. A 4K frame is 33 MB: allocated afresh each time,
+/// its page faults cost more than the copy into it (Windows, 18-24 ms against ~5).
+#[derive(Clone, Default)]
+pub struct Recycler(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+/// Buffers kept: the one being filled, the one waiting and the one being encoded.
+const SPARE_BUFFERS: usize = 3;
+
+impl Recycler {
+    /// An empty buffer that can hold `len` bytes without allocating.
+    // Only the Windows capture copies into its own buffers.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn take(&self, len: usize) -> Vec<u8> {
+        let mut spare = self.0.lock().unwrap();
+        // Buffers of another size (the desktop changed) are dropped.
+        spare.retain(|b| b.capacity() >= len && b.capacity() <= len + len / 4);
+        let mut buf = spare.pop().unwrap_or_else(|| Vec::with_capacity(len));
+        buf.clear();
+        buf
+    }
+
+    fn put(&self, buf: Vec<u8>) {
+        let mut spare = self.0.lock().unwrap();
+        if spare.len() < SPARE_BUFFERS {
+            spare.push(buf);
+        }
+    }
 }
 
 /// A cursor image, BGRA with rows bottom-up (the RDP pointer layout), straight alpha.
@@ -151,7 +190,33 @@ mod tests {
             },
             damage: None,
             captured: Instant::now(),
+            recycle: None,
         }
+    }
+
+    #[test]
+    fn dropped_frames_give_their_buffer_back() {
+        let r = Recycler::default();
+        let mut buf = r.take(1000);
+        buf.resize(1000, 7);
+        let ptr = buf.as_ptr();
+        drop(Frame {
+            width: 25,
+            height: 10,
+            data: FrameData::Cpu {
+                data: buf,
+                stride: 100,
+            },
+            damage: None,
+            captured: Instant::now(),
+            recycle: Some(r.clone()),
+        });
+        let again = r.take(1000);
+        assert_eq!(again.as_ptr(), ptr);
+        assert!(again.is_empty());
+        // Another size gets a new buffer.
+        let other = r.take(4000);
+        assert_ne!(other.as_ptr(), ptr);
     }
 
     #[test]
