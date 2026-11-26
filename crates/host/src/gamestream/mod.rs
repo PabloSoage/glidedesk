@@ -38,8 +38,8 @@ use http::{Request, Xml};
 use identity::{Clients, Identity};
 use pair::Pairing;
 
+/// The usual HTTP port; HTTPS is 5 below.
 pub const HTTP_PORT: u16 = 47989;
-pub const HTTPS_PORT: u16 = 47984;
 /// The GameStream server version Moonlight checks (generation 7: SHA-256 pairing), and the
 /// GeForce Experience version, as Sunshine reports them (`src/nvhttp.h`).
 const APP_VERSION: &str = "7.1.431.-1";

@@ -132,9 +132,14 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         max_in_flight: u32,
         /// Also serve Moonlight clients (GameStream: 47989/tcp, 47984/tcp, RTSP 48010/tcp,
-        /// video 47998/udp, control and input 47999/udp, sound 48000/udp). No gamepads yet.
+        /// video 47998/udp, control and input 47999/udp, sound 48000/udp).
         #[arg(long)]
         gamestream: bool,
+        /// GameStream's HTTP port; the others move with it as in Sunshine (HTTPS 5 below,
+        /// RTSP 21 above, video, control and sound 9, 10 and 11 above). Add the host in
+        /// Moonlight as `address:port` when it is not the usual one.
+        #[arg(long, default_value_t = gamestream::HTTP_PORT, value_parser = clap::value_parser!(u16).range(1024..65500))]
+        gamestream_port: u16,
     },
     /// Run only the GameStream front end (pairing, server info, app list), for testing
     /// Moonlight clients without a session.
@@ -233,6 +238,7 @@ async fn main() -> Result<()> {
             no_refine,
             max_in_flight,
             gamestream,
+            gamestream_port,
         } => {
             #[cfg(feature = "gnome")]
             capture::set_refresh_rate(refresh);
@@ -281,8 +287,8 @@ async fn main() -> Result<()> {
                 state_dir,
                 gamestream: gamestream.then(|| {
                     (
-                        std::net::SocketAddr::new(bind.ip(), gamestream::HTTP_PORT),
-                        std::net::SocketAddr::new(bind.ip(), gamestream::HTTPS_PORT),
+                        std::net::SocketAddr::new(bind.ip(), gamestream_port),
+                        std::net::SocketAddr::new(bind.ip(), gamestream_port - 5),
                     )
                 }),
             })
