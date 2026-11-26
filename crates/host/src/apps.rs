@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct App {
@@ -215,7 +215,7 @@ fn maximize_windows_of(pid: u32) {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    warn!(pid, "No window of the app to maximize");
+    tracing::warn!(pid, "No window of the app to maximize");
 }
 
 /// FNV-1a of the name, kept positive and away from the desktop's id.
