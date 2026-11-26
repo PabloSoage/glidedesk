@@ -95,8 +95,40 @@ Useful options of `serve` (`--help` lists them all):
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
 | `--avc444` | off | full-chroma AVC444 for RDP clients (experimental: `mstsc` shows it blurred) |
 | `--x11 :0` | | serve an existing X11 display instead of a GNOME session (see Termux below) |
+| `--gamestream` | off | also answer Moonlight clients (pairing and app list only for now; see below) |
 
 The TLS certificate is self-signed, created in `~/.config/glidedesk/` on first start.
+
+### Apps instead of the whole desktop
+
+List apps in `~/.config/glidedesk/apps.conf` (Windows: `%APPDATA%\glidedesk\apps.conf`), one
+per line:
+
+```text
+# Name = command line, run in the session
+Firefox = firefox
+Terminal = gnome-terminal
+```
+
+A client that asks for one (`glidedesk <server> --app Firefox`, the **App** field of the
+connection window, or `app = "Firefox"` in a `.glidedesk` profile) gets it started in the
+session, and the session ends when the app does. An app that is already running is reused. On
+Windows the app's window is maximized; on GNOME it opens as a normal window for now. Native
+protocol only (RDP clients get the desktop). Apps that start another process and exit at once
+(launchers) keep the session open.
+
+### Moonlight (in progress)
+
+With `--gamestream` the server listens on 47989/tcp and 47984/tcp like Sunshine, so Moonlight
+(desktop, Android, iOS, TVs, Nintendo Switch, …) can find it and pair. Add the server in
+Moonlight, which shows a PIN, and type it on the server:
+
+```sh
+GLIDEDESK_PASSWORD='...' glidedesk-host pair 1234    # without a PIN: lists who is waiting
+```
+
+Paired clients see the apps from `apps.conf` (plus **Desktop**). Streaming to Moonlight is not
+done yet.
 
 If the "Stop screen sharing" button in GNOME's top bar is pressed, the server starts a new
 session by itself within about a second; clients stay connected. Windows that were full

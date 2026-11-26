@@ -23,6 +23,9 @@ struct Args {
     /// With --native: ask for HEVC instead of H.264.
     #[arg(long)]
     hevc: bool,
+    /// With --native: open this app of the server instead of the desktop.
+    #[arg(long)]
+    app: Option<String>,
     #[arg(long)]
     user: String,
     #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
@@ -91,6 +94,7 @@ async fn main() -> Result<()> {
             },
             refresh: 60,
             trust: Default::default(),
+            app: a.app,
         };
         tokio::spawn(async move {
             glidedesk_client::native::run(opts, shared, rx)

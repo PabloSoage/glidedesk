@@ -81,6 +81,10 @@ struct Args {
     /// Do not share the clipboard.
     #[arg(long)]
     no_clipboard: bool,
+    /// Open this app of the server (a name from its apps.conf) instead of the desktop; the
+    /// session ends when the app does. Native protocol only.
+    #[arg(long)]
+    app: Option<String>,
 }
 
 #[derive(
@@ -137,6 +141,9 @@ fn apply_profile(args: &mut Args, prof: profile::Profile) -> Result<()> {
     }
     if let Some(c) = prof.clipboard {
         args.no_clipboard = !c;
+    }
+    if let Some(app) = prof.app.filter(|a| !a.is_empty()) {
+        args.app = Some(app);
     }
     if let Some(g) = prof.gpu {
         args.gpu =
@@ -308,6 +315,7 @@ impl App {
                     },
                     refresh,
                     trust,
+                    app: a.app,
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await

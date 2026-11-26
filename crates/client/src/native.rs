@@ -43,6 +43,9 @@ pub struct NativeOptions {
     pub refresh: u32,
     /// Which server certificate to accept.
     pub trust: crate::trust::Trust,
+    /// Open this app of the server instead of the desktop (protocol version 3); the session
+    /// ends when the app does.
+    pub app: Option<String>,
 }
 
 /// Accepts the server's self-signed certificate if [`Trust`](crate::trust::Trust) does, and
@@ -151,10 +154,10 @@ enum Wait {
     Recovery,
 }
 
-/// A server that only speaks protocol version 1 refused version 2 (with the fingerprint of
-/// its certificate, already accepted for this connection).
+/// A server that speaks an older protocol refused ours: the fingerprint of its certificate
+/// (already accepted for this connection) and the newest version it named.
 #[derive(Debug)]
-struct OldServer([u8; 32]);
+struct OldServer([u8; 32], Option<u32>);
 
 impl std::fmt::Display for OldServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -171,19 +174,29 @@ pub async fn run(
     sink: SharedSink,
     mut input: mpsc::UnboundedReceiver<Input>,
 ) -> Result<[u8; 32]> {
-    let r = session(&opts, &sink, &mut input, glidedesk_proto::VERSION).await;
-    let old = match &r {
-        Err(e) => e.downcast_ref::<OldServer>().map(|o| o.0),
-        Ok(_) => None,
-    };
-    let Some(fingerprint) = old else {
-        return r;
-    };
-    // glidedesk 0.3.0 and older: version 1, no frame invalidation. The certificate was
-    // just accepted, so it is not asked about again.
-    info!("Older server: protocol version 1, lost frames recovered by keyframes");
-    opts.trust.pinned = Some(fingerprint);
-    session(&opts, &sink, &mut input, glidedesk_proto::MIN_VERSION).await
+    let mut version = glidedesk_proto::VERSION;
+    loop {
+        let r = session(&opts, &sink, &mut input, version).await;
+        let old = match &r {
+            Err(e) => e.downcast_ref::<OldServer>().map(|o| (o.0, o.1)),
+            Ok(_) => None,
+        };
+        let Some((fingerprint, newest)) = old else {
+            return r;
+        };
+        // glidedesk 0.3.0 says "server speaks 1 to 1", 0.3.1 "1 to 2"; anything else, the
+        // oldest. The certificate was just accepted, so it is not asked about again.
+        version = newest
+            .filter(|&v| (glidedesk_proto::MIN_VERSION..version).contains(&v))
+            .unwrap_or(glidedesk_proto::MIN_VERSION);
+        info!(version, "Older server: speaking its protocol version");
+        opts.trust.pinned = Some(fingerprint);
+    }
+}
+
+/// The newest version in a refusal like "protocol version 3, server speaks 1 to 2".
+fn newest_version(reason: &str) -> Option<u32> {
+    reason.rsplit(' ').next()?.parse().ok()
 }
 
 /// One connection, speaking protocol `version`.
@@ -244,15 +257,21 @@ async fn session(
         ServerMsg::Denied(reason)
             if version > glidedesk_proto::MIN_VERSION && reason.starts_with("protocol version") =>
         {
-            return Err(OldServer(fingerprint).into());
+            return Err(OldServer(fingerprint, newest_version(&reason)).into());
         }
         ServerMsg::Denied(reason) => bail!("the server refused the login: {reason}"),
         other => bail!("unexpected first message {other:?}"),
     };
-    info!(?codec, width, height, "Logged in");
+    info!(?codec, width, height, version, "Logged in");
     sink.lock()
         .unwrap()
         .reset(u32::from(width), u32::from(height), codec);
+    if let Some(app) = &opts.app {
+        if version < 3 {
+            bail!("this server is too old to open apps (it needs glidedesk 0.4 or newer)");
+        }
+        glidedesk_proto::write_msg(&mut wr, &ClientMsg::OpenApp(app.clone())).await?;
+    }
 
     let key = Arc::new(PacketKey::new(&key));
     let udp = {
@@ -455,6 +474,17 @@ async fn session(
                 }
                 Ok(ServerMsg::Clipboard(text)) => sink.lock().unwrap().clipboard(&text),
                 Ok(ServerMsg::Denied(reason)) => break Err(anyhow::anyhow!(reason)),
+                Ok(ServerMsg::Apps(names)) => info!(?names, "Apps on the server"),
+                Ok(ServerMsg::AppStarted(name)) => info!(name, "App open"),
+                Ok(ServerMsg::AppExited { name, reason }) if opts.app.as_deref() == Some(name.as_str()) => {
+                    break match reason {
+                        None => {
+                            info!(name, "The app ended");
+                            Ok(())
+                        }
+                        Some(r) => Err(anyhow::anyhow!("{name}: {r}")),
+                    };
+                }
                 Ok(other) => warn!(?other, "Unexpected message"),
                 Err(e) => break Err(anyhow::Error::from(e).context("control channel")),
             },
@@ -508,4 +538,13 @@ fn now_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn reads_the_newest_version_from_a_refusal() {
+        assert_eq!(super::newest_version("protocol version 3, server speaks 1 to 2"), Some(2));
+        assert_eq!(super::newest_version("wrong user name or password"), None);
+    }
 }

@@ -21,6 +21,8 @@ pub struct Profile {
     pub fingerprint: Option<String>,
     pub codec: Option<crate::CodecChoice>,
     pub clipboard: Option<bool>,
+    /// An app of the server to open instead of the desktop.
+    pub app: Option<String>,
 }
 
 impl Profile {
@@ -161,6 +163,7 @@ mod tests {
             gpu: Some("nvidia".into()),
             codec: Some(crate::CodecChoice::Hevc),
             clipboard: Some(false),
+            app: Some("Firefox".into()),
             fingerprint: Some(
                 "eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573".into(),
             ),

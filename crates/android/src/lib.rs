@@ -214,6 +214,8 @@ mod android {
                     codecs: vec![VideoCodec::Hevc, VideoCodec::H264],
                     refresh: refresh.clamp(30, 240) as u32,
                     trust: Default::default(),
+                    // Choosing an app in the Android UI is still to do.
+                    app: None,
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await

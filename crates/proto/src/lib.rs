@@ -14,7 +14,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Bumped on any change; servers also accept clients from [`MIN_VERSION`] on.
 ///
 /// - 2: [`ClientMsg::InvalidateFrames`] and the recovery flag on video packets.
-pub const VERSION: u32 = 2;
+/// - 3: apps: [`ServerMsg::Apps`], [`ClientMsg::OpenApp`], [`ServerMsg::AppExited`].
+pub const VERSION: u32 = 3;
 /// Oldest client version a server accepts (it then uses only what that version knows).
 pub const MIN_VERSION: u32 = 1;
 /// Default TCP and UDP port.
@@ -82,6 +83,10 @@ pub enum ClientMsg {
     InvalidateFrames {
         first: u32,
     },
+    /// (Version 3.) Open this app (a name from [`ServerMsg::Apps`]) instead of the whole
+    /// desktop. A running one is reused; when it exits the server sends
+    /// [`ServerMsg::AppExited`].
+    OpenApp(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +125,16 @@ pub enum ServerMsg {
     Clipboard(String),
     Pong {
         t_us: u64,
+    },
+    /// (Version 3, right after [`ServerMsg::Welcome`].) The apps the client can open; the
+    /// first is the desktop.
+    Apps(Vec<String>),
+    /// (Version 3.) The app the client opened is running.
+    AppStarted(String),
+    /// (Version 3.) The app the client opened ended (or could not start: the reason).
+    AppExited {
+        name: String,
+        reason: Option<String>,
     },
 }
 

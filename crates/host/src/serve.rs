@@ -255,6 +255,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         .spawn(move || pipeline.run())?;
 
     let auth_limiter = Arc::new(crate::auth::RateLimiter::new());
+    let apps = crate::apps::Runner::new(opts.state_dir.clone());
     let input = InputForwarder::spawn(parts.input);
     let rdp = rdp_server.run(crate::rdp::Front {
         bind: opts.bind,
@@ -282,6 +283,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                         input: input.clone(),
                         clipboard: parts.text_clipboard.clone(),
                         auth_limiter: native_limiter,
+                        apps: Arc::clone(&apps),
                     })
                     .await
             }

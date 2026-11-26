@@ -70,6 +70,8 @@ pub struct Launcher {
     pub software_decode: bool,
     pub mute: bool,
     pub clipboard: bool,
+    /// An app of the server to open instead of the desktop (empty: the desktop).
+    pub app: String,
     pub history: History,
     pub known_hosts: KnownHosts,
     pub fingerprint: String,
@@ -103,6 +105,7 @@ impl Launcher {
             software_decode: false,
             mute: false,
             clipboard: true,
+            app: String::new(),
             history,
             known_hosts,
             fingerprint: String::new(),
@@ -136,6 +139,11 @@ impl Launcher {
         (!f.is_empty()).then(|| f.to_owned())
     }
 
+    fn app(&self) -> Option<String> {
+        let a = self.app.trim();
+        (!a.is_empty()).then(|| a.to_owned())
+    }
+
     fn user(&self) -> Option<String> {
         let u = self.user.trim();
         (!u.is_empty()).then(|| u.to_owned())
@@ -165,6 +173,7 @@ impl Launcher {
         self.software_decode = p.software_decode.unwrap_or(false);
         self.codec = p.codec.unwrap_or(CodecChoice::Auto);
         self.clipboard = p.clipboard.unwrap_or(true);
+        self.app = p.app.unwrap_or_default();
         self.gpu = match p.gpu.as_deref().map(str::to_ascii_lowercase).as_deref() {
             Some("amd") => GpuOption::Amd,
             Some("intel") => GpuOption::Intel,
@@ -198,6 +207,7 @@ impl Launcher {
             fingerprint: self.fingerprint(),
             codec: (self.codec != CodecChoice::Auto).then_some(self.codec),
             clipboard: (!self.clipboard).then_some(false),
+            app: self.app(),
         };
         p.save_file(path).map_err(|e| format!("{e:#}"))
     }
@@ -238,6 +248,7 @@ impl Launcher {
             fingerprint,
             codec: self.codec,
             no_clipboard: !self.clipboard,
+            app: if self.rdp { None } else { self.app() },
         })
     }
 }
@@ -375,6 +386,19 @@ pub fn render_ui(launcher: &mut Launcher, ui: &mut egui::Ui) -> LauncherAction {
                             egui::TextEdit::singleline(&mut launcher.port_str)
                                 .hint_text(if launcher.rdp { "3389" } else { "3391" }),
                         );
+                    });
+                    ui.add_enabled_ui(!launcher.rdp, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("App:");
+                            ui.add_sized(
+                                [200.0, 20.0],
+                                egui::TextEdit::singleline(&mut launcher.app)
+                                    .hint_text("the whole desktop"),
+                            )
+                            .on_hover_text(
+                                "An app from the server's apps.conf, opened instead of the desktop",
+                            );
+                        });
                     });
                 });
                 ui.add_space(6.0);

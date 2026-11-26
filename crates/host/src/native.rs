@@ -240,6 +240,8 @@ pub struct Front {
     pub input: InputForwarder,
     pub clipboard: Option<Arc<dyn TextClipboard>>,
     pub auth_limiter: Arc<crate::auth::RateLimiter>,
+    /// Apps clients can open (protocol version 3).
+    pub apps: Arc<crate::apps::Runner>,
 }
 
 pub struct Server {
@@ -516,15 +518,29 @@ where
         },
     )
     .await?;
+    if version >= 3 {
+        let names = front.apps.list().into_iter().map(|a| a.name).collect();
+        glidedesk_proto::write_msg(&mut wr, &ServerMsg::Apps(names)).await?;
+    }
 
-    // Outgoing: queued messages and cursor changes.
+    // Outgoing: queued messages, cursor changes, and the end of the app this client opened.
     let mut cursor = front.cursor.clone();
     cursor.mark_changed();
     let mut clip = front.clipboard.as_ref().map(|c| c.subscribe());
+    let opened: Arc<Mutex<Option<String>>> = Arc::default();
+    let mut app_exits = front.apps.subscribe();
+    let watched = Arc::clone(&opened);
     let writer = tokio::spawn(async move {
         loop {
             let msg = tokio::select! {
                 m = ctl_rx.recv() => match m { Some(m) => m, None => break },
+                e = app_exits.recv() => match e {
+                    Ok(e) if watched.lock().unwrap().as_deref() == Some(e.name.as_str()) => {
+                        ServerMsg::AppExited { name: e.name, reason: e.reason }
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
                 t = async { match clip.as_mut() { Some(c) => c.recv().await, None => std::future::pending().await } } => match t {
                     Ok(text) => ServerMsg::Clipboard(text),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -606,6 +622,22 @@ where
                 if let Some(c) = &front.clipboard {
                     c.set(text);
                 }
+            }
+            ClientMsg::OpenApp(name) => {
+                let reply = match front.apps.open(&name) {
+                    Ok(()) => {
+                        *opened.lock().unwrap() = Some(name.clone());
+                        ServerMsg::AppStarted(name)
+                    }
+                    Err(e) => {
+                        warn!(%peer, app = name, error = format!("{e:#}"), "Could not open the app");
+                        ServerMsg::AppExited {
+                            name,
+                            reason: Some(format!("{e:#}")),
+                        }
+                    }
+                };
+                let _ = ctl_tx.send(reply);
             }
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
         }

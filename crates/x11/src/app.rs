@@ -42,6 +42,9 @@ struct Args {
     /// No sound.
     #[arg(long)]
     mute: bool,
+    /// Open this app of the server instead of the desktop (native protocol).
+    #[arg(long)]
+    app: Option<String>,
 }
 
 /// Connects to $DISPLAY. Besides the usual lookup: Linux X servers that only listen on the
@@ -382,6 +385,7 @@ pub fn main() -> Result<()> {
                     codecs: vec![VideoCodec::H264],
                     refresh: 60,
                     trust: Default::default(),
+                    app: a.app,
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await
