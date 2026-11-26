@@ -10,6 +10,7 @@
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 use tracing::debug;
 
+use super::gamepad::{self, Gamepads};
 use crate::input::InputForwarder;
 
 const KEY_DOWN: u32 = 0x03;
@@ -24,14 +25,16 @@ const HSCROLL: u32 = 0x5500_0001;
 
 pub struct MoonlightInput {
     input: InputForwarder,
+    pads: Gamepads,
     /// Pointer position in desktop pixels (relative motion moves it).
     pos: (f64, f64),
 }
 
 impl MoonlightInput {
-    pub fn new(input: InputForwarder) -> Self {
+    pub fn new(input: InputForwarder, rumble: gamepad::Rumble) -> Self {
         Self {
             input,
+            pads: Gamepads::new(rumble),
             pos: (0.0, 0.0),
         }
     }
@@ -125,6 +128,11 @@ impl MoonlightInput {
                     }
                 }
             }
+            gamepad::MULTI_CONTROLLER | gamepad::MULTI_CONTROLLER_OLD => {
+                if let Some((number, mask, state)) = gamepad::parse(body) {
+                    self.pads.update(number, mask, &state);
+                }
+            }
             other => debug!(
                 kind = format!("{other:#x}"),
                 "Moonlight input not handled yet"
@@ -132,8 +140,9 @@ impl MoonlightInput {
         }
     }
 
-    /// The client went away: let go of every key.
+    /// The client went away: let go of every key and unplug its gamepads.
     pub fn release_all(&mut self) {
+        self.pads.clear();
         self.input.keyboard(KeyboardEvent::Synchronize(
             ironrdp_pdu::input::fast_path::SynchronizeFlags::empty(),
         ));
@@ -264,7 +273,7 @@ mod tests {
     async fn moonlight_messages_reach_the_session() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let forwarder = InputForwarder::spawn(Box::new(Recorder(std::sync::Arc::clone(&seen))));
-        let mut input = MoonlightInput::new(forwarder);
+        let mut input = MoonlightInput::new(forwarder, std::sync::Arc::new(|_, _, _| {}));
         let desktop = (1920, 1080);
         // Queued pointer moves are merged (only the newest counts), so wait between them.
         let wait_for = |n: usize| {

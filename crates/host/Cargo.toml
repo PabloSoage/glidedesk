@@ -62,7 +62,12 @@ serde_json = { version = "1", optional = true }
 opus = "0.4"
 rusty_enet = "0.4"
 
+# Virtual gamepads for Moonlight's controllers.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+
 [target.'cfg(windows)'.dependencies]
+vigem-client = { version = "0.1", features = ["unstable_xtarget_notification"] }
 arboard = { version = "3", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",

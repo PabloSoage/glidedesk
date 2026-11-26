@@ -11,6 +11,8 @@
 | [str0m](https://github.com/algesten/str0m) (WebRTC) | host dependency (web front end) | MIT |
 | [opus](https://github.com/SpaceManiac/opus-rs) bindings, libopus | host dependency (web front end sound) | MIT or Apache-2.0; libopus BSD-3-Clause |
 | [rusty_enet](https://github.com/jabuwu/rusty_enet) (ENet 1.3 in Rust) | host dependency (Moonlight control stream) | MIT |
+| [evdev](https://github.com/cmr/evdev) | host dependency on Linux (virtual gamepads through uinput) | Apache-2.0 OR MIT |
+| [vigem-client](https://github.com/CasualX/vigem-client) | host dependency on Windows (virtual gamepads through ViGEmBus) | MIT |
 | `crates/desktop/src/probe.hevc`: a 256×144 HEVC test frame made with FFmpeg's `testsrc2` | desktop client | generated, no license |
 
 Code adapted from [Sunshine](https://github.com/LizardByte/Sunshine) or
@@ -24,11 +26,12 @@ and commit, and marked in the file header.
 | `crates/host/src/gamestream/identity.rs` (RSA-2048 self-signed identity) | Sunshine `src/httpcommon.cpp` | `224c6be` |
 | `crates/host/src/gamestream/mod.rs` (`/launch`, `/resume`, `/cancel`) | Sunshine `src/nvhttp.cpp` | `224c6be` |
 | `crates/host/src/gamestream/rtsp.rs` (RTSP handshake, `DESCRIBE` SDP, Opus layouts) | Sunshine `src/rtsp.cpp`, `src/audio.cpp`; moonlight-common-c `src/RtspConnection.c`, `src/SdpGenerator.c` | `224c6be`; `b4ee1ce` |
-| `crates/host/src/gamestream/stream.rs` (video packets, frame header, ports) | Sunshine `src/stream.cpp`; moonlight-common-c `src/Video.h`, `src/RtpVideoQueue.c`, `src/VideoDepacketizer.c` | `224c6be`; `b4ee1ce` |
+| `crates/host/src/gamestream/stream.rs` (video packets, frame header, ports, video encryption) | Sunshine `src/stream.cpp`; moonlight-common-c `src/Video.h`, `src/RtpVideoQueue.c`, `src/VideoDepacketizer.c` | `224c6be`; `b4ee1ce` |
 | `crates/host/src/gamestream/control.rs` (control stream encryption, message types) | Sunshine `src/stream.cpp`; moonlight-common-c `src/ControlStream.c` | `224c6be`; `b4ee1ce` |
-| `crates/host/src/gamestream/audio.rs` (audio packets, encryption, bitrate choice) | Sunshine `src/stream.cpp`, `src/audio.cpp`; moonlight-common-c `src/AudioStream.c`, `src/RtpAudioQueue.c` | `224c6be`; `b4ee1ce` |
+| `crates/host/src/gamestream/audio.rs` (audio packets, encryption, Opus layouts and bitrates) | Sunshine `src/stream.cpp`, `src/audio.cpp`; moonlight-common-c `src/AudioStream.c`, `src/RtpAudioQueue.c` | `224c6be`; `b4ee1ce` |
 | `crates/host/src/gamestream/fec.rs` (Reed-Solomon parity: GF(2^8) 0x11d, Cauchy matrix) | [nanors](https://github.com/sleepybishop/nanors) `rs.c` (MIT); Sunshine `src/stream.cpp` (`fec::encode`, which fields parity covers) | `a9b1636`; `224c6be` |
 | `crates/host/src/gamestream/input.rs` (input message layouts) | moonlight-common-c `src/Input.h`, `src/InputStream.c`; Sunshine `src/input.cpp` | `b4ee1ce`; `224c6be` |
+| `crates/host/src/gamestream/gamepad.rs` (controller message, button bits, rumble message) | moonlight-common-c `src/Input.h`, `src/Limelight.h`, `src/ControlStream.c`; Sunshine `src/input.cpp`, `src/stream.cpp` | `b4ee1ce`; `224c6be` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).

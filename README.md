@@ -135,7 +135,22 @@ so lost packets are rebuilt on Wi-Fi. Input and sound are always encrypted; vide
 when the client wants it (Moonlight on a PC with AES instructions always does) and always for
 clients outside private networks (anything but 10/8, 172.16/12, 192.168/16, 100.64/10, IPv6
 fc00::/7 and link-local). On GNOME the session's sound output is 7.1, so games and players can
-send surround; RDP and browsers get it mixed down to stereo. Not done yet: gamepads and touch.
+send surround; RDP and browsers get it mixed down to stereo.
+
+Each controller on the client becomes a virtual Xbox 360 pad in the session, with rumble going
+back to the client. On Linux this needs write access to `/dev/uinput`, which is root's only by
+default; a udev rule like Sunshine's gives it to a group:
+
+```sh
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="uinput", MODE="0660"' |
+  sudo tee /etc/udev/rules.d/60-glidedesk-uinput.rules
+sudo groupadd -f uinput && sudo usermod -aG uinput "$USER"   # then log in again
+sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
+```
+
+Anyone in that group can create input devices, so add only the user the server runs as. On
+Windows the pads need the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver.
+Not done yet: touch and pen (Moonlight turns them into mouse input for now), and gyro.
 
 If the "Stop screen sharing" button in GNOME's top bar is pressed, the server starts a new
 session by itself within about a second; clients stay connected. Windows that were full

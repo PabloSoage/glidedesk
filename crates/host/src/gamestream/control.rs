@@ -8,8 +8,8 @@
 //! naming the direction: "CC" from the client, "HC" from the host.
 //!
 //! What the host acts on: keyframe requests, reference frame invalidations (the encoder stops
-//! referencing the lost frames, or sends a keyframe if it cannot), keyboard and mouse
-//! ([`super::input`]) and the end of the connection.
+//! referencing the lost frames, or sends a keyframe if it cannot), keyboard, mouse and gamepads
+//! ([`super::input`]) and the end of the connection. What the host sends: gamepad rumble.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
-use rusty_enet::{Event, Host, HostSettings};
+use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use tracing::{debug, info, warn};
 
 use super::input::MoonlightInput;
@@ -37,6 +37,7 @@ const LOSS_STATS: u16 = 0x0201;
 const INPUT: u16 = 0x0206;
 const START_A: u16 = 0x0305;
 const START_B: u16 = 0x0307;
+const RUMBLE: u16 = 0x010b;
 
 /// Runs the control stream on its own thread (ENet polls a non-blocking socket).
 pub fn spawn(stream: Arc<Stream>, bind: SocketAddr, input: Option<InputForwarder>) -> Result<()> {
@@ -53,16 +54,42 @@ pub fn spawn(stream: Arc<Stream>, bind: SocketAddr, input: Option<InputForwarder
     std::thread::Builder::new()
         .name("gs-control".into())
         .spawn(move || {
-            let mut input = input.map(MoonlightInput::new);
-            run(host, &stream, &mut input)
+            // Rumble from the session's gamepads, to send from this thread.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let rumble: super::gamepad::Rumble = Arc::new(move |n, low, high| {
+                let _ = tx.send((n, low, high));
+            });
+            let mut input = input.map(|i| MoonlightInput::new(i, rumble));
+            run(host, &stream, &mut input, &rx)
         })?;
     Ok(())
 }
 
-fn run(mut host: Host<UdpSocket>, stream: &Stream, input: &mut Option<MoonlightInput>) {
+/// The connected client and the sequence number of the host's next message.
+#[derive(Default)]
+struct Client {
+    peer: Option<PeerID>,
+    seq: u32,
+}
+
+fn run(
+    mut host: Host<UdpSocket>,
+    stream: &Stream,
+    input: &mut Option<MoonlightInput>,
+    rumble: &std::sync::mpsc::Receiver<(u16, u16, u16)>,
+) {
+    let mut client = Client::default();
     loop {
+        while let Ok((n, low, high)) = rumble.try_recv() {
+            // Sunshine's control_rumble_t: a constant, controller, low and high motor (LE).
+            let mut payload = 0x00c0_ffee_u32.to_le_bytes().to_vec();
+            for v in [n, low, high] {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+            send(&mut host, stream, &mut client, RUMBLE, &payload);
+        }
         match host.service() {
-            Ok(Some(event)) => on_event(event, stream, input),
+            Ok(Some(event)) => on_event(event, stream, input, &mut client),
             Ok(None) => std::thread::sleep(Duration::from_millis(1)),
             // Windows reports ICMP errors for earlier sends on the next receive.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
@@ -74,7 +101,32 @@ fn run(mut host: Host<UdpSocket>, stream: &Stream, input: &mut Option<MoonlightI
     }
 }
 
-fn on_event(event: Event<'_, UdpSocket>, stream: &Stream, input: &mut Option<MoonlightInput>) {
+/// Sends a message to the connected client, encrypted.
+fn send(
+    host: &mut Host<UdpSocket>,
+    stream: &Stream,
+    client: &mut Client,
+    kind: u16,
+    payload: &[u8],
+) {
+    let (Some(peer), Some(launch)) = (client.peer, stream.launch()) else {
+        return;
+    };
+    let data = seal(&launch.key, client.seq, *b"HC", kind, payload);
+    client.seq = client.seq.wrapping_add(1);
+    if let Some(p) = host.get_peer_mut(peer)
+        && let Err(e) = p.send(0, &Packet::reliable(data.as_slice()))
+    {
+        debug!(?e, "Sending a control message failed");
+    }
+}
+
+fn on_event(
+    event: Event<'_, UdpSocket>,
+    stream: &Stream,
+    input: &mut Option<MoonlightInput>,
+    client: &mut Client,
+) {
     match event {
         Event::Connect { peer, data } => {
             let expected = stream.launch().map(|l| l.connect_data);
@@ -85,10 +137,17 @@ fn on_event(event: Event<'_, UdpSocket>, stream: &Stream, input: &mut Option<Moo
             }
             // As moonlight-common-c sets it for itself: 10 s without an answer ends it.
             peer.set_timeout(2, 10_000, 10_000);
+            *client = Client {
+                peer: Some(peer.id()),
+                seq: 0,
+            };
             info!(addr = ?peer.address(), "Moonlight control stream connected");
         }
         Event::Disconnect { peer, .. } => {
             info!(addr = ?peer.address(), "Moonlight control stream ended");
+            if client.peer == Some(peer.id()) {
+                client.peer = None;
+            }
             stream.end_video();
             if let Some(i) = input {
                 i.release_all();
@@ -165,7 +224,6 @@ pub fn open(key: &[u8; 16], data: &[u8]) -> Option<(u16, Vec<u8>)> {
 }
 
 /// Encrypts a message the way [`open`] reads it, from either side.
-#[cfg(test)]
 fn seal(key: &[u8; 16], seq: u32, direction: [u8; 2], kind: u16, payload: &[u8]) -> Vec<u8> {
     let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, key).unwrap());
     let mut plain = kind.to_le_bytes().to_vec();

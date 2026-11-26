@@ -15,6 +15,7 @@
 pub mod audio;
 pub mod control;
 pub mod fec;
+pub mod gamepad;
 pub mod http;
 pub mod identity;
 pub mod input;
