@@ -10,10 +10,11 @@
 //! - `/launch`, `/resume` and `/cancel`, the RTSP handshake ([`rtsp`]), video ([`stream`])
 //!   audio ([`audio`]) and the control stream ([`control`]).
 //!
-//! Not yet: surround sound, gamepads, touch and pen, FEC parity packets, encrypted video.
+//! Not yet: surround sound, gamepads, touch and pen, encrypted video.
 
 pub mod audio;
 pub mod control;
+pub mod fec;
 pub mod http;
 pub mod identity;
 pub mod input;

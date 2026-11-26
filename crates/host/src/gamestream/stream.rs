@@ -6,8 +6,9 @@
 //! 8-byte frame header and is cut into packets of the size the client asked for. Every packet
 //! carries an RTP header (12 bytes, with the extension bit), 4 reserved bytes and the
 //! GameStream video header (16 bytes), then its part of the frame; the last one is padded with
-//! zeros. Up to 255 packets form an FEC block (up to 4 blocks per frame). No parity packets are
-//! sent yet (FEC percentage 0), which the client accepts.
+//! zeros. The packets of a frame form up to 4 FEC blocks of at most 255 packets, each followed
+//! by Reed-Solomon parity packets ([`super::fec`], 20% by default as in Sunshine) from which
+//! the client rebuilds lost ones.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -96,6 +97,8 @@ pub struct Settings {
     /// Milliseconds of sound per audio packet.
     pub audio_ms: u32,
     pub audio_channels: u32,
+    /// Fewest parity packets per FEC block (`x-nv-vqos[0].fec.minRequiredFecPackets`).
+    pub min_parity: usize,
 }
 
 impl Settings {
@@ -114,7 +117,7 @@ impl Settings {
             bail!("packet size {packet_size} is out of range");
         }
         // Moonlight sends what the user picked as configuredBitrateKbps; maximumBitrateKbps is
-        // that less 20% for FEC (which is not sent yet).
+        // that less 20% for FEC.
         let bitrate = get("x-ml-video.configuredBitrateKbps")
             .filter(|&b| b > 0)
             .or_else(|| get("x-nv-vqos[0].bw.maximumBitrateKbps"))
@@ -145,6 +148,9 @@ impl Settings {
             audio_ms,
             audio_channels: u32::try_from(get("x-nv-audio.surround.numChannels").unwrap_or(2))
                 .unwrap_or(2),
+            min_parity: usize::try_from(get("x-nv-vqos[0].fec.minRequiredFecPackets").unwrap_or(0))
+                .unwrap_or(0)
+                .min(8),
         })
     }
 }
@@ -211,10 +217,10 @@ impl Stream {
         }
         let (w, h) = self.session.request_size(settings.width, settings.height);
         *self.session.wanted_refresh.lock().unwrap() = Some(settings.fps);
-        self.bitrate.store(
-            settings.bitrate_kbps.saturating_mul(1000),
-            Ordering::Relaxed,
-        );
+        // Leave room for the parity packets within what the user picked (as Sunshine does).
+        let video_kbps = settings.bitrate_kbps / 100 * (100 - FEC_PERCENT as u32);
+        self.bitrate
+            .store(video_kbps.saturating_mul(1000), Ordering::Relaxed);
         info!(
             w,
             h,
@@ -340,12 +346,28 @@ impl Output for GameStreamOutput {
                 frame_type,
                 timestamp,
                 packet_size: v.settings.packet_size,
+                fec_percent: FEC_PERCENT,
+                min_parity: v.settings.min_parity,
             },
             &mut v.seq,
             &mut buf,
         )?;
         let block = v.settings.packet_size + MAX_RTP_HEADER;
+        // GLIDEDESK_GS_TEST_DROP=N leaves out one packet in N, to see the client rebuild them
+        // from parity.
+        static DROP: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+            std::env::var("GLIDEDESK_GS_TEST_DROP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n > 1)
+        });
+        static SENT: AtomicU64 = AtomicU64::new(0);
         for p in 0..packets {
+            if let Some(n) = *DROP
+                && SENT.fetch_add(1, Ordering::Relaxed).is_multiple_of(n)
+            {
+                continue;
+            }
             if let Err(e) = self
                 .stream
                 .socket
@@ -472,9 +494,10 @@ const MAX_RTP_HEADER: usize = 16;
 /// RTP header (12) + reserved (4) + `NV_VIDEO_PACKET` (16).
 const HEADER: usize = 32;
 const FRAME_HEADER: usize = 8;
-/// Data packets per FEC block: 8-bit Reed-Solomon allows 255 shards (Sunshine
-/// `fec::max_data_shards` with no parity).
-const MAX_BLOCK_PACKETS: usize = 255;
+/// Shards (data and parity) in an FEC block: 8-bit Reed-Solomon.
+const MAX_SHARDS: usize = 255;
+/// Parity sent with the video, in percent of the data packets (Sunshine's default).
+pub const FEC_PERCENT: usize = 20;
 /// The FEC block number has 2 bits.
 const MAX_BLOCKS: usize = 4;
 /// The packet index within a block has 10 bits.
@@ -492,16 +515,49 @@ struct FrameInfo {
     /// 90 kHz.
     timestamp: u32,
     packet_size: usize,
+    /// Parity packets per block, in percent of its data packets (0: none).
+    fec_percent: usize,
+    /// The client's minimum of parity packets per block.
+    min_parity: usize,
 }
 
-/// Lays the packets of one frame out in `buf`, each `packet_size + 16` bytes; returns how
-/// many. `seq` is the RTP sequence number of the first and comes back past the last.
+/// Most data packets in an FEC block at `pct` percent parity: data and parity together stay
+/// within the 255 shards of 8-bit Reed-Solomon (Sunshine `fec::max_data_shards`).
+fn max_data_shards(pct: usize) -> usize {
+    MAX_SHARDS * 100 / (100 + pct)
+}
+
+/// Parity packets for a block of `ds` data packets, and the percentage to announce so that the
+/// client works out the same count (`(ds * pct + 99) / 100`). The client's minimum raises the
+/// count for small blocks, as Sunshine does.
+fn parity_for(ds: usize, pct: usize, min: usize) -> (usize, usize) {
+    if pct == 0 {
+        return (0, 0);
+    }
+    let mut parity = (ds * pct).div_ceil(100);
+    let mut pct = pct;
+    if parity < min {
+        parity = min;
+        pct = 100 * parity / ds;
+    }
+    (parity.min(MAX_SHARDS - ds), pct.min(255))
+}
+
+/// Lays the packets of one frame out in `buf`, each `packet_size + 16` bytes: per FEC block,
+/// its data packets and then its parity packets. Returns how many. `seq` is the RTP sequence
+/// number of the first and comes back past the last.
 fn packetize(data: &[u8], f: &FrameInfo, seq: &mut u16, buf: &mut Vec<u8>) -> Result<usize> {
     let block = f.packet_size + MAX_RTP_HEADER;
     let per_packet = block - HEADER;
     let total = FRAME_HEADER + data.len();
     let packets = total.div_ceil(per_packet);
-    let blocks = packets.div_ceil(MAX_BLOCK_PACKETS).clamp(1, MAX_BLOCKS);
+    let mut pct = f.fec_percent;
+    let mut blocks = packets.div_ceil(max_data_shards(pct)).max(1);
+    if blocks > MAX_BLOCKS {
+        // An enormous frame: no parity for it, as Sunshine does.
+        pct = 0;
+        blocks = packets.div_ceil(MAX_SHARDS).clamp(1, MAX_BLOCKS);
+    }
     let per_block = packets.div_ceil(blocks);
     if per_block > MAX_PACKETS_PER_BLOCK_FIELD {
         bail!("frame of {} bytes is too large to send", data.len());
@@ -518,41 +574,65 @@ fn packetize(data: &[u8], f: &FrameInfo, seq: &mut u16, buf: &mut Vec<u8>) -> Re
     header[4..6].copy_from_slice(&last.to_le_bytes());
 
     buf.clear();
-    buf.resize(packets * block, 0);
     let mut src = header.iter().chain(data.iter()).copied();
-    for p in 0..packets {
-        let (b, x) = (p / per_block, p % per_block);
-        let in_block = per_block.min(packets - b * per_block);
-        let out = &mut buf[p * block..(p + 1) * block];
-        // RTP: version 2 with the extension bit, sequence number and timestamp (big-endian).
-        out[0] = 0x80 | RTP_FLAG_EXTENSION;
-        out[2..4].copy_from_slice(&seq.to_be_bytes());
-        out[4..8].copy_from_slice(&f.timestamp.to_be_bytes());
-        // NV_VIDEO_PACKET (little-endian) after 4 reserved bytes.
-        let block_start = seq.wrapping_sub(x as u16);
-        let nv = &mut out[16..32];
-        nv[0..4].copy_from_slice(&((u32::from(block_start) + x as u32) << 8).to_le_bytes());
-        nv[4..8].copy_from_slice(&f.index.to_le_bytes());
-        let mut flags = FLAG_CONTAINS_PIC_DATA;
-        if x == 0 {
-            flags |= FLAG_SOF;
+    let mut count = 0;
+    let multi_fec = |b: usize| ((b << 4) | ((blocks - 1) << 6)) as u8;
+    for b in 0..blocks {
+        let ds = per_block.min(packets - b * per_block);
+        let (parity, block_pct) = parity_for(ds, pct, f.min_parity);
+        let fec_info =
+            |x: usize| ((x as u32) << 12) | ((ds as u32) << 22) | ((block_pct as u32) << 4);
+        let first = *seq;
+        buf.resize((count + ds + parity) * block, 0);
+        for x in 0..ds {
+            let out = &mut buf[(count + x) * block..(count + x + 1) * block];
+            // RTP: version 2 with the extension bit, sequence number and timestamp (BE).
+            out[0] = 0x80 | RTP_FLAG_EXTENSION;
+            let s = first.wrapping_add(x as u16);
+            out[2..4].copy_from_slice(&s.to_be_bytes());
+            out[4..8].copy_from_slice(&f.timestamp.to_be_bytes());
+            // NV_VIDEO_PACKET (LE) after 4 reserved bytes.
+            let nv = &mut out[16..32];
+            nv[0..4].copy_from_slice(&(u32::from(s) << 8).to_le_bytes());
+            nv[4..8].copy_from_slice(&f.index.to_le_bytes());
+            let mut flags = FLAG_CONTAINS_PIC_DATA;
+            if x == 0 {
+                flags |= FLAG_SOF;
+            }
+            if x == ds - 1 {
+                flags |= FLAG_EOF;
+            }
+            nv[8] = flags;
+            nv[10] = 0x10;
+            nv[11] = multi_fec(b);
+            nv[12..16].copy_from_slice(&fec_info(x).to_le_bytes());
+            for (dst, byte) in out[HEADER..].iter_mut().zip(&mut src) {
+                *dst = byte;
+            }
         }
-        if x == in_block - 1 {
-            flags |= FLAG_EOF;
+        if parity > 0 {
+            let (data_part, parity_part) =
+                buf[count * block..(count + ds + parity) * block].split_at_mut(ds * block);
+            let shards: Vec<&[u8]> = data_part.chunks(block).collect();
+            let mut outs: Vec<&mut [u8]> = parity_part.chunks_mut(block).collect();
+            super::fec::encode(&shards, &mut outs);
+            // Parity covers whole packets. Its own header gets only what the client reads
+            // from it; the client rebuilds those fields of a recovered packet itself.
+            for (k, out) in outs.iter_mut().enumerate() {
+                let x = ds + k;
+                out[0] = 0x80 | RTP_FLAG_EXTENSION;
+                out[2..4].copy_from_slice(&first.wrapping_add(x as u16).to_be_bytes());
+                out[4..8].copy_from_slice(&f.timestamp.to_be_bytes());
+                out[20..24].copy_from_slice(&f.index.to_le_bytes());
+                out[27] = multi_fec(b);
+                out[28..32].copy_from_slice(&fec_info(x).to_le_bytes());
+            }
         }
-        nv[8] = flags;
-        nv[10] = 0x10;
-        nv[11] = ((b << 4) | ((blocks - 1) << 6)) as u8;
-        let fec_info = ((x as u32) << 12) | ((in_block as u32) << 22);
-        nv[12..16].copy_from_slice(&fec_info.to_le_bytes());
-        for (dst, byte) in out[HEADER..].iter_mut().zip(&mut src) {
-            *dst = byte;
-        }
-        *seq = seq.wrapping_add(1);
+        count += ds + parity;
+        *seq = first.wrapping_add((ds + parity) as u16);
     }
-    Ok(packets)
+    Ok(count)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,78 +656,133 @@ mod tests {
                 audio_encrypted: false,
                 audio_ms: 5,
                 audio_channels: 2,
+                min_parity: 0,
             }
         );
         assert!(Settings::from_sdp("a=x-nv-video[0].maxFPS:60").is_err());
     }
 
-    /// Reassembles packets the way moonlight-common-c does: payloads in order, frame header
-    /// skipped.
-    fn reassemble(buf: &[u8], packets: usize, packet_size: usize) -> Vec<u8> {
-        let block = packet_size + MAX_RTP_HEADER;
-        let mut out = Vec::new();
-        for p in 0..packets {
-            out.extend_from_slice(&buf[p * block + HEADER..(p + 1) * block]);
+    /// One packet as the client reads it.
+    struct Seen {
+        seq: u16,
+        index_in_block: usize,
+        data_shards: usize,
+        pct: usize,
+        block: usize,
+        last_block: usize,
+        flags: u8,
+        frame: u32,
+    }
+
+    fn seen(pkt: &[u8]) -> Seen {
+        let nv = &pkt[16..32];
+        let fec = u32::from_le_bytes(nv[12..16].try_into().unwrap());
+        Seen {
+            seq: u16::from_be_bytes([pkt[2], pkt[3]]),
+            index_in_block: ((fec >> 12) & 0x3ff) as usize,
+            data_shards: (fec >> 22) as usize,
+            pct: ((fec >> 4) & 0xff) as usize,
+            block: usize::from((nv[11] >> 4) & 3),
+            last_block: usize::from((nv[11] >> 6) & 3),
+            flags: nv[8],
+            frame: u32::from_le_bytes(nv[4..8].try_into().unwrap()),
         }
-        out.drain(..FRAME_HEADER);
-        out
+    }
+
+    fn frame(len: usize, packet_size: usize, fec_percent: usize) -> (Vec<u8>, Vec<u8>, usize) {
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3 + i / 251) as u8).collect();
+        let mut seq = 65530u16;
+        let mut buf = Vec::new();
+        let f = FrameInfo {
+            index: 9,
+            frame_type: 2,
+            timestamp: 1234,
+            packet_size,
+            fec_percent,
+            min_parity: 2,
+        };
+        let n = packetize(&data, &f, &mut seq, &mut buf).unwrap();
+        assert_eq!(seq, 65530u16.wrapping_add(n as u16));
+        (data, buf, n)
     }
 
     #[test]
     fn frames_are_cut_like_sunshine() {
         let packet_size = 1024;
-        let per_packet = packet_size + MAX_RTP_HEADER - HEADER;
-        for len in [
-            1usize,
-            per_packet - FRAME_HEADER,
-            per_packet,
-            300 * per_packet + 7,
-        ] {
-            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-            let mut seq = 65530u16;
-            let mut buf = Vec::new();
-            let f = FrameInfo {
-                index: 9,
-                frame_type: 2,
-                timestamp: 1234,
-                packet_size,
-            };
-            let n = packetize(&data, &f, &mut seq, &mut buf).unwrap();
-            assert_eq!(n, (len + FRAME_HEADER).div_ceil(per_packet));
-            assert_eq!(seq, 65530u16.wrapping_add(n as u16));
-            assert_eq!(&reassemble(&buf, n, packet_size)[..len], &data[..]);
-            let block = packet_size + MAX_RTP_HEADER;
-            // Frame header on the first packet.
-            assert_eq!(buf[HEADER], 1);
-            assert_eq!(buf[HEADER + 3], 2);
-            let blocks = n.div_ceil(255);
-            for p in 0..n {
-                let pkt = &buf[p * block..(p + 1) * block];
-                assert_eq!(pkt[0], 0x90);
-                assert_eq!(
-                    u16::from_be_bytes([pkt[2], pkt[3]]),
-                    65530u16.wrapping_add(p as u16)
-                );
-                let nv = &pkt[16..32];
-                assert_eq!(u32::from_le_bytes(nv[4..8].try_into().unwrap()), 9);
-                let fec = u32::from_le_bytes(nv[12..16].try_into().unwrap());
-                let index_in_block = (fec >> 12) & 0x3ff;
-                let shards = (fec >> 22) as usize;
-                // What the client checks: the block starts at seq - index, and the shard count
-                // and block numbers stay the same within a block.
-                assert_eq!((fec >> 4) & 0xff, 0);
-                assert_eq!(usize::from((nv[11] >> 6) & 3), blocks - 1);
-                let b = usize::from((nv[11] >> 4) & 3);
-                assert!(shards <= 255 && index_in_block < shards as u32);
-                if index_in_block == 0 {
-                    assert_ne!(nv[8] & FLAG_SOF, 0);
+        let block = packet_size + MAX_RTP_HEADER;
+        let per_packet = block - HEADER;
+        for fec_percent in [0, FEC_PERCENT] {
+            for len in [
+                1usize,
+                per_packet - FRAME_HEADER,
+                per_packet,
+                300 * per_packet + 7,
+            ] {
+                let (data, buf, n) = frame(len, packet_size, fec_percent);
+                // Walk the packets as the client does: each block's data, then its parity.
+                let mut payload = Vec::new();
+                let mut p = 0;
+                let mut blocks = 0;
+                while p < n {
+                    let first = seen(&buf[p * block..(p + 1) * block]);
+                    assert_eq!(first.index_in_block, 0);
+                    assert_eq!(first.block, blocks);
+                    let ds = first.data_shards;
+                    // The client's own count: (ds * pct + 99) / 100.
+                    let parity = (ds * first.pct).div_ceil(100);
+                    if fec_percent > 0 {
+                        assert!(parity >= 2, "the client's minimum");
+                    }
+                    assert!(ds + parity <= 255);
+                    for x in 0..ds + parity {
+                        let pkt = &buf[(p + x) * block..(p + x + 1) * block];
+                        let s = seen(pkt);
+                        assert_eq!(pkt[0], 0x90);
+                        assert_eq!(s.seq, first.seq.wrapping_add(x as u16));
+                        assert_eq!((s.index_in_block, s.data_shards, s.pct), (x, ds, first.pct));
+                        assert_eq!((s.block, s.frame), (blocks, 9));
+                        if x < ds {
+                            assert_eq!(s.flags & FLAG_SOF != 0, x == 0);
+                            assert_eq!(s.flags & FLAG_EOF != 0, x == ds - 1);
+                            payload.extend_from_slice(&pkt[HEADER..]);
+                        }
+                    }
+                    p += ds + parity;
+                    blocks += 1;
                 }
-                assert_eq!(nv[8] & FLAG_EOF != 0, index_in_block as usize == shards - 1);
-                assert!(b < blocks);
+                assert_eq!(p, n);
+                assert_eq!(seen(&buf[..block]).last_block, blocks - 1);
+                assert_eq!(buf[HEADER], 1);
+                assert_eq!(buf[HEADER + 3], 2);
+                payload.drain(..FRAME_HEADER);
+                assert_eq!(&payload[..len], &data[..]);
             }
         }
     }
 
+    #[test]
+    fn lost_packets_are_recovered_from_parity() {
+        let packet_size = 1024;
+        let block = packet_size + MAX_RTP_HEADER;
+        let (_, buf, n) = frame(40 * (block - HEADER), packet_size, FEC_PERCENT);
+        let ds = seen(&buf[..block]).data_shards;
+        assert_eq!(n, ds + (ds * FEC_PERCENT).div_ceil(100));
+        let shards: Vec<Vec<u8>> = buf.chunks(block).map(<[u8]>::to_vec).collect();
+        let (data, parity) = shards.split_at(ds);
+        let mut damaged = data.to_vec();
+        let lost = [0, 7, ds - 1];
+        for &i in &lost {
+            damaged[i] = vec![0; block];
+        }
+        super::super::fec::tests::recover(&mut damaged, &lost, parity);
+        // What the client keeps from a recovered packet (it rebuilds the RTP header, frame
+        // number and block numbers itself): packet index, flags and the payload.
+        for &i in &lost {
+            assert_eq!(damaged[i][16..20], data[i][16..20]);
+            assert_eq!(damaged[i][24..27], data[i][24..27]);
+            assert_eq!(damaged[i][HEADER..], data[i][HEADER..]);
+        }
+    }
     #[test]
     fn ping_payload_is_hex() {
         let l = Launch::new([0; 16], 7, [10, 0, 0, 2].into(), 1, "Desktop");
