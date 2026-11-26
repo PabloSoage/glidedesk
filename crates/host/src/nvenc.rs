@@ -156,7 +156,11 @@ impl Encoder {
         }
         this.initialize()?;
         this.allocate()?;
-        info!(?cfg, invalidation = this.invalidation, "NVENC encoder ready");
+        info!(
+            ?cfg,
+            invalidation = this.invalidation,
+            "NVENC encoder ready"
+        );
         Ok(this)
     }
 

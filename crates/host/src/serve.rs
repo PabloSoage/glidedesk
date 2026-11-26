@@ -57,6 +57,8 @@ pub struct ServeOptions {
     pub username: String,
     pub password: String,
     pub state_dir: PathBuf,
+    /// GameStream (Moonlight) HTTP and HTTPS addresses; `None` turns it off.
+    pub gamestream: Option<(SocketAddr, SocketAddr)>,
 }
 
 /// Output index of RDP in the pipeline (the others follow in the order they are added).
@@ -313,10 +315,27 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
     #[cfg(not(feature = "web"))]
     let web = std::future::pending::<Result<()>>();
+    let gamestream = async {
+        match opts.gamestream {
+            Some((http_bind, https_bind)) => {
+                crate::gamestream::run(crate::gamestream::Front {
+                    http_bind,
+                    https_bind,
+                    state_dir: opts.state_dir.clone(),
+                    password: opts.password.clone(),
+                    auth_limiter: Arc::clone(&auth_limiter),
+                    hevc,
+                })
+                .await
+            }
+            None => std::future::pending().await,
+        }
+    };
     let r = tokio::select! {
         r = rdp => r,
         r = native => r,
         r = web => r,
+        r = gamestream => r,
     };
     shared.stop.store(true, Ordering::Relaxed);
     let _ = pipeline_thread.join();

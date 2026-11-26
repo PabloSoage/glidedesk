@@ -2,6 +2,7 @@
 // GNOME-only test commands unused.
 #![cfg_attr(not(feature = "gnome"), allow(dead_code, unused_imports))]
 
+mod apps;
 #[cfg(feature = "gnome")]
 mod audio;
 mod auth;
@@ -14,6 +15,7 @@ mod csc;
 mod encoder;
 mod ffenc;
 mod frame;
+mod gamestream;
 #[cfg(feature = "gnome")]
 mod gnome;
 mod gpu;
@@ -126,6 +128,37 @@ enum Command {
         /// queue short (lower latency); higher ones absorb network jitter.
         #[arg(long, default_value_t = 2)]
         max_in_flight: u32,
+        /// Also serve Moonlight clients (GameStream on 47989/tcp and 47984/tcp). For now only
+        /// pairing and the app list: streaming is not done yet.
+        #[arg(long)]
+        gamestream: bool,
+    },
+    /// Run only the GameStream front end (pairing, server info, app list), for testing
+    /// Moonlight clients without a session.
+    #[command(hide = true)]
+    GamestreamTest {
+        #[arg(long, default_value = "127.0.0.1")]
+        ip: std::net::IpAddr,
+        #[arg(long)]
+        state_dir: std::path::PathBuf,
+        #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
+        password: String,
+        /// HTTP port; HTTPS goes 5 below, as in GameStream.
+        #[arg(long, default_value_t = gamestream::HTTP_PORT)]
+        port: u16,
+    },
+    /// Pair a Moonlight client with the running host: give the PIN the client shows. Without
+    /// a PIN, lists the clients waiting.
+    Pair {
+        pin: Option<String>,
+        /// Part of the device name, when several clients are waiting.
+        #[arg(long)]
+        device: Option<String>,
+        /// The host's password; read from GLIDEDESK_PASSWORD when not given.
+        #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
+        password: String,
+        #[arg(long, default_value_t = gamestream::HTTP_PORT)]
+        port: u16,
     },
     #[cfg(feature = "gnome")]
     /// Capture the session for a few seconds, resize half way, and report frame rates.
@@ -196,6 +229,7 @@ async fn main() -> Result<()> {
             no_hybrid,
             no_refine,
             max_in_flight,
+            gamestream,
         } => {
             #[cfg(feature = "gnome")]
             capture::set_refresh_rate(refresh);
@@ -242,8 +276,45 @@ async fn main() -> Result<()> {
                     .unwrap_or_default(),
                 password,
                 state_dir,
+                gamestream: gamestream.then(|| {
+                    (
+                        std::net::SocketAddr::new(bind.ip(), gamestream::HTTP_PORT),
+                        std::net::SocketAddr::new(bind.ip(), gamestream::HTTPS_PORT),
+                    )
+                }),
             })
             .await
+        }
+        Command::GamestreamTest {
+            ip,
+            state_dir,
+            password,
+            port,
+        } => {
+            gamestream::run(gamestream::Front {
+                http_bind: std::net::SocketAddr::new(ip, port),
+                https_bind: std::net::SocketAddr::new(ip, port - 5),
+                state_dir,
+                password,
+                auth_limiter: std::sync::Arc::new(auth::RateLimiter::new()),
+                hevc: true,
+            })
+            .await
+        }
+        Command::Pair {
+            pin,
+            device,
+            password,
+            port,
+        } => {
+            let out =
+                gamestream::send_pin(port, &password, pin.as_deref(), device.as_deref()).await?;
+            if pin.is_none() && out.is_empty() {
+                println!("No Moonlight client is waiting for a PIN.");
+            } else {
+                print!("{out}");
+            }
+            Ok(())
         }
         #[cfg(feature = "gnome")]
         Command::CaptureTest {
