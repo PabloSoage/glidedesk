@@ -10,11 +10,12 @@
 //! - `/launch`, `/resume` and `/cancel`, the RTSP handshake ([`rtsp`]), video ([`stream`])
 //!   and the control stream ([`control`]).
 //!
-//! Not yet: audio, input, FEC parity packets, encrypted video.
+//! Not yet: audio, gamepads, touch and pen, FEC parity packets, encrypted video.
 
 pub mod control;
 pub mod http;
 pub mod identity;
+pub mod input;
 pub mod pair;
 pub mod rtsp;
 pub mod stream;
@@ -56,6 +57,8 @@ pub struct Front {
     pub stream: Option<Arc<stream::Stream>>,
     /// Opens the app a client launches.
     pub apps: Option<Arc<crate::apps::Runner>>,
+    /// The session's keyboard and mouse.
+    pub input: Option<crate::input::InputForwarder>,
 }
 
 struct State {
@@ -84,7 +87,11 @@ pub async fn run(front: Front) -> Result<()> {
     );
     if let Some(s) = &front.stream {
         let ip = front.http_bind.ip();
-        control::spawn(Arc::clone(s), SocketAddr::new(ip, s.ports.control))?;
+        control::spawn(
+            Arc::clone(s),
+            SocketAddr::new(ip, s.ports.control),
+            front.input.clone(),
+        )?;
         let rtsp = rtsp::run(Arc::clone(s), SocketAddr::new(ip, s.ports.rtsp));
         tokio::spawn(async move {
             if let Err(e) = rtsp.await {

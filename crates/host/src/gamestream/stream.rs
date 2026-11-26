@@ -221,6 +221,11 @@ impl Stream {
         }
     }
 
+    /// Size of the desktop being captured, for pointer positions.
+    pub fn desktop_size(&self) -> (u32, u32) {
+        *self.session.current_size.lock().unwrap()
+    }
+
     pub fn request_keyframe(&self) {
         self.keyframe.store(true, Ordering::SeqCst);
     }

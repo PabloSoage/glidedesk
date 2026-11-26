@@ -132,7 +132,7 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         max_in_flight: u32,
         /// Also serve Moonlight clients (GameStream: 47989/tcp, 47984/tcp, RTSP 48010/tcp,
-        /// video 47998/udp, control 47999/udp). Video only so far: no audio or input yet.
+        /// video 47998/udp, control and input 47999/udp). No audio or gamepads yet.
         #[arg(long)]
         gamestream: bool,
     },
@@ -303,6 +303,7 @@ async fn main() -> Result<()> {
                 hevc: true,
                 stream: None,
                 apps: None,
+                input: None,
             })
             .await
         }

@@ -129,8 +129,8 @@ GLIDEDESK_PASSWORD='...' glidedesk-host pair 1234    # without a PIN: lists who 
 
 Paired clients see the apps from `apps.conf` (plus **Desktop**) and can stream them: video in
 H.264 or HEVC at the resolution, frame rate and bitrate chosen in Moonlight. Streaming also uses
-48010/tcp (RTSP), 47998/udp (video) and 47999/udp (control). Not done yet: audio, keyboard,
-mouse and gamepads, and the FEC packets that cover losses on Wi-Fi.
+48010/tcp (RTSP), 47998/udp (video) and 47999/udp (control, with keyboard and mouse). Not done
+yet: audio, gamepads, touch, and the FEC packets that cover losses on Wi-Fi.
 
 If the "Stop screen sharing" button in GNOME's top bar is pressed, the server starts a new
 session by itself within about a second; clients stay connected. Windows that were full

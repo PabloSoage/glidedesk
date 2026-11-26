@@ -343,6 +343,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                     hevc,
                     stream: gamestream_stream,
                     apps: Some(Arc::clone(&apps)),
+                    input: Some(input.clone()),
                 })
                 .await
             }

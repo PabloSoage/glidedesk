@@ -7,8 +7,8 @@
 //! and payload. The 12-byte IV is the sequence number (LE) followed by zeros and two bytes
 //! naming the direction: "CC" from the client, "HC" from the host.
 //!
-//! What the host acts on so far: keyframe requests (and reference invalidations, answered with
-//! a keyframe) and the end of the connection. Input comes next.
+//! What the host acts on: keyframe requests (and reference invalidations, answered with a
+//! keyframe), keyboard and mouse ([`super::input`]) and the end of the connection.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -19,7 +19,9 @@ use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use rusty_enet::{Event, Host, HostSettings};
 use tracing::{debug, info, warn};
 
+use super::input::MoonlightInput;
 use super::stream::Stream;
+use crate::input::InputForwarder;
 
 /// ENet channels Moonlight opens (moonlight-common-c `CTRL_CHANNEL_COUNT`).
 const CHANNELS: usize = 0x30;
@@ -36,7 +38,7 @@ const START_A: u16 = 0x0305;
 const START_B: u16 = 0x0307;
 
 /// Runs the control stream on its own thread (ENet polls a non-blocking socket).
-pub fn spawn(stream: Arc<Stream>, bind: SocketAddr) -> Result<()> {
+pub fn spawn(stream: Arc<Stream>, bind: SocketAddr, input: Option<InputForwarder>) -> Result<()> {
     let socket = UdpSocket::bind(bind).with_context(|| format!("binding UDP {bind}"))?;
     let host = Host::new(
         socket,
@@ -49,14 +51,17 @@ pub fn spawn(stream: Arc<Stream>, bind: SocketAddr) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("ENet host: {e:?}"))?;
     std::thread::Builder::new()
         .name("gs-control".into())
-        .spawn(move || run(host, &stream))?;
+        .spawn(move || {
+            let mut input = input.map(MoonlightInput::new);
+            run(host, &stream, &mut input)
+        })?;
     Ok(())
 }
 
-fn run(mut host: Host<UdpSocket>, stream: &Stream) {
+fn run(mut host: Host<UdpSocket>, stream: &Stream, input: &mut Option<MoonlightInput>) {
     loop {
         match host.service() {
-            Ok(Some(event)) => on_event(event, stream),
+            Ok(Some(event)) => on_event(event, stream, input),
             Ok(None) => std::thread::sleep(Duration::from_millis(1)),
             // Windows reports ICMP errors for earlier sends on the next receive.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
@@ -68,7 +73,7 @@ fn run(mut host: Host<UdpSocket>, stream: &Stream) {
     }
 }
 
-fn on_event(event: Event<'_, UdpSocket>, stream: &Stream) {
+fn on_event(event: Event<'_, UdpSocket>, stream: &Stream, input: &mut Option<MoonlightInput>) {
     match event {
         Event::Connect { peer, data } => {
             let expected = stream.launch().map(|l| l.connect_data);
@@ -84,26 +89,33 @@ fn on_event(event: Event<'_, UdpSocket>, stream: &Stream) {
         Event::Disconnect { peer, .. } => {
             info!(addr = ?peer.address(), "Moonlight control stream ended");
             stream.end_video();
+            if let Some(i) = input {
+                i.release_all();
+            }
         }
         Event::Receive { packet, .. } => {
             let Some(launch) = stream.launch() else {
                 return;
             };
             match open(&launch.key, packet.data()) {
-                Some((kind, payload)) => on_message(kind, &payload, stream),
+                Some((kind, payload)) => on_message(kind, &payload, stream, input),
                 None => debug!(len = packet.data().len(), "Dropped a control message"),
             }
         }
     }
 }
 
-fn on_message(kind: u16, payload: &[u8], stream: &Stream) {
+fn on_message(kind: u16, payload: &[u8], stream: &Stream, input: &mut Option<MoonlightInput>) {
     match kind {
         REQUEST_IDR | INVALIDATE_REFS => {
             debug!(kind, "Moonlight asked for a keyframe");
             stream.request_keyframe();
         }
-        INPUT => debug!(len = payload.len(), "Input (not handled yet)"),
+        INPUT => {
+            if let Some(i) = input {
+                i.handle(payload, stream.desktop_size());
+            }
+        }
         PERIODIC_PING | LOSS_STATS | START_A | START_B => {}
         other => debug!(
             kind = format!("{other:#06x}"),
