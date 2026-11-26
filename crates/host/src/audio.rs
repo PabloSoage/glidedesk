@@ -1,9 +1,11 @@
 //! Session audio from PipeWire (GNOME sessions).
 //!
-//! The host creates a virtual sink in PipeWire (`support.null-audio-sink`) and makes it the
+//! The host creates a virtual 7.1 sink in PipeWire (`support.null-audio-sink`) and makes it the
 //! default output, so applications in the session play into it; its monitor is captured as
-//! 48 kHz stereo S16 and broadcast in 20 ms blocks to the front ends ([`crate::sound`] for RDP). The sink disappears with
-//! the host.
+//! 48 kHz 7.1 S16 in 20 ms blocks. Those go as they are to front ends that take surround sound
+//! (Moonlight) and mixed down to stereo to the others ([`crate::sound`] for RDP). PipeWire
+//! does not spread stereo over the other channels (checked on the server, 26/11), so stereo
+//! applications reach stereo clients unchanged. The sink disappears with the host.
 
 use std::thread;
 use std::time::Duration;
@@ -15,27 +17,37 @@ use pw::spa::pod::Pod;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use crate::sound::{BLOCK, CHANNELS, RATE};
+use crate::sound::{BLOCK, CHANNELS, RATE, SURROUND_CHANNELS};
 
 const SINK_NAME: &str = "glidedesk-audio";
+/// Bytes per 20 ms block of 7.1.
+const SURROUND_BLOCK: usize = BLOCK / CHANNELS as usize * SURROUND_CHANNELS;
 
-/// Starts the PipeWire side; audio blocks are broadcast to whichever connection is playing.
-pub fn start() -> Result<broadcast::Sender<Vec<u8>>> {
+type Blocks = broadcast::Sender<Vec<u8>>;
+
+/// Starts the PipeWire side; audio blocks are broadcast to whichever connection is playing:
+/// stereo, and 7.1.
+pub fn start() -> Result<(Blocks, Blocks)> {
     let (tx, _) = broadcast::channel(32);
-    let sender = tx.clone();
+    let (surround_tx, _) = broadcast::channel(32);
+    let (sender, surround) = (tx.clone(), surround_tx.clone());
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     thread::Builder::new().name("audio".into()).spawn(move || {
-        if let Err(e) = run(sender, &ready_tx) {
+        if let Err(e) = run(sender, surround, &ready_tx) {
             let _ = ready_tx.send(Err(e));
         }
     })?;
     ready_rx
         .recv()
         .map_err(|_| anyhow!("audio thread exited"))??;
-    Ok(tx)
+    Ok((tx, surround_tx))
 }
 
-fn run(out: broadcast::Sender<Vec<u8>>, ready: &std::sync::mpsc::Sender<Result<()>>) -> Result<()> {
+fn run(
+    out: broadcast::Sender<Vec<u8>>,
+    surround: broadcast::Sender<Vec<u8>>,
+    ready: &std::sync::mpsc::Sender<Result<()>>,
+) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -48,7 +60,7 @@ fn run(out: broadcast::Sender<Vec<u8>>, ready: &std::sync::mpsc::Sender<Result<(
             *pw::keys::NODE_NAME => SINK_NAME,
             *pw::keys::NODE_DESCRIPTION => "Remote desktop (glidedesk)",
             *pw::keys::MEDIA_CLASS => "Audio/Sink",
-            "audio.position" => "FL,FR",
+            "audio.position" => "FL,FR,FC,LFE,RL,RR,SL,SR",
             "audio.rate" => "48000",
             "object.linger" => "false",
         },
@@ -65,7 +77,9 @@ fn run(out: broadcast::Sender<Vec<u8>>, ready: &std::sync::mpsc::Sender<Result<(
             "target.object" => SINK_NAME,
         },
     )?;
-    let mut pending: Vec<u8> = Vec::with_capacity(BLOCK * 2);
+    let mut pending: Vec<u8> = Vec::with_capacity(SURROUND_BLOCK * 2);
+    let mut samples71: Vec<i16> = Vec::with_capacity(SURROUND_BLOCK / 2);
+    let mut stereo: Vec<i16> = Vec::with_capacity(BLOCK / 2);
     let _listener = stream
         .add_local_listener_with_user_data(())
         .param_changed(|_, _, id, param| {
@@ -91,10 +105,23 @@ fn run(out: broadcast::Sender<Vec<u8>>, ready: &std::sync::mpsc::Sender<Result<(
                 return;
             };
             pending.extend_from_slice(samples);
-            while pending.len() >= BLOCK {
-                let block: Vec<u8> = pending.drain(..BLOCK).collect();
+            while pending.len() >= SURROUND_BLOCK {
+                let block: Vec<u8> = pending.drain(..SURROUND_BLOCK).collect();
                 // No receiver: no client is playing; the block is dropped.
-                let _ = out.send(block);
+                if out.receiver_count() > 0 {
+                    samples71.clear();
+                    samples71.extend(
+                        block
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|b| i16::from_le_bytes(*b)),
+                    );
+                    stereo.clear();
+                    crate::sound::downmix_71(&samples71, &mut stereo);
+                    let _ = out.send(stereo.iter().flat_map(|s| s.to_le_bytes()).collect());
+                }
+                let _ = surround.send(block);
             }
         })
         .register()?;
@@ -102,10 +129,18 @@ fn run(out: broadcast::Sender<Vec<u8>>, ready: &std::sync::mpsc::Sender<Result<(
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::S16LE);
     info.set_rate(RATE);
-    info.set_channels(u32::from(CHANNELS));
+    info.set_channels(SURROUND_CHANNELS as u32);
     let mut position = [0; spa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
-    position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
-    position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
+    position[..SURROUND_CHANNELS].copy_from_slice(&[
+        spa::sys::SPA_AUDIO_CHANNEL_FL,
+        spa::sys::SPA_AUDIO_CHANNEL_FR,
+        spa::sys::SPA_AUDIO_CHANNEL_FC,
+        spa::sys::SPA_AUDIO_CHANNEL_LFE,
+        spa::sys::SPA_AUDIO_CHANNEL_RL,
+        spa::sys::SPA_AUDIO_CHANNEL_RR,
+        spa::sys::SPA_AUDIO_CHANNEL_SL,
+        spa::sys::SPA_AUDIO_CHANNEL_SR,
+    ]);
     info.set_position(position);
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),

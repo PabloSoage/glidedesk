@@ -129,8 +129,8 @@ enum Command {
         /// queue short (lower latency); higher ones absorb network jitter.
         #[arg(long, default_value_t = 2)]
         max_in_flight: u32,
-        /// Also serve Moonlight clients (GameStream on 47989/tcp and 47984/tcp). For now only
-        /// pairing and the app list: streaming is not done yet.
+        /// Also serve Moonlight clients (GameStream: 47989/tcp, 47984/tcp, RTSP 48010/tcp,
+        /// video 47998/udp, control and input 47999/udp, sound 48000/udp). No gamepads yet.
         #[arg(long)]
         gamestream: bool,
     },
@@ -299,6 +299,9 @@ async fn main() -> Result<()> {
                 password,
                 auth_limiter: std::sync::Arc::new(auth::RateLimiter::new()),
                 hevc: true,
+                stream: None,
+                apps: None,
+                input: None,
             })
             .await
         }

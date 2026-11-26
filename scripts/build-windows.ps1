@@ -26,6 +26,16 @@ function Find-Vcpkg {
 }
 
 $vcpkg = Find-Vcpkg
+
+# libopus (sound for Moonlight and browsers) is built with CMake: the one that comes with
+# Visual Studio / Build Tools if there is none on PATH.
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue) -and -not $env:CMAKE) {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    foreach ($vs in & $vswhere -all -products * -property installationPath) {
+        $cmake = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+        if (Test-Path $cmake) { $env:CMAKE = $cmake; break }
+    }
+}
 # The host (--host) needs FFmpeg's encoders too: the manifest's "host" feature, installed apart.
 $hostBuild = $args -contains '--host'
 $rest = $args | Where-Object { $_ -ne '--host' }

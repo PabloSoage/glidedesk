@@ -16,6 +16,21 @@ pub const RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
 /// Bytes per 20 ms block of 48 kHz stereo S16.
 pub const BLOCK: usize = (RATE as usize / 50) * CHANNELS as usize * 2;
+/// Channels of the surround sound where the session has it (7.1: FL FR FC LFE RL RR SL SR,
+/// Moonlight's order too).
+pub const SURROUND_CHANNELS: usize = 8;
+
+/// 7.1 samples (interleaved) to stereo: centre and surrounds at -3 dB into their side
+/// (ITU-R BS.775), no LFE. Stereo that was played into the 7.1 output comes back unchanged.
+pub fn downmix_71(src: &[i16], out: &mut Vec<i16>) {
+    const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let clamp = |v: f32| v.round().clamp(-32768.0, 32767.0) as i16;
+    for f in src.as_chunks::<SURROUND_CHANNELS>().0 {
+        let [fl, fr, fc, _lfe, rl, rr, sl, sr] = f.map(f32::from);
+        out.push(clamp(fl + K * (fc + rl + sl)));
+        out.push(clamp(fr + K * (fc + rr + sr)));
+    }
+}
 const BLOCK_MS: u32 = 20;
 /// Above this much audio queued beyond the client's own buffering, blocks are dropped until
 /// it is back under `QUEUE_LOW_MS`.
