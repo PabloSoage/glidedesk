@@ -95,7 +95,7 @@ Useful options of `serve` (`--help` lists them all):
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
 | `--avc444` | off | full-chroma AVC444 for RDP clients (experimental: `mstsc` shows it blurred) |
 | `--x11 :0` | | serve an existing X11 display instead of a GNOME session (see Termux below) |
-| `--gamestream` | off | also answer Moonlight clients (pairing and app list only for now; see below) |
+| `--gamestream` | off | also answer Moonlight clients (pairing, app list and video so far; see below) |
 
 The TLS certificate is self-signed, created in `~/.config/glidedesk/` on first start.
 
@@ -127,8 +127,10 @@ Moonlight, which shows a PIN, and type it on the server:
 GLIDEDESK_PASSWORD='...' glidedesk-host pair 1234    # without a PIN: lists who is waiting
 ```
 
-Paired clients see the apps from `apps.conf` (plus **Desktop**). Streaming to Moonlight is not
-done yet.
+Paired clients see the apps from `apps.conf` (plus **Desktop**) and can stream them: video in
+H.264 or HEVC at the resolution, frame rate and bitrate chosen in Moonlight. Streaming also uses
+48010/tcp (RTSP), 47998/udp (video) and 47999/udp (control). Not done yet: audio, keyboard,
+mouse and gamepads, and the FEC packets that cover losses on Wi-Fi.
 
 If the "Stop screen sharing" button in GNOME's top bar is pressed, the server starts a new
 session by itself within about a second; clients stay connected. Windows that were full

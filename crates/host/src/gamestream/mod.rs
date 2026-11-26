@@ -6,13 +6,18 @@
 //! - HTTP on 47989 and HTTPS on 47984 (the client presents its certificate; only paired
 //!   clients get past `/serverinfo` and `/pair`);
 //! - pairing with a PIN ([`pair`]), typed on the host with `glidedesk-host pair <PIN>`;
-//! - `/serverinfo` and `/applist` (the host's [`crate::apps`]).
+//! - `/serverinfo` and `/applist` (the host's [`crate::apps`]);
+//! - `/launch`, `/resume` and `/cancel`, the RTSP handshake ([`rtsp`]), video ([`stream`])
+//!   and the control stream ([`control`]).
 //!
-//! Streaming (`/launch`, RTSP, video, audio, input) comes next.
+//! Not yet: audio, input, FEC parity packets, encrypted video.
 
+pub mod control;
 pub mod http;
 pub mod identity;
 pub mod pair;
+pub mod rtsp;
+pub mod stream;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -46,6 +51,11 @@ pub struct Front {
     pub password: String,
     pub auth_limiter: Arc<crate::auth::RateLimiter>,
     pub hevc: bool,
+    /// The pipeline's GameStream output; `None` when there is nothing to stream (the
+    /// `gamestream-test` command).
+    pub stream: Option<Arc<stream::Stream>>,
+    /// Opens the app a client launches.
+    pub apps: Option<Arc<crate::apps::Runner>>,
 }
 
 struct State {
@@ -72,6 +82,16 @@ pub async fn run(front: Front) -> Result<()> {
         https = %front.https_bind,
         "Listening for Moonlight (GameStream)"
     );
+    if let Some(s) = &front.stream {
+        let ip = front.http_bind.ip();
+        control::spawn(Arc::clone(s), SocketAddr::new(ip, s.ports.control))?;
+        let rtsp = rtsp::run(Arc::clone(s), SocketAddr::new(ip, s.ports.rtsp));
+        tokio::spawn(async move {
+            if let Err(e) = rtsp.await {
+                warn!(error = format!("{e:#}"), "RTSP for Moonlight stopped");
+            }
+        });
+    }
     let state = Arc::new(State {
         id,
         clients,
@@ -154,6 +174,15 @@ where
             Xml::ok()
         }
         ("/applist", Some(_)) => app_list(state),
+        ("/launch", Some(_)) => launch(&req, peer, local, state, false),
+        ("/resume", Some(_)) => launch(&req, peer, local, state, true),
+        ("/cancel", Some(_)) => {
+            if let Some(s) = &state.front.stream {
+                s.clear_launch();
+            }
+            info!(%peer, "Moonlight quit the app");
+            Xml::ok().put("cancel", 1)
+        }
         ("/unpair", None) => {
             // A client that failed to pair tidies up over HTTP.
             if let Some(uid) = req.arg("uniqueid") {
@@ -184,6 +213,7 @@ fn server_info(state: &State, local: IpAddr, paired: bool) -> Xml {
             .map_or_else(|| "127.0.0.1".to_owned(), |v4| v4.to_string()),
         IpAddr::V4(v4) => v4.to_string(),
     };
+    let running = state.front.stream.as_ref().and_then(|s| s.launch());
     Xml::ok()
         .put("hostname", &state.host_name)
         .put("appversion", APP_VERSION)
@@ -200,8 +230,79 @@ fn server_info(state: &State, local: IpAddr, paired: bool) -> Xml {
         .put("LocalIP", local_ip)
         .put("ServerCodecModeSupport", codecs)
         .put("PairStatus", u8::from(paired))
-        .put("currentgame", 0)
-        .put("state", "SUNSHINE_SERVER_FREE")
+        .put("currentgame", running.as_ref().map_or(0, |l| l.app_id))
+        .put(
+            "state",
+            if running.is_some() {
+                "SUNSHINE_SERVER_BUSY"
+            } else {
+                "SUNSHINE_SERVER_FREE"
+            },
+        )
+}
+
+/// `/launch` and `/resume`: the client's key and screen mode, and (for `/launch`) the app
+/// to open. The answer points the client at the RTSP port.
+fn launch(req: &Request, peer: SocketAddr, local: IpAddr, state: &State, resume: bool) -> Xml {
+    let Some(stream) = &state.front.stream else {
+        return Xml::error(503, "This host has no session to stream");
+    };
+    let key = req
+        .arg("rikey")
+        .and_then(identity::unhex)
+        .and_then(|k| <[u8; 16]>::try_from(k).ok());
+    let (Some(key), Some(_)) = (key, req.arg("rikeyid")) else {
+        return Xml::error(400, "Missing a required launch parameter");
+    };
+    let running = stream.launch();
+    let app = if resume {
+        let Some(r) = &running else {
+            return Xml::error(503, "No running app to resume");
+        };
+        crate::apps::App {
+            id: r.app_id,
+            name: r.app_name.clone(),
+            command: None,
+        }
+    } else {
+        if running.is_some() {
+            return Xml::error(400, "An app is already running on this host");
+        }
+        let id: u32 = req.arg("appid").and_then(|a| a.parse().ok()).unwrap_or(0);
+        let Some(app) = crate::apps::load(&state.front.state_dir)
+            .into_iter()
+            .find(|a| a.id == id)
+        else {
+            return Xml::error(404, "There is no such app on this host");
+        };
+        if let Some(apps) = &state.front.apps
+            && let Err(e) = apps.open(&app.name)
+        {
+            warn!(
+                app = app.name,
+                error = format!("{e:#}"),
+                "Opening the app failed"
+            );
+            return Xml::error(500, "Failed to start the specified application");
+        }
+        app
+    };
+    let mode = req.arg("mode").unwrap_or("0x0x0");
+    let launch = stream::Launch::new(key, peer.ip(), app.id, &app.name);
+    info!(%peer, app = app.name, mode, resume, "Moonlight launch");
+    stream.set_launch(launch);
+    let host = match local {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| format!("[{v6}]"), |v4| v4.to_string()),
+    };
+    Xml::ok()
+        .put(
+            "sessionUrl0",
+            format!("rtsp://{host}:{}", stream.ports.rtsp),
+        )
+        .put(if resume { "resume" } else { "gamesession" }, 1)
 }
 
 fn app_list(state: &State) -> Xml {

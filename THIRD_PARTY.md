@@ -10,6 +10,7 @@
 | [FFmpeg](https://ffmpeg.org) (libavcodec, libavutil) | host encoders (system library); desktop client decoders, linked statically into the Windows build (vcpkg, decoders only, no GPL parts) | LGPL-2.1-or-later |
 | [str0m](https://github.com/algesten/str0m) (WebRTC) | host dependency (web front end) | MIT |
 | [opus](https://github.com/SpaceManiac/opus-rs) bindings, libopus | host dependency (web front end sound) | MIT or Apache-2.0; libopus BSD-3-Clause |
+| [rusty_enet](https://github.com/jabuwu/rusty_enet) (ENet 1.3 in Rust) | host dependency (Moonlight control stream) | MIT |
 | `crates/desktop/src/probe.hevc`: a 256×144 HEVC test frame made with FFmpeg's `testsrc2` | desktop client | generated, no license |
 
 Code adapted from [Sunshine](https://github.com/LizardByte/Sunshine) or
@@ -21,6 +22,10 @@ and commit, and marked in the file header.
 | `crates/host/src/gamestream/pair.rs` (GameStream pairing) | Sunshine `src/nvhttp.cpp`, `src/crypto.cpp` | `224c6be` |
 | `crates/host/src/gamestream/mod.rs` (`/serverinfo`, `/applist`, version strings, codec bits) | Sunshine `src/nvhttp.cpp`, `src/nvhttp.h`; moonlight-common-c `src/Limelight.h` | `224c6be`; `b4ee1ce` |
 | `crates/host/src/gamestream/identity.rs` (RSA-2048 self-signed identity) | Sunshine `src/httpcommon.cpp` | `224c6be` |
+| `crates/host/src/gamestream/mod.rs` (`/launch`, `/resume`, `/cancel`) | Sunshine `src/nvhttp.cpp` | `224c6be` |
+| `crates/host/src/gamestream/rtsp.rs` (RTSP handshake, `DESCRIBE` SDP, Opus layouts) | Sunshine `src/rtsp.cpp`, `src/audio.cpp`; moonlight-common-c `src/RtspConnection.c`, `src/SdpGenerator.c` | `224c6be`; `b4ee1ce` |
+| `crates/host/src/gamestream/stream.rs` (video packets, frame header, ports) | Sunshine `src/stream.cpp`; moonlight-common-c `src/Video.h`, `src/RtpVideoQueue.c`, `src/VideoDepacketizer.c` | `224c6be`; `b4ee1ce` |
+| `crates/host/src/gamestream/control.rs` (control stream encryption, message types) | Sunshine `src/stream.cpp`; moonlight-common-c `src/ControlStream.c` | `224c6be`; `b4ee1ce` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).

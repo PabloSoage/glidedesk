@@ -10,12 +10,21 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: HashMap<String, String>,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 impl Request {
     pub fn arg(&self, name: &str) -> Option<&str> {
         self.query.get(name).map(String::as_str)
+    }
+
+    /// The first header called `name` (any case).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -41,10 +50,14 @@ pub async fn read_request<S: AsyncRead + Unpin>(s: &mut S) -> Result<Request> {
     let mut first = lines.next().unwrap_or_default().split(' ');
     let method = first.next().unwrap_or_default().to_owned();
     let target = first.next().unwrap_or_default();
-    let length: usize = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    let length: usize = headers
+        .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.trim().parse().ok())
+        .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
     if length > 64 << 10 {
         bail!("request body too large");
@@ -63,6 +76,7 @@ pub async fn read_request<S: AsyncRead + Unpin>(s: &mut S) -> Result<Request> {
         method,
         path: path.to_owned(),
         query: parse_query(query),
+        headers,
         body,
     })
 }

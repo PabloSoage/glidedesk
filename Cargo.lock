@@ -2038,6 +2038,7 @@ dependencies = [
  "ring",
  "rsa 0.9.10",
  "rustls",
+ "rusty_enet",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5104,6 +5105,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty_enet"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5944ffaf525ad41a2b9192bec1b32bd22f71e8329369c19ccb92a6e04b25937a"
+dependencies = [
+ "js-sys",
+]
 
 [[package]]
 name = "ryu"

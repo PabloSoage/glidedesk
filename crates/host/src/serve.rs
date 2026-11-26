@@ -240,6 +240,20 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         }
         None => None,
     };
+    let gamestream_stream = match opts.gamestream {
+        Some((http_bind, _)) => {
+            let (output, stream) = crate::gamestream::stream::new(
+                Arc::clone(&shared),
+                outputs.len(),
+                http_bind.ip(),
+                crate::gamestream::stream::Ports::from_http(http_bind.port()),
+                hevc,
+            )?;
+            outputs.push(Box::new(output));
+            Some(stream)
+        }
+        None => None,
+    };
     #[cfg(feature = "web")]
     let max_bitrate = opts.pipeline.max_bitrate;
     let pipeline = Pipeline::new(
@@ -327,6 +341,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                     password: opts.password.clone(),
                     auth_limiter: Arc::clone(&auth_limiter),
                     hevc,
+                    stream: gamestream_stream,
+                    apps: Some(Arc::clone(&apps)),
                 })
                 .await
             }
