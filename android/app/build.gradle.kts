@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.pablosoage.glidedesk"
         minSdk = 29
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.3.1"
+        versionCode = 5
+        versionName = "0.4.0"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }

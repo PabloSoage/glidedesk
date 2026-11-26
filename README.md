@@ -26,9 +26,56 @@ A remote desktop for Linux that aims to feel like Windows RDP, or better:
   almost nothing; only the ceiling a frame may reach follows the link, from the measured
   delay (it drops as soon as frames queue, and climbs back while the link is clean).
 
-**Status: v0.3, usable; still young.** The Linux server is tested on Ubuntu 24.04 (GNOME 46)
-with NVIDIA GPUs (VA-API encoding on AMD and Intel through WSL only). The clients run on
-Windows, Linux, Android and Termux. The Windows server is a preview (see below).
+**Status: v0.4, usable; still young.** The Linux server is tested on Ubuntu 24.04 (GNOME 46)
+and 26.04 (GNOME 50) with NVIDIA GPUs (VA-API encoding on AMD and Intel through WSL only). The
+clients run on Windows, Linux, Android and Termux, plus anything with Moonlight or a browser.
+The Windows server is a preview (see below).
+
+## Quick start
+
+Files are on the [releases page](https://github.com/PabloSoage/glidedesk/releases). Clients
+log in with the server's user name and the password you give the server.
+
+**1. Start the server**
+
+- **Linux** (Ubuntu 24.04 or 26.04 with GNOME; take the host built for your Ubuntu):
+
+  ```sh
+  sudo apt install gnome-shell pipewire wireplumber dbus-daemon ffmpeg libopus0
+  chmod +x glidedesk-host-linux-x86_64-ubuntu26.04 glidedesk-session.sh
+  export GLIDEDESK_PASSWORD='choose-a-password'
+  ./glidedesk-session.sh -- ./glidedesk-host-linux-x86_64-ubuntu26.04 serve --gamestream
+  sudo ufw allow 3389/tcp && sudo ufw allow 3390 && sudo ufw allow 3391   # if ufw is on
+  ```
+
+- **Windows 10/11** (preview; shares the signed-in user's desktop), in PowerShell:
+
+  ```powershell
+  $env:GLIDEDESK_PASSWORD = 'choose-a-password'
+  .\glidedesk-host-windows-x86_64.exe serve --bind 0.0.0.0:3392 --gamestream
+  ```
+
+  Windows asks to allow it through the firewall: allow it. (3389 is Windows' own Remote
+  Desktop, hence 3392.)
+
+`--gamestream` is only needed for Moonlight; for Moonlight also open 47984, 47989 and
+48010/tcp and 47998-48000/udp.
+
+**2. Connect**
+
+| Client device | Use | How |
+|---|---|---|
+| Windows | `glidedesk-windows-x86_64.exe` (lowest latency) | run it, type the server and user, **Connect** |
+| Windows | Remote Desktop, built in | `mstsc /v:<server>` (Windows server: `<server>:3392`) |
+| Linux | `glidedesk-linux-x86_64` | `glidedesk <server> --user <user>` |
+| Linux | FreeRDP / Remmina | `xfreerdp3 /v:<server> /u:<user> /dynamic-resolution` |
+| Android | `glidedesk-android.apk` | install, type server, user and password, **Low latency** |
+| macOS, iOS, Android | Microsoft's Windows App (RDP) | add the server as a PC |
+| Any device with a browser | nothing to install (Linux server) | `https://<server>:3390` |
+| Nintendo Switch, TVs, iOS, macOS, Android | Moonlight (server with `--gamestream`) | add the server, then on the server: `glidedesk-host pair <PIN>` (with `GLIDEDESK_PASSWORD` set) |
+
+The first time, accept the server's self-signed certificate (the glidedesk clients show its
+fingerprint). The details of every server and client follow below.
 
 ## Which client?
 
@@ -42,7 +89,7 @@ Windows, Linux, Android and Termux. The Windows server is a preview (see below).
 | Refresh rate | the server's (`--refresh`, default 120) | the client's screen (60, 120, 144 Hz...) | the server's |
 | Desktop follows the window | FreeRDP: yes. `mstsc`: not yet | yes | yes |
 | Sound | yes | yes (desktop and Termux clients) | yes (Opus) |
-| Clipboard (text) | yes | yes (desktop client) | not yet |
+| Clipboard | text and files | text (desktop client) | not yet |
 | Pointer | drawn by the client | drawn by the client | drawn by the browser |
 
 Use RDP or the browser when you cannot install anything; use the glidedesk client for the
@@ -54,27 +101,29 @@ Prebuilt binaries are on the [releases page](https://github.com/PabloSoage/glide
 
 | File | What |
 |---|---|
-| `glidedesk-host-linux-x86_64` | the server (Ubuntu 24.04 / GNOME 46, x86-64) |
+| `glidedesk-host-linux-x86_64-ubuntu24.04` | the server for Ubuntu 24.04 (GNOME 46, FFmpeg 6), x86-64 |
+| `glidedesk-host-linux-x86_64-ubuntu26.04` | the server for Ubuntu 26.04 (GNOME 50, FFmpeg 8), x86-64 |
 | `glidedesk-session.sh` | starts the headless GNOME session the server runs in |
 | `glidedesk-host-windows-x86_64.exe` | the server for Windows 10/11 (preview: shares the signed-in user's desktop) |
 | `glidedesk-windows-x86_64.exe` | desktop client for Windows |
-| `glidedesk-linux-x86_64` | desktop client for Linux (Wayland or X11; uses the system FFmpeg 6, as on Ubuntu 24.04: `sudo apt install libavcodec60`) |
+| `glidedesk-linux-x86_64-ubuntu24.04`, `glidedesk-linux-x86_64-ubuntu26.04` | desktop client for Linux (Wayland or X11; uses the system FFmpeg: 6 on 24.04, 8 on 26.04) |
 | `glidedesk-android.apk` | Android client (RDP or native protocol) |
 | `glidedesk-x11-termux-aarch64` | client for Termux with termux-x11 (Android, arm64) |
 | `glidedesk-x11-linux-x86_64` | the same small X11 client for Linux machines without a GPU |
 
 ## Server
 
-Requirements: Ubuntu 24.04 with GNOME 46 (other distributions with GNOME 46+ should work), and
-for hardware encoding the NVIDIA driver (570 or later) or Mesa / Intel media VA-API drivers.
+Requirements: Ubuntu 24.04 (GNOME 46) or 26.04 (GNOME 50); other distributions with GNOME 46+
+should work when built from source. For hardware encoding, the NVIDIA driver (570 or later)
+or Mesa / Intel media VA-API drivers.
 
 ```sh
 sudo apt install gnome-shell pipewire wireplumber dbus-daemon ffmpeg libopus0
-chmod +x glidedesk-host-linux-x86_64 glidedesk-session.sh
+chmod +x glidedesk-host-linux-x86_64-ubuntu26.04 glidedesk-session.sh
 # Your Linux user name and a password for remote clients (not your login password,
 # unless you want it to be):
 export GLIDEDESK_PASSWORD='choose-a-password'
-./glidedesk-session.sh -- ./glidedesk-host-linux-x86_64 serve
+./glidedesk-session.sh -- ./glidedesk-host-linux-x86_64-ubuntu26.04 serve
 ```
 
 `glidedesk-session.sh` starts a private headless GNOME Shell on its own D-Bus session (it does
@@ -117,7 +166,7 @@ Windows the app's window is maximized; on GNOME it opens as a normal window for 
 protocol only (RDP clients get the desktop). Apps that start another process and exit at once
 (launchers) keep the session open.
 
-### Moonlight (in progress)
+### Moonlight
 
 With `--gamestream` the server listens on 47989/tcp and 47984/tcp like Sunshine, so Moonlight
 (desktop, Android, iOS, TVs, Nintendo Switch, …) can find it and pair. Add the server in
@@ -249,7 +298,7 @@ The display keeps its own size; input goes through XTEST, sound through PulseAud
 
 The server also runs on Windows 10/11 and shares the desktop of the signed-in user: Desktop
 Duplication for the picture, NVENC, Quick Sync or AMF for the video (x264 without them), the
-default output for sound, and the clipboard (text). When the desktop is drawn on the NVENC GPU
+default output for sound, the clipboard (text and, with RDP clients, files), Moonlight with `--gamestream` and gamepads through ViGEmBus. When the desktop is drawn on the NVENC GPU
 (also inside a Remote Desktop session on Windows Server with an NVIDIA GPU), frames go to the
 encoder without leaving the GPU. Clients connect with the native protocol or RDP; the web
 client is not there yet.
