@@ -544,7 +544,10 @@ fn now_us() -> u64 {
 mod version_tests {
     #[test]
     fn reads_the_newest_version_from_a_refusal() {
-        assert_eq!(super::newest_version("protocol version 3, server speaks 1 to 2"), Some(2));
+        assert_eq!(
+            super::newest_version("protocol version 3, server speaks 1 to 2"),
+            Some(2)
+        );
         assert_eq!(super::newest_version("wrong user name or password"), None);
     }
 }
