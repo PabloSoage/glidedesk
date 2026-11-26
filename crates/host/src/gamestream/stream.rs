@@ -8,7 +8,8 @@
 //! GameStream video header (16 bytes), then its part of the frame; the last one is padded with
 //! zeros. The packets of a frame form up to 4 FEC blocks of at most 255 packets, each followed
 //! by Reed-Solomon parity packets ([`super::fec`], 20% by default as in Sunshine) from which
-//! the client rebuilds lost ones.
+//! the client rebuilds lost ones. Clients that ask for it get every packet encrypted
+//! ([`VideoCipher`]).
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -92,11 +93,15 @@ pub struct Settings {
     pub packet_size: usize,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// Video goes encrypted (`SS_ENC_VIDEO`); `packet_size` already leaves room for it.
+    pub video_encrypted: bool,
     /// The client decrypts audio (Moonlight always asks).
     pub audio_encrypted: bool,
     /// Milliseconds of sound per audio packet.
     pub audio_ms: u32,
     pub audio_channels: u32,
+    /// The client wants the high-quality Opus layout (one stream per channel for surround).
+    pub audio_high_quality: bool,
     /// Fewest parity packets per FEC block (`x-nv-vqos[0].fec.minRequiredFecPackets`).
     pub min_parity: usize,
 }
@@ -128,8 +133,9 @@ impl Settings {
             other => bail!("the client asked for a codec this host does not send ({other})"),
         };
         // Audio encryption: the legacy feature flag (0x20) or Sunshine's SS_ENC_AUDIO (0x04).
-        let audio_encrypted = get("x-nv-general.featureFlags").unwrap_or(0) & 0x20 != 0
-            || get("x-ss-general.encryptionEnabled").unwrap_or(0) & 0x04 != 0;
+        let enabled = get("x-ss-general.encryptionEnabled").unwrap_or(0);
+        let audio_encrypted =
+            get("x-nv-general.featureFlags").unwrap_or(0) & 0x20 != 0 || enabled & 0x04 != 0;
         let audio_ms = match get("x-nv-aqos.packetDuration") {
             Some(10) => 10,
             Some(20) => 20,
@@ -144,10 +150,12 @@ impl Settings {
             packet_size: packet_size as usize,
             bitrate_kbps: u32::try_from(bitrate).unwrap_or(20_000).max(500),
             codec,
+            video_encrypted: enabled & 0x02 != 0,
             audio_encrypted,
             audio_ms,
             audio_channels: u32::try_from(get("x-nv-audio.surround.numChannels").unwrap_or(2))
                 .unwrap_or(2),
+            audio_high_quality: get("x-nv-audio.surround.AudioQuality").unwrap_or(0) != 0,
             min_parity: usize::try_from(get("x-nv-vqos[0].fec.minRequiredFecPackets").unwrap_or(0))
                 .unwrap_or(0)
                 .min(8),
@@ -174,6 +182,55 @@ struct Video {
     /// Frame numbers sent lately and the encoder's picture index of each, for invalidation
     /// requests.
     sent: std::collections::VecDeque<(u32, u64)>,
+    cipher: Option<VideoCipher>,
+}
+
+/// Room taken in each encrypted packet by its prefix: IV (12), frame number (LE u32) and tag
+/// (16), moonlight-common-c `ENC_VIDEO_HEADER`.
+const ENC_PREFIX: usize = 32;
+
+/// Encrypted video (`SS_ENC_VIDEO`, Sunshine `videoBroadcastThread`): each packet, parity
+/// included, goes out as the prefix followed by the whole packet encrypted with AES-128-GCM
+/// under the `/launch` key. The IV is a 64-bit packet counter (LE) and a 'V' in its last byte,
+/// so it never repeats for a key (NIST SP 800-38D 8.2.1).
+struct VideoCipher {
+    key: ring::aead::LessSafeKey,
+    counter: u64,
+    out: Vec<u8>,
+}
+
+impl VideoCipher {
+    fn new(key: &[u8; 16]) -> Self {
+        let key = ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, key)
+            .expect("an AES-128 key is 16 bytes");
+        Self {
+            key: ring::aead::LessSafeKey::new(key),
+            counter: 0,
+            out: Vec::new(),
+        }
+    }
+
+    fn seal(&mut self, frame: u32, packet: &[u8]) -> &[u8] {
+        let mut iv = [0u8; 12];
+        iv[..8].copy_from_slice(&self.counter.to_le_bytes());
+        iv[11] = b'V';
+        self.counter += 1;
+        self.out.clear();
+        self.out.extend_from_slice(&iv);
+        self.out.extend_from_slice(&frame.to_le_bytes());
+        self.out.extend_from_slice(&[0; 16]);
+        self.out.extend_from_slice(packet);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(
+                ring::aead::Nonce::assume_unique_for_key(iv),
+                ring::aead::Aad::empty(),
+                &mut self.out[ENC_PREFIX..],
+            )
+            .expect("a video packet is far below the AES-GCM limit");
+        self.out[16..ENC_PREFIX].copy_from_slice(tag.as_ref());
+        &self.out
+    }
 }
 
 /// Frames remembered for invalidation (a loss further back needs a keyframe).
@@ -236,12 +293,17 @@ impl Stream {
             kbps = settings.bitrate_kbps,
             codec = ?settings.codec,
             packet = settings.packet_size,
+            video_encrypted = settings.video_encrypted,
             audio_ms = settings.audio_ms,
+            audio_channels = settings.audio_channels,
             audio_encrypted = settings.audio_encrypted,
             "Moonlight stream set up"
         );
         *self.audio.lock().unwrap() = Some(super::audio::Target::new(&launch, &settings));
         *self.video.lock().unwrap() = Some(Video {
+            cipher: settings
+                .video_encrypted
+                .then(|| VideoCipher::new(&launch.key)),
             settings,
             ping_payload: launch.ping_payload,
             client: launch.client,
@@ -410,11 +472,12 @@ impl Output for GameStreamOutput {
             {
                 continue;
             }
-            if let Err(e) = self
-                .stream
-                .socket
-                .send_to(&buf[p * block..(p + 1) * block], peer)
-            {
+            let packet = &buf[p * block..(p + 1) * block];
+            let packet = match v.cipher.as_mut() {
+                Some(c) => c.seal(v.frame_index, packet),
+                None => packet,
+            };
+            if let Err(e) = self.stream.socket.send_to(packet, peer) {
                 debug!(%e, "Sending video failed");
             }
         }
@@ -466,6 +529,7 @@ pub fn new(
     ports: Ports,
     hevc: bool,
     audio: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    surround: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 ) -> Result<(GameStreamOutput, Arc<Stream>)> {
     let udp = |port: u16| -> Result<UdpSocket> {
         let bind = SocketAddr::new(ip, port);
@@ -510,8 +574,15 @@ pub fn new(
                 })
             })?;
     }
-    if let Some(audio) = audio {
-        super::audio::spawn(Arc::clone(&stream), audio)?;
+    // 7.1 where the session has it (every layout comes from it), stereo otherwise.
+    match (surround, audio) {
+        (Some(s), _) => {
+            super::audio::spawn(Arc::clone(&stream), s, crate::sound::SURROUND_CHANNELS)?
+        }
+        (None, Some(a)) => {
+            super::audio::spawn(Arc::clone(&stream), a, usize::from(crate::sound::CHANNELS))?
+        }
+        (None, None) => {}
     }
     Ok((
         GameStreamOutput {
@@ -706,9 +777,11 @@ mod tests {
                 packet_size: 1392,
                 bitrate_kbps: 20_000,
                 codec: Codec::Hevc,
+                video_encrypted: false,
                 audio_encrypted: false,
                 audio_ms: 5,
                 audio_channels: 2,
+                audio_high_quality: false,
                 min_parity: 0,
             }
         );
@@ -836,6 +909,35 @@ mod tests {
             assert_eq!(damaged[i][HEADER..], data[i][HEADER..]);
         }
     }
+    #[test]
+    fn encrypted_packets_open_like_moonlight_does() {
+        let key = [9u8; 16];
+        let mut c = VideoCipher::new(&key);
+        let packet: Vec<u8> = (0..1040).map(|i| (i * 5) as u8).collect();
+        for n in 0..3u64 {
+            let sealed = c.seal(77, &packet).to_vec();
+            assert_eq!(sealed.len(), ENC_PREFIX + packet.len());
+            // ENC_VIDEO_HEADER: iv[12], frameNumber (LE), tag[16], then the ciphertext.
+            assert_eq!(&sealed[..8], &n.to_le_bytes());
+            assert_eq!(sealed[11], b'V');
+            assert_eq!(u32::from_le_bytes(sealed[12..16].try_into().unwrap()), 77);
+            let key = ring::aead::LessSafeKey::new(
+                ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key).unwrap(),
+            );
+            let mut body = sealed[ENC_PREFIX..].to_vec();
+            body.extend_from_slice(&sealed[16..32]);
+            let iv: [u8; 12] = sealed[..12].try_into().unwrap();
+            let plain = key
+                .open_in_place(
+                    ring::aead::Nonce::assume_unique_for_key(iv),
+                    ring::aead::Aad::empty(),
+                    &mut body,
+                )
+                .unwrap();
+            assert_eq!(plain, &packet[..]);
+        }
+    }
+
     #[test]
     fn ping_payload_is_hex() {
         let l = Launch::new([0; 16], 7, [10, 0, 0, 2].into(), 1, "Desktop");

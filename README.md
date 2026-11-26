@@ -95,7 +95,7 @@ Useful options of `serve` (`--help` lists them all):
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
 | `--avc444` | off | full-chroma AVC444 for RDP clients (experimental: `mstsc` shows it blurred) |
 | `--x11 :0` | | serve an existing X11 display instead of a GNOME session (see Termux below) |
-| `--gamestream` | off | also answer Moonlight clients (pairing, app list and video so far; see below) |
+| `--gamestream` | off | also answer Moonlight clients (see below) |
 
 The TLS certificate is self-signed, created in `~/.config/glidedesk/` on first start.
 
@@ -128,10 +128,14 @@ GLIDEDESK_PASSWORD='...' glidedesk-host pair 1234    # without a PIN: lists who 
 ```
 
 Paired clients see the apps from `apps.conf` (plus **Desktop**) and can stream them: video in
-H.264 or HEVC at the resolution, frame rate and bitrate chosen in Moonlight, stereo sound, keyboard
-and mouse. Streaming also uses 48010/tcp (RTSP), 47998/udp (video), 47999/udp (control and input)
-and 48000/udp (sound). Video carries 20% Reed-Solomon parity, as Sunshine's, so lost packets are
-rebuilt on Wi-Fi. Not done yet: surround sound, gamepads and touch.
+H.264 or HEVC at the resolution, frame rate and bitrate chosen in Moonlight, stereo, 5.1 or 7.1
+sound, keyboard and mouse. Streaming also uses 48010/tcp (RTSP), 47998/udp (video), 47999/udp
+(control and input) and 48000/udp (sound). Video carries 20% Reed-Solomon parity, as Sunshine's,
+so lost packets are rebuilt on Wi-Fi. Input and sound are always encrypted; video is encrypted
+when the client wants it (Moonlight on a PC with AES instructions always does) and always for
+clients outside private networks (anything but 10/8, 172.16/12, 192.168/16, 100.64/10, IPv6
+fc00::/7 and link-local). On GNOME the session's sound output is 7.1, so games and players can
+send surround; RDP and browsers get it mixed down to stereo. Not done yet: gamepads and touch.
 
 If the "Stop screen sharing" button in GNOME's top bar is pressed, the server starts a new
 session by itself within about a second; clients stay connected. Windows that were full

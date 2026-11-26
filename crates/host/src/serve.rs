@@ -71,6 +71,8 @@ struct Parts {
     cursor: watch::Receiver<Option<CursorEvent>>,
     input: Box<dyn InputBackend>,
     audio: Option<broadcast::Sender<Vec<u8>>>,
+    /// The same sound in 7.1 ([`crate::sound::SURROUND_CHANNELS`]), where the session has it.
+    surround: Option<broadcast::Sender<Vec<u8>>>,
     clipboard: Option<Box<dyn ironrdp_server::CliprdrServerFactory>>,
     /// The same clipboard for the native front end.
     text_clipboard: Option<Arc<dyn crate::native::TextClipboard>>,
@@ -126,11 +128,11 @@ async fn gnome(
         sinks,
         cuda,
     ));
-    let audio = match crate::audio::start() {
-        Ok(a) => Some(a),
+    let (audio, surround) = match crate::audio::start() {
+        Ok((stereo, surround)) => (Some(stereo), Some(surround)),
         Err(e) => {
             warn!(%e, "No audio");
-            None
+            (None, None)
         }
     };
     let clipboard = crate::clipboard::ClipboardFactory::spawn(live.clone());
@@ -142,6 +144,7 @@ async fn gnome(
         cursor: cursor_rx,
         input: Box::new(crate::input::MutterInput::new(live)),
         audio,
+        surround,
         clipboard: Some(Box::new(clipboard)),
         text_clipboard: Some(Arc::new(hub)),
         size: (w, h),
@@ -164,6 +167,7 @@ fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
         audio: crate::pulse::start()
             .map_err(|e| warn!(%e, "No audio"))
             .ok(),
+        surround: None,
         clipboard: None,
         text_clipboard: None,
         stop: None,
@@ -185,6 +189,7 @@ fn windows(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<Parts> {
         audio: crate::winaudio::start()
             .map_err(|e| warn!(error = format!("{e:#}"), "No audio"))
             .ok(),
+        surround: None,
         clipboard: clipboard
             .clone()
             .map(|c| Box::new(c) as Box<dyn ironrdp_server::CliprdrServerFactory>),
@@ -249,6 +254,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                 crate::gamestream::stream::Ports::from_http(http_bind.port()),
                 hevc,
                 parts.audio.clone(),
+                parts.surround.clone(),
             )?;
             outputs.push(Box::new(output));
             Some(stream)

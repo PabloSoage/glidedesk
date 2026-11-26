@@ -9,6 +9,11 @@
 //! sequence number (BE u32) followed by zeros. The client collects packets in blocks of four;
 //! in-order packets play right away, so no parity packets are sent yet, but every packet of a
 //! block must have the same size, which is why the bitrate is constant.
+//!
+//! Stereo, 5.1 and 7.1 go in the Opus layouts `DESCRIBE` lists ([`Layout`]): multistream Opus
+//! for surround, in Moonlight's channel order (FL FR FC LFE BL BR SL SR). The sound comes from
+//! the session in 7.1 where it can ([`crate::audio`]) and is fitted to what the client asked
+//! for ([`remix`]); from a stereo session, surround clients get it in the front channels.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -21,11 +26,39 @@ use tracing::{debug, info, warn};
 
 use super::stream::{Launch, Settings, Stream};
 
-/// Stereo Opus bitrate: what Sunshine uses for high-quality stereo is 512 kbit/s, normal
-/// 96 kbit/s; this sits in between and stays transparent.
-const BITRATE: i32 = 128_000;
 const RATE: u32 = 48_000;
 const PAYLOAD_TYPE: u8 = 97;
+
+/// An Opus layout, as Sunshine lists them (`src/audio.cpp` `stream_configs`): channels,
+/// streams, coupled (two-channel) streams and bitrate. The channel mapping is the identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub channels: usize,
+    pub streams: u8,
+    pub coupled: u8,
+    pub bitrate: i32,
+}
+
+impl Layout {
+    /// What the client asked for: channels and normal or high quality. Normal-quality stereo
+    /// is 128 kbit/s here (Sunshine: 96), transparent for desktop sound.
+    pub fn for_client(channels: u32, high_quality: bool) -> Self {
+        let l = |channels, streams, coupled, bitrate| Layout {
+            channels,
+            streams,
+            coupled,
+            bitrate,
+        };
+        match (channels, high_quality) {
+            (6, false) => l(6, 4, 2, 256_000),
+            (6, true) => l(6, 6, 0, 1_536_000),
+            (8, false) => l(8, 5, 3, 450_000),
+            (8, true) => l(8, 8, 0, 2_048_000),
+            (_, false) => l(2, 1, 1, 128_000),
+            (_, true) => l(2, 1, 1, 512_000),
+        }
+    }
+}
 
 /// Where the audio of the current stream goes.
 pub struct Target {
@@ -34,6 +67,7 @@ pub struct Target {
     encrypted: bool,
     /// Milliseconds of sound per packet.
     ms: u32,
+    layout: Layout,
     ping_payload: [u8; 16],
     client: IpAddr,
     peer: Option<SocketAddr>,
@@ -43,10 +77,11 @@ pub struct Target {
 
 impl Target {
     pub fn new(launch: &Launch, settings: &Settings) -> Self {
-        if settings.audio_channels != 2 {
+        let layout = Layout::for_client(settings.audio_channels, settings.audio_high_quality);
+        if layout.channels != settings.audio_channels as usize {
             warn!(
                 channels = settings.audio_channels,
-                "Moonlight asked for surround sound; this host sends stereo only"
+                "Moonlight asked for a sound layout this host does not send; sending stereo"
             );
         }
         Self {
@@ -54,6 +89,7 @@ impl Target {
             key_id: launch.key_id,
             encrypted: settings.audio_encrypted,
             ms: settings.audio_ms,
+            layout,
             ping_payload: launch.ping_payload,
             client: launch.client,
             peer: None,
@@ -113,34 +149,93 @@ fn cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Sends the session's sound to whichever Moonlight client is streaming.
-pub fn spawn(stream: Arc<Stream>, audio: broadcast::Sender<Vec<u8>>) -> Result<()> {
+/// Fits interleaved samples with `from` channels (2, or 7.1) to `to` channels (2, 6 or 8):
+/// 7.1 to 5.1 folds the side channels into the back ones, to stereo mixes down; stereo to
+/// surround fills the front channels and leaves the rest silent.
+pub fn remix(src: &[i16], from: usize, to: usize, out: &mut Vec<i16>) {
+    match (from, to) {
+        (a, b) if a == b => out.extend_from_slice(src),
+        (8, 2) => crate::sound::downmix_71(src, out),
+        (8, 6) => {
+            for f in src.as_chunks::<8>().0 {
+                out.extend_from_slice(&f[..4]);
+                out.push(f[4].saturating_add(f[6]));
+                out.push(f[5].saturating_add(f[7]));
+            }
+        }
+        (2, n) => {
+            for f in src.as_chunks::<2>().0 {
+                out.extend_from_slice(f);
+                out.extend(std::iter::repeat_n(0, n - 2));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sends the session's sound (`channels` per sample: 2, or 7.1) to whichever Moonlight client
+/// is streaming.
+pub fn spawn(
+    stream: Arc<Stream>,
+    audio: broadcast::Sender<Vec<u8>>,
+    channels: usize,
+) -> Result<()> {
     std::thread::Builder::new()
         .name("gs-audio".into())
-        .spawn(move || run(&stream, &audio))?;
+        .spawn(move || run(&stream, &audio, channels))?;
     Ok(())
 }
 
-fn encoder(ms: u32) -> Option<opus::Encoder> {
-    let mut enc =
-        match opus::Encoder::new(RATE, opus::Channels::Stereo, opus::Application::LowDelay) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(%e, "No Opus encoder: Moonlight gets no sound");
-                return None;
-            }
-        };
-    let _ = enc.set_vbr(false);
-    let _ = enc.set_bitrate(opus::Bitrate::Bits(BITRATE));
-    debug!(ms, "Opus encoder for Moonlight");
-    Some(enc)
+enum Encoder {
+    Stereo(opus::Encoder),
+    Surround(opus::MSEncoder),
 }
 
-fn run(stream: &Stream, audio: &broadcast::Sender<Vec<u8>>) {
+impl Encoder {
+    fn encode(&mut self, pcm: &[i16], out: &mut [u8]) -> opus::Result<usize> {
+        match self {
+            Self::Stereo(e) => e.encode(pcm, out),
+            Self::Surround(e) => e.encode(pcm, out),
+        }
+    }
+}
+
+fn encoder(layout: Layout, ms: u32) -> Option<Encoder> {
+    let app = opus::Application::LowDelay;
+    let made = if layout.channels == 2 {
+        opus::Encoder::new(RATE, opus::Channels::Stereo, app).and_then(|mut e| {
+            e.set_vbr(false)?;
+            e.set_bitrate(opus::Bitrate::Bits(layout.bitrate))?;
+            Ok(Encoder::Stereo(e))
+        })
+    } else {
+        let mapping: Vec<u8> = (0..layout.channels as u8).collect();
+        opus::MSEncoder::new(RATE, layout.streams, layout.coupled, &mapping, app).and_then(
+            |mut e| {
+                e.set_vbr(false)?;
+                e.set_bitrate(opus::Bitrate::Bits(layout.bitrate))?;
+                Ok(Encoder::Surround(e))
+            },
+        )
+    };
+    match made {
+        Ok(e) => {
+            debug!(?layout, ms, "Opus encoder for Moonlight");
+            Some(e)
+        }
+        Err(e) => {
+            warn!(%e, ?layout, "No Opus encoder: Moonlight gets no sound");
+            None
+        }
+    }
+}
+
+fn run(stream: &Stream, audio: &broadcast::Sender<Vec<u8>>, channels: usize) {
     let mut rx = audio.subscribe();
-    let mut enc: Option<(opus::Encoder, u32)> = None;
+    let mut enc: Option<(Encoder, Layout, u32)> = None;
+    let mut samples: Vec<i16> = Vec::new();
     let mut pending: Vec<i16> = Vec::new();
-    let mut out = vec![0u8; 4000];
+    let mut out = vec![0u8; 8000];
     let mut started = false;
     loop {
         let block = match rx.blocking_recv() {
@@ -155,21 +250,29 @@ fn run(stream: &Stream, audio: &broadcast::Sender<Vec<u8>>) {
             continue;
         };
         if !started {
-            info!("Moonlight audio starts");
+            info!(channels = t.layout.channels, "Moonlight audio starts");
             started = true;
         }
-        pending.extend(
+        samples.clear();
+        samples.extend(
             block
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|b| i16::from_le_bytes(*b)),
         );
-        if enc.as_ref().is_none_or(|(_, ms)| *ms != t.ms) {
-            enc = encoder(t.ms).map(|e| (e, t.ms));
+        if enc
+            .as_ref()
+            .is_none_or(|(_, layout, ms)| (*layout, *ms) != (t.layout, t.ms))
+        {
+            pending.clear();
+            enc = encoder(t.layout, t.ms).map(|e| (e, t.layout, t.ms));
         }
-        let Some((e, _)) = enc.as_mut() else { continue };
-        let frame = (RATE / 1000 * t.ms * 2) as usize;
+        let Some((e, layout, _)) = enc.as_mut() else {
+            continue;
+        };
+        remix(&samples, channels, layout.channels, &mut pending);
+        let frame = (RATE / 1000 * t.ms) as usize * layout.channels;
 
         let mut used = 0;
         while pending.len() - used >= frame {
@@ -238,22 +341,72 @@ mod tests {
 
     #[test]
     fn constant_bitrate_gives_constant_sizes() {
-        let mut e = encoder(5).unwrap();
-        let mut out = vec![0u8; 4000];
-        let mut sizes = std::collections::BTreeSet::new();
-        for k in 0..100 {
-            // A tone that changes, then silence: VBR would vary the size.
-            let frame: Vec<i16> = (0..480)
-                .map(|i| {
-                    if k < 50 {
-                        ((f64::from(i + k * 480) * 0.05).sin() * 8000.0) as i16
-                    } else {
-                        0
-                    }
-                })
-                .collect();
-            sizes.insert(e.encode(&frame, &mut out).unwrap());
+        let mut out = vec![0u8; 8000];
+        for (channels, hq) in [(2, false), (6, false), (6, true), (8, false), (8, true)] {
+            let layout = Layout::for_client(channels, hq);
+            let mut e = encoder(layout, 5).unwrap();
+            let mut sizes = std::collections::BTreeSet::new();
+            for k in 0..100 {
+                // A tone that changes, then silence: VBR would vary the size.
+                let frame: Vec<i16> = (0..240 * layout.channels)
+                    .map(|i| {
+                        if k < 50 {
+                            ((((i / layout.channels) + k * 240) as f64 * 0.05).sin() * 8000.0)
+                                as i16
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                sizes.insert(e.encode(&frame, &mut out).unwrap());
+            }
+            assert_eq!(sizes.len(), 1, "{layout:?}: {sizes:?}");
         }
-        assert_eq!(sizes.len(), 1, "{sizes:?}");
+    }
+
+    #[test]
+    fn surround_decodes_with_moonlights_layout() {
+        // Moonlight's decoder is built from the DESCRIBE parameters: for normal 5.1, 6
+        // channels, 4 streams, 2 coupled, mapping 0..6 (once it undoes GFE's rotation).
+        let layout = Layout::for_client(6, false);
+        let mut e = encoder(layout, 10).unwrap();
+        let mut d = opus::MSDecoder::new(RATE, 4, 2, &[0, 1, 2, 3, 4, 5]).unwrap();
+        // A tone on the back left channel only.
+        let mut pcm = vec![0i16; 480 * 6];
+        for (i, f) in pcm.chunks_mut(6).enumerate() {
+            f[4] = ((i as f64 * 0.2).sin() * 10000.0) as i16;
+        }
+        let mut out = vec![0u8; 4000];
+        let mut back = vec![0i16; 480 * 6];
+        let mut energy = [0f64; 6];
+        for _ in 0..10 {
+            let n = e.encode(&pcm, &mut out).unwrap();
+            d.decode(&out[..n], &mut back, false).unwrap();
+        }
+        for f in back.chunks(6) {
+            for (c, s) in f.iter().enumerate() {
+                energy[c] += f64::from(*s).powi(2);
+            }
+        }
+        let loudest = (0..6)
+            .max_by(|&a, &b| energy[a].total_cmp(&energy[b]))
+            .unwrap();
+        assert_eq!(loudest, 4, "{energy:?}");
+    }
+
+    #[test]
+    fn layouts_are_fitted() {
+        // 7.1 frame: FL FR FC LFE RL RR SL SR.
+        let f71 = [1000i16, 2000, 0, 500, 300, 400, 30, 40];
+        let mut out = Vec::new();
+        remix(&f71, 8, 6, &mut out);
+        assert_eq!(out, [1000, 2000, 0, 500, 330, 440]);
+        out.clear();
+        remix(&[100, -100], 2, 8, &mut out);
+        assert_eq!(out, [100, -100, 0, 0, 0, 0, 0, 0]);
+        out.clear();
+        // Stereo played into the 7.1 output comes back as it was.
+        remix(&[1234, -4321, 0, 0, 0, 0, 0, 0], 8, 2, &mut out);
+        assert_eq!(out, [1234, -4321]);
     }
 }

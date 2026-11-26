@@ -18,8 +18,10 @@ use tracing::{debug, info, warn};
 use super::http;
 use super::stream::{Settings, Stream};
 
-/// Encryption flags (moonlight-common-c `SS_ENC_*`): the control stream only.
+/// Encryption flags (moonlight-common-c `SS_ENC_*`).
 const SS_ENC_CONTROL_V2: u32 = 0x01;
+const SS_ENC_VIDEO: u32 = 0x02;
+const SS_ENC_AUDIO: u32 = 0x04;
 
 /// Opus layouts for `DESCRIBE`, as Sunshine lists them (`src/audio.cpp` `stream_configs`):
 /// channels, streams, coupled streams and the channel mapping, normal then high quality for
@@ -55,7 +57,9 @@ async fn handle(mut tcp: tokio::net::TcpStream, peer: SocketAddr, stream: &Strea
     let cseq = req.header("CSeq").unwrap_or("0").to_owned();
     debug!(%peer, method = req.method, target = req.path, "RTSP");
     let (status, headers, body) = match stream.launch() {
-        Some(l) if l.client.to_canonical() == peer.ip().to_canonical() => answer(&req, &l, stream),
+        Some(l) if l.client.to_canonical() == peer.ip().to_canonical() => {
+            answer(&req, &l, stream, !is_private(peer.ip()))
+        }
         _ => ("503 Service Unavailable", Vec::new(), String::new()),
     };
     let mut out = format!("RTSP/1.0 {status}\r\nCSeq: {cseq}\r\n");
@@ -71,11 +75,16 @@ async fn handle(mut tcp: tokio::net::TcpStream, peer: SocketAddr, stream: &Strea
 
 type Answer = (&'static str, Vec<(&'static str, String)>, String);
 
-fn answer(req: &http::Request, launch: &super::stream::Launch, stream: &Stream) -> Answer {
+fn answer(
+    req: &http::Request,
+    launch: &super::stream::Launch,
+    stream: &Stream,
+    remote: bool,
+) -> Answer {
     let ok = |headers, body| ("200 OK", headers, body);
     match req.method.as_str() {
         "OPTIONS" | "PLAY" => ok(Vec::new(), String::new()),
-        "DESCRIBE" => ok(Vec::new(), describe(stream.hevc)),
+        "DESCRIBE" => ok(Vec::new(), describe(stream.hevc, remote)),
         "SETUP" => {
             let ports = stream.ports;
             let (port, extra) = if req.path.contains("streamid=audio") {
@@ -117,13 +126,34 @@ fn ping(launch: &super::stream::Launch) -> String {
     String::from_utf8_lossy(&launch.ping_payload).into_owned()
 }
 
-/// The `DESCRIBE` SDP: no Sunshine feature flags, control stream encryption supported and
-/// asked for, reference frame invalidation, HEVC if the encoder makes it (the VPS prefix is how
-/// GameStream says so), and the Opus layouts.
-fn describe(hevc: bool) -> String {
+/// Addresses on the client's own network or a private tunnel: loopback, link-local, private
+/// IPv4 ranges, shared address space (100.64/10, used by some VPNs) and IPv6 unique local.
+fn is_private(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (a == 100 && (64..128).contains(&b))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+        }
+    }
+}
+
+/// The `DESCRIBE` SDP: no Sunshine feature flags; encryption of the control stream (always),
+/// video and audio (offered: the client opts in; asked for from outside private networks);
+/// reference frame invalidation; HEVC if the encoder makes it (the VPS prefix is how
+/// GameStream says so); and the Opus layouts.
+fn describe(hevc: bool, remote: bool) -> String {
     let mut s = String::from("a=x-ss-general.featureFlags:0\r\n");
+    let supported = SS_ENC_CONTROL_V2 | SS_ENC_VIDEO | SS_ENC_AUDIO;
+    let requested = if remote { supported } else { SS_ENC_CONTROL_V2 };
     s.push_str(&format!(
-        "a=x-ss-general.encryptionSupported:{SS_ENC_CONTROL_V2}\r\na=x-ss-general.encryptionRequested:{SS_ENC_CONTROL_V2}\r\n"
+        "a=x-ss-general.encryptionSupported:{supported}\r\na=x-ss-general.encryptionRequested:{requested}\r\n"
     ));
     // Lost frames are invalidated rather than answered with a keyframe where the encoder can
     // (NVENC); otherwise the host sends a keyframe anyway.
@@ -143,11 +173,29 @@ mod tests {
 
     #[test]
     fn describe_lists_codecs_and_audio() {
-        let d = describe(true);
+        let d = describe(true, false);
         assert!(d.contains("sprop-parameter-sets=AAAAAU"));
+        assert!(d.contains("a=x-ss-general.encryptionSupported:7"));
         assert!(d.contains("a=x-ss-general.encryptionRequested:1"));
+        assert!(describe(true, true).contains("a=x-ss-general.encryptionRequested:7"));
         // Moonlight looks for "a=fmtp:97 surround-params=<channels>" and reads the rest.
         assert_eq!(d.matches("surround-params=6").count(), 2);
-        assert!(!describe(false).contains("AAAAAU"));
+        assert!(!describe(false, false).contains("AAAAAU"));
+    }
+
+    #[test]
+    fn private_networks() {
+        for ip in [
+            "192.168.1.5",
+            "10.8.0.2",
+            "100.100.1.1",
+            "fd00::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(is_private(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "100.200.1.1", "2a00:1450::1"] {
+            assert!(!is_private(ip.parse().unwrap()), "{ip}");
+        }
     }
 }
