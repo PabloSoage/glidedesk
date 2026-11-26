@@ -44,8 +44,10 @@ impl Ports {
 /// What `/launch` (or `/resume`) set up for one client.
 #[derive(Clone, Debug)]
 pub struct Launch {
-    /// AES-128 key for the control stream (`rikey`).
+    /// AES-128 key for the control stream and audio (`rikey`).
     pub key: [u8; 16],
+    /// `rikeyid`: the start of the audio IVs.
+    pub key_id: u32,
     /// The app the client opened (its `/applist` id and name).
     pub app_id: u32,
     pub app_name: String,
@@ -61,7 +63,7 @@ pub struct Launch {
 impl Launch {
     /// The screen mode the client asks for here comes again in `ANNOUNCE`, which is what
     /// counts ([`Settings`]).
-    pub fn new(key: [u8; 16], client: IpAddr, app_id: u32, app_name: &str) -> Self {
+    pub fn new(key: [u8; 16], key_id: u32, client: IpAddr, app_id: u32, app_name: &str) -> Self {
         let raw: [u8; 8] = glidedesk_proto::random();
         let mut ping_payload = [0u8; 16];
         for (i, b) in raw.iter().enumerate() {
@@ -69,6 +71,7 @@ impl Launch {
         }
         Self {
             key,
+            key_id,
             app_id,
             app_name: app_name.to_owned(),
             ping_payload,
@@ -88,6 +91,11 @@ pub struct Settings {
     pub packet_size: usize,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// The client decrypts audio (Moonlight always asks).
+    pub audio_encrypted: bool,
+    /// Milliseconds of sound per audio packet.
+    pub audio_ms: u32,
+    pub audio_channels: u32,
 }
 
 impl Settings {
@@ -116,6 +124,14 @@ impl Settings {
             1 => Codec::Hevc,
             other => bail!("the client asked for a codec this host does not send ({other})"),
         };
+        // Audio encryption: the legacy feature flag (0x20) or Sunshine's SS_ENC_AUDIO (0x04).
+        let audio_encrypted = get("x-nv-general.featureFlags").unwrap_or(0) & 0x20 != 0
+            || get("x-ss-general.encryptionEnabled").unwrap_or(0) & 0x04 != 0;
+        let audio_ms = match get("x-nv-aqos.packetDuration") {
+            Some(10) => 10,
+            Some(20) => 20,
+            _ => 5,
+        };
         let positive =
             |name: &str| -> Result<u32> { Ok(u32::try_from(need(name)?).unwrap_or(0).max(1)) };
         Ok(Self {
@@ -125,6 +141,10 @@ impl Settings {
             packet_size: packet_size as usize,
             bitrate_kbps: u32::try_from(bitrate).unwrap_or(20_000).max(500),
             codec,
+            audio_encrypted,
+            audio_ms,
+            audio_channels: u32::try_from(get("x-nv-audio.surround.numChannels").unwrap_or(2))
+                .unwrap_or(2),
         })
     }
 }
@@ -156,6 +176,8 @@ pub struct Stream {
     launch: Mutex<Option<Launch>>,
     video: Mutex<Option<Video>>,
     socket: UdpSocket,
+    pub(super) audio: Mutex<Option<super::audio::Target>>,
+    pub(super) audio_socket: UdpSocket,
     keyframe: AtomicBool,
     bitrate: AtomicU32,
     sent: AtomicU64,
@@ -169,12 +191,14 @@ impl Stream {
     /// A new `/launch` or `/resume`: any stream of an earlier one ends.
     pub fn set_launch(&self, launch: Launch) {
         *self.video.lock().unwrap() = None;
+        *self.audio.lock().unwrap() = None;
         *self.launch.lock().unwrap() = Some(launch);
     }
 
     /// `/cancel`: the client quit the app.
     pub fn clear_launch(&self) {
         *self.video.lock().unwrap() = None;
+        *self.audio.lock().unwrap() = None;
         *self.launch.lock().unwrap() = None;
     }
 
@@ -198,8 +222,11 @@ impl Stream {
             kbps = settings.bitrate_kbps,
             codec = ?settings.codec,
             packet = settings.packet_size,
+            audio_ms = settings.audio_ms,
+            audio_encrypted = settings.audio_encrypted,
             "Moonlight stream set up"
         );
+        *self.audio.lock().unwrap() = Some(super::audio::Target::new(&launch, &settings));
         *self.video.lock().unwrap() = Some(Video {
             settings,
             ping_payload: launch.ping_payload,
@@ -216,6 +243,7 @@ impl Stream {
 
     /// The control stream ended: no more video until the client sets up a stream again.
     pub fn end_video(&self) {
+        *self.audio.lock().unwrap() = None;
         if self.video.lock().unwrap().take().is_some() {
             info!("Moonlight stream ended");
         }
@@ -228,6 +256,15 @@ impl Stream {
 
     pub fn request_keyframe(&self) {
         self.keyframe.store(true, Ordering::SeqCst);
+    }
+
+    /// A UDP datagram on the audio port: a ping tells where the client is.
+    fn on_audio_ping(&self, data: &[u8], from: SocketAddr) {
+        if let Some(t) = self.audio.lock().unwrap().as_mut()
+            && t.on_ping(data, from)
+        {
+            info!(%from, "Moonlight audio goes to the client");
+        }
     }
 
     /// A UDP datagram on the video port: a ping tells where the client is.
@@ -354,9 +391,10 @@ pub fn new(
     ip: IpAddr,
     ports: Ports,
     hevc: bool,
+    audio: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
 ) -> Result<(GameStreamOutput, Arc<Stream>)> {
-    let bind = SocketAddr::new(ip, ports.video);
-    let socket = {
+    let udp = |port: u16| -> Result<UdpSocket> {
+        let bind = SocketAddr::new(ip, port);
         let s = socket2::Socket::new(
             socket2::Domain::for_address(bind),
             socket2::Type::DGRAM,
@@ -365,7 +403,7 @@ pub fn new(
         let _ = s.set_send_buffer_size(8 << 20);
         s.bind(&bind.into())
             .with_context(|| format!("binding UDP {bind}"))?;
-        UdpSocket::from(s)
+        Ok(UdpSocket::from(s))
     };
     let stream = Arc::new(Stream {
         session,
@@ -374,7 +412,9 @@ pub fn new(
         hevc,
         launch: Mutex::new(None),
         video: Mutex::new(None),
-        socket,
+        socket: udp(ports.video)?,
+        audio: Mutex::new(None),
+        audio_socket: udp(ports.audio)?,
         keyframe: AtomicBool::new(false),
         bitrate: AtomicU32::new(0),
         sent: AtomicU64::new(0),
@@ -383,7 +423,20 @@ pub fn new(
         let stream = Arc::clone(&stream);
         std::thread::Builder::new()
             .name("gs-video".into())
-            .spawn(move || ping_loop(&stream))?;
+            .spawn(move || ping_loop(&stream.socket, "video", |d, f| stream.on_ping(d, f)))?;
+    }
+    {
+        let stream = Arc::clone(&stream);
+        std::thread::Builder::new()
+            .name("gs-audio-ping".into())
+            .spawn(move || {
+                ping_loop(&stream.audio_socket, "audio", |d, f| {
+                    stream.on_audio_ping(d, f)
+                })
+            })?;
+    }
+    if let Some(audio) = audio {
+        super::audio::spawn(Arc::clone(&stream), audio)?;
     }
     Ok((
         GameStreamOutput {
@@ -393,16 +446,17 @@ pub fn new(
     ))
 }
 
-fn ping_loop(stream: &Stream) {
+/// Reads the client's pings on a media socket.
+fn ping_loop(socket: &UdpSocket, what: &str, on_ping: impl Fn(&[u8], SocketAddr)) {
     let mut buf = [0u8; 64];
     loop {
-        match stream.socket.recv_from(&mut buf) {
-            Ok((n, from)) => stream.on_ping(&buf[..n], from),
+        match socket.recv_from(&mut buf) {
+            Ok((n, from)) => on_ping(&buf[..n], from),
             // Windows reports an ICMP "port unreachable" for an earlier send as an error on
             // the next receive; it says nothing about this socket.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
             Err(e) => {
-                warn!(%e, "Moonlight video socket failed");
+                warn!(%e, what, "Moonlight media socket failed");
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -519,6 +573,9 @@ mod tests {
                 packet_size: 1392,
                 bitrate_kbps: 20_000,
                 codec: Codec::Hevc,
+                audio_encrypted: false,
+                audio_ms: 5,
+                audio_channels: 2,
             }
         );
         assert!(Settings::from_sdp("a=x-nv-video[0].maxFPS:60").is_err());
@@ -593,7 +650,7 @@ mod tests {
 
     #[test]
     fn ping_payload_is_hex() {
-        let l = Launch::new([0; 16], [10, 0, 0, 2].into(), 1, "Desktop");
+        let l = Launch::new([0; 16], 7, [10, 0, 0, 2].into(), 1, "Desktop");
         assert!(l.ping_payload.iter().all(u8::is_ascii_hexdigit));
     }
 }

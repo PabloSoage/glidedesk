@@ -8,10 +8,11 @@
 //! - pairing with a PIN ([`pair`]), typed on the host with `glidedesk-host pair <PIN>`;
 //! - `/serverinfo` and `/applist` (the host's [`crate::apps`]);
 //! - `/launch`, `/resume` and `/cancel`, the RTSP handshake ([`rtsp`]), video ([`stream`])
-//!   and the control stream ([`control`]).
+//!   audio ([`audio`]) and the control stream ([`control`]).
 //!
-//! Not yet: audio, gamepads, touch and pen, FEC parity packets, encrypted video.
+//! Not yet: surround sound, gamepads, touch and pen, FEC parity packets, encrypted video.
 
+pub mod audio;
 pub mod control;
 pub mod http;
 pub mod identity;
@@ -258,7 +259,12 @@ fn launch(req: &Request, peer: SocketAddr, local: IpAddr, state: &State, resume:
         .arg("rikey")
         .and_then(identity::unhex)
         .and_then(|k| <[u8; 16]>::try_from(k).ok());
-    let (Some(key), Some(_)) = (key, req.arg("rikeyid")) else {
+    // A signed 32-bit number in Moonlight's URL.
+    let key_id = req
+        .arg("rikeyid")
+        .and_then(|k| k.parse::<i64>().ok())
+        .map(|k| k as u32);
+    let (Some(key), Some(key_id)) = (key, key_id) else {
         return Xml::error(400, "Missing a required launch parameter");
     };
     let running = stream.launch();
@@ -295,7 +301,7 @@ fn launch(req: &Request, peer: SocketAddr, local: IpAddr, state: &State, resume:
         app
     };
     let mode = req.arg("mode").unwrap_or("0x0x0");
-    let launch = stream::Launch::new(key, peer.ip(), app.id, &app.name);
+    let launch = stream::Launch::new(key, key_id, peer.ip(), app.id, &app.name);
     info!(%peer, app = app.name, mode, resume, "Moonlight launch");
     stream.set_launch(launch);
     let host = match local {

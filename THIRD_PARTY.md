@@ -26,6 +26,7 @@ and commit, and marked in the file header.
 | `crates/host/src/gamestream/rtsp.rs` (RTSP handshake, `DESCRIBE` SDP, Opus layouts) | Sunshine `src/rtsp.cpp`, `src/audio.cpp`; moonlight-common-c `src/RtspConnection.c`, `src/SdpGenerator.c` | `224c6be`; `b4ee1ce` |
 | `crates/host/src/gamestream/stream.rs` (video packets, frame header, ports) | Sunshine `src/stream.cpp`; moonlight-common-c `src/Video.h`, `src/RtpVideoQueue.c`, `src/VideoDepacketizer.c` | `224c6be`; `b4ee1ce` |
 | `crates/host/src/gamestream/control.rs` (control stream encryption, message types) | Sunshine `src/stream.cpp`; moonlight-common-c `src/ControlStream.c` | `224c6be`; `b4ee1ce` |
+| `crates/host/src/gamestream/audio.rs` (audio packets, encryption, bitrate choice) | Sunshine `src/stream.cpp`, `src/audio.cpp`; moonlight-common-c `src/AudioStream.c`, `src/RtpAudioQueue.c` | `224c6be`; `b4ee1ce` |
 | `crates/host/src/gamestream/input.rs` (input message layouts) | moonlight-common-c `src/Input.h`, `src/InputStream.c`; Sunshine `src/input.cpp` | `b4ee1ce`; `224c6be` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and

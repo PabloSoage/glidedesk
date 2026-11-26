@@ -248,6 +248,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                 http_bind.ip(),
                 crate::gamestream::stream::Ports::from_http(http_bind.port()),
                 hevc,
+                parts.audio.clone(),
             )?;
             outputs.push(Box::new(output));
             Some(stream)

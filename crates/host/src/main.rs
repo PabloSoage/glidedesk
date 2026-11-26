@@ -132,7 +132,7 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         max_in_flight: u32,
         /// Also serve Moonlight clients (GameStream: 47989/tcp, 47984/tcp, RTSP 48010/tcp,
-        /// video 47998/udp, control and input 47999/udp). No audio or gamepads yet.
+        /// video 47998/udp, control and input 47999/udp, sound 48000/udp). No gamepads yet.
         #[arg(long)]
         gamestream: bool,
     },

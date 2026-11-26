@@ -13,7 +13,7 @@ gnome = ["dep:zbus", "dep:pipewire", "dep:futures-util"]
 # Existing X11 displays (Termux's termux-x11, X11 desktops).
 x11 = ["dep:x11rb"]
 # Browsers over WebRTC (page, signalling and media on one port).
-web = ["dep:str0m", "dep:serde", "dep:serde_json", "dep:opus"]
+web = ["dep:str0m", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 anyhow = "1"
@@ -58,7 +58,8 @@ ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcode
 str0m = { version = "0.24", default-features = false, features = ["openssl"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-opus = { version = "0.4", optional = true }
+# Sound for browsers and Moonlight (libopus).
+opus = "0.4"
 rusty_enet = "0.4"
 
 [target.'cfg(windows)'.dependencies]
