@@ -14,8 +14,6 @@ mod color;
 mod csc;
 mod encoder;
 mod ffenc;
-// Used by the Windows host for now; the GNOME session follows.
-#[cfg_attr(not(windows), allow(dead_code))]
 mod filecopy;
 mod frame;
 mod gamestream;
