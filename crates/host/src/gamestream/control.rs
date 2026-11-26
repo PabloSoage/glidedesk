@@ -7,8 +7,9 @@
 //! and payload. The 12-byte IV is the sequence number (LE) followed by zeros and two bytes
 //! naming the direction: "CC" from the client, "HC" from the host.
 //!
-//! What the host acts on: keyframe requests (and reference invalidations, answered with a
-//! keyframe), keyboard and mouse ([`super::input`]) and the end of the connection.
+//! What the host acts on: keyframe requests, reference frame invalidations (the encoder stops
+//! referencing the lost frames, or sends a keyframe if it cannot), keyboard and mouse
+//! ([`super::input`]) and the end of the connection.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -107,10 +108,15 @@ fn on_event(event: Event<'_, UdpSocket>, stream: &Stream, input: &mut Option<Moo
 
 fn on_message(kind: u16, payload: &[u8], stream: &Stream, input: &mut Option<MoonlightInput>) {
     match kind {
-        REQUEST_IDR | INVALIDATE_REFS => {
-            debug!(kind, "Moonlight asked for a keyframe");
+        REQUEST_IDR => {
+            debug!("Moonlight asked for a keyframe");
             stream.request_keyframe();
         }
+        // SS_RFI_REQUEST: first lost frame (LE u32), reserved, last lost frame.
+        INVALIDATE_REFS => match payload.get(..4) {
+            Some(b) => stream.invalidate_from(u32::from_le_bytes(b.try_into().unwrap())),
+            None => stream.request_keyframe(),
+        },
         INPUT => {
             if let Some(i) = input {
                 i.handle(payload, stream.desktop_size());

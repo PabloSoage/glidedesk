@@ -118,13 +118,16 @@ fn ping(launch: &super::stream::Launch) -> String {
 }
 
 /// The `DESCRIBE` SDP: no Sunshine feature flags, control stream encryption supported and
-/// asked for, HEVC if the encoder makes it (the VPS prefix is how GameStream says so), and the
-/// Opus layouts.
+/// asked for, reference frame invalidation, HEVC if the encoder makes it (the VPS prefix is how
+/// GameStream says so), and the Opus layouts.
 fn describe(hevc: bool) -> String {
     let mut s = String::from("a=x-ss-general.featureFlags:0\r\n");
     s.push_str(&format!(
         "a=x-ss-general.encryptionSupported:{SS_ENC_CONTROL_V2}\r\na=x-ss-general.encryptionRequested:{SS_ENC_CONTROL_V2}\r\n"
     ));
+    // Lost frames are invalidated rather than answered with a keyframe where the encoder can
+    // (NVENC); otherwise the host sends a keyframe anyway.
+    s.push_str("a=x-nv-video[0].refPicInvalidation:1\r\n");
     if hevc {
         s.push_str("sprop-parameter-sets=AAAAAU\r\n");
     }

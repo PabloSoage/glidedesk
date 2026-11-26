@@ -171,7 +171,13 @@ struct Video {
     size: Option<(u32, u32)>,
     /// Reused packet buffer.
     buf: Vec<u8>,
+    /// Frame numbers sent lately and the encoder's picture index of each, for invalidation
+    /// requests.
+    sent: std::collections::VecDeque<(u32, u64)>,
 }
+
+/// Frames remembered for invalidation (a loss further back needs a keyframe).
+const SENT_HISTORY: usize = 128;
 
 /// Streaming state shared by `/launch`, RTSP, the control stream and the pipeline.
 pub struct Stream {
@@ -185,6 +191,8 @@ pub struct Stream {
     pub(super) audio: Mutex<Option<super::audio::Target>>,
     pub(super) audio_socket: UdpSocket,
     keyframe: AtomicBool,
+    /// Encoder picture index of the oldest frame the client lost and asked to invalidate.
+    lost: Mutex<Option<u64>>,
     bitrate: AtomicU32,
     sent: AtomicU64,
 }
@@ -243,7 +251,9 @@ impl Stream {
             epoch: Instant::now(),
             size: None,
             buf: Vec::new(),
+            sent: std::collections::VecDeque::new(),
         });
+        *self.lost.lock().unwrap() = None;
         Ok(())
     }
 
@@ -262,6 +272,25 @@ impl Stream {
 
     pub fn request_keyframe(&self) {
         self.keyframe.store(true, Ordering::SeqCst);
+    }
+
+    /// The client lost frames from `first` on (reference frame invalidation): the encoder stops
+    /// referencing them, or sends a keyframe when it cannot or they are too far back.
+    pub fn invalidate_from(&self, first: u32) {
+        let index = self.video.lock().unwrap().as_ref().and_then(|v| {
+            v.sent
+                .iter()
+                .find(|&&(f, _)| f == first)
+                .map(|&(_, index)| index)
+        });
+        debug!(first, ?index, "Moonlight lost frames");
+        match index {
+            Some(index) => {
+                let mut lost = self.lost.lock().unwrap();
+                *lost = Some(lost.map_or(index, |l| l.min(index)));
+            }
+            None => self.request_keyframe(),
+        }
     }
 
     /// A UDP datagram on the audio port: a ping tells where the client is.
@@ -362,7 +391,20 @@ impl Output for GameStreamOutput {
                 .filter(|&n| n > 1)
         });
         static SENT: AtomicU64 = AtomicU64::new(0);
+        // GLIDEDESK_GS_TEST_DROP_FRAME=N leaves out every Nth P-frame whole, to see the client
+        // ask for an invalidation.
+        static DROP_FRAME: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
+            std::env::var("GLIDEDESK_GS_TEST_DROP_FRAME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n > 1)
+        });
+        let skip_frame =
+            !main.keyframe && DROP_FRAME.is_some_and(|n| v.frame_index.is_multiple_of(n));
         for p in 0..packets {
+            if skip_frame {
+                break;
+            }
             if let Some(n) = *DROP
                 && SENT.fetch_add(1, Ordering::Relaxed).is_multiple_of(n)
             {
@@ -377,6 +419,12 @@ impl Output for GameStreamOutput {
             }
         }
         v.buf = buf;
+        if main.index != 0 {
+            if v.sent.len() == SENT_HISTORY {
+                v.sent.pop_front();
+            }
+            v.sent.push_back((v.frame_index, main.index));
+        }
         self.stream.sent.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
@@ -396,7 +444,11 @@ impl Output for GameStreamOutput {
     }
 
     fn wants_refresh(&self) -> bool {
-        self.stream.keyframe.load(Ordering::SeqCst)
+        self.stream.keyframe.load(Ordering::SeqCst) || self.stream.lost.lock().unwrap().is_some()
+    }
+
+    fn take_lost(&mut self) -> Option<u64> {
+        self.stream.lost.lock().unwrap().take()
     }
 
     fn link_estimate(&mut self) -> Option<u32> {
@@ -438,6 +490,7 @@ pub fn new(
         audio: Mutex::new(None),
         audio_socket: udp(ports.audio)?,
         keyframe: AtomicBool::new(false),
+        lost: Mutex::new(None),
         bitrate: AtomicU32::new(0),
         sent: AtomicU64::new(0),
     });
