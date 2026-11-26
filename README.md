@@ -31,6 +31,37 @@ and 26.04 (GNOME 50) with NVIDIA GPUs (VA-API encoding on AMD and Intel through 
 clients run on Windows, Linux, Android and Termux, plus anything with Moonlight or a browser.
 The Windows server is a preview (see below).
 
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph server["Server: Linux or Windows"]
+    desk["Desktop<br>headless GNOME on Linux,<br>the signed-in user's on Windows"]
+    cap["Capture<br>PipeWire / Desktop Duplication"]
+    enc["Hardware encoder<br>NVENC, VA-API, AMF, Quick Sync<br>x264 without a GPU"]
+    rdp["RDP<br>3389/tcp"]
+    nat["glidedesk protocol<br>3391, video over UDP + FEC"]
+    web["Web, WebRTC<br>3390, Linux server"]
+    gs["Moonlight, GameStream<br>47984-48010"]
+    desk --> cap --> enc
+    enc --> rdp & nat & web & gs
+  end
+  subgraph clients["Clients"]
+    c1["mstsc, Windows App,<br>FreeRDP, Remmina"]
+    c2["glidedesk for Windows,<br>Linux, Android, Termux"]
+    c3["any browser"]
+    c4["Moonlight: Switch, TVs,<br>phones, PCs"]
+  end
+  rdp --> c1
+  nat --> c2
+  web --> c3
+  gs --> c4
+  clients -.->|"keyboard, mouse, gamepads, clipboard"| desk
+```
+
+With NVENC each frame goes from the GPU that composed it to the encoder without passing through
+the CPU, and is sent as soon as the desktop changes; a still desktop sends almost nothing.
+
 ## Quick start
 
 Files are on the [releases page](https://github.com/PabloSoage/glidedesk/releases). Clients
@@ -67,7 +98,7 @@ log in with the server's user name and the password you give the server.
 |---|---|---|
 | Windows | `glidedesk-windows-x86_64.exe` (lowest latency) | run it, type the server and user, **Connect** |
 | Windows | Remote Desktop, built in | `mstsc /v:<server>` (Windows server: `<server>:3392`) |
-| Linux | `glidedesk-linux-x86_64` | `glidedesk <server> --user <user>` |
+| Linux | `glidedesk-linux-x86_64-ubuntu24.04` or `-ubuntu26.04` | `glidedesk <server> --user <user>` |
 | Linux | FreeRDP / Remmina | `xfreerdp3 /v:<server> /u:<user> /dynamic-resolution` |
 | Android | `glidedesk-android.apk` | install, type server, user and password, **Low latency** |
 | macOS, iOS, Android | Microsoft's Windows App (RDP) | add the server as a PC |
@@ -343,16 +374,20 @@ next to a private headless GNOME Shell (it is the release's `glidedesk-session.s
 
 ## Design
 
-```
-clients: mstsc / Windows App / FreeRDP    glidedesk (Windows, Linux, Android, Termux)    browsers
-              |  RDP (TLS, EGFX H.264)            |  TLS control + UDP video with FEC      |  WebRTC
-              v                                   v                                        v
-glidedesk-host: RDP front end (IronRDP)  |  native front end  |  web front end (str0m, HTTPS page)
-                encoder: NVENC (colour conversion in CUDA), or VA-API / x264 (FFmpeg)
-                rate control: constant quality under a ceiling that follows the link (or WebRTC's estimate)
-                capture: Mutter ScreenCast RecordVirtual -> PipeWire -> CUDA (zero copy)
-                input, clipboard: Mutter RemoteDesktop
-                session: gnome-shell --headless (Wayland, rendered on the GPU through GBM)
+```mermaid
+flowchart TB
+  session["gnome-shell --headless<br>Wayland, rendered on the GPU through GBM"]
+  capture["Mutter ScreenCast RecordVirtual<br>PipeWire into CUDA, zero copy"]
+  encoder["Encoder: NVENC, colour conversion in CUDA<br>or VA-API / x264 through FFmpeg"]
+  rate["Rate control: constant quality under a ceiling<br>that follows the link, or WebRTC's estimate"]
+  input["Mutter RemoteDesktop<br>keyboard, mouse, clipboard; uinput for gamepads"]
+  session --> capture --> encoder
+  rate -.-> encoder
+  encoder --> rdp["RDP front end, IronRDP<br>TLS, EGFX H.264"]
+  encoder --> nat["native front end<br>TLS control + UDP video with FEC"]
+  encoder --> web["web front end<br>str0m WebRTC + HTTPS page"]
+  encoder --> gs["GameStream front end<br>RTSP, ENet control, RTP video with FEC"]
+  rdp & nat & web & gs -.-> input -.-> session
 ```
 
 The last client to connect, on either protocol, gets the session; the previous one is told
