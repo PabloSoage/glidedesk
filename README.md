@@ -243,19 +243,27 @@ fc00::/7 and link-local). On GNOME the session's sound output is 7.1, so games a
 send surround; RDP and browsers get it mixed down to stereo.
 
 Each controller on the client becomes a virtual Xbox 360 pad in the session, with rumble going
-back to the client. On Linux this needs write access to `/dev/uinput`, which is root's only by
-default; a udev rule like Sunshine's gives it to a group:
+back to the client. On Linux, a controller with motion sensors (or a PlayStation one) becomes a
+virtual DualSense instead, made through UHID so the kernel's `hid-playstation` driver gives games
+its gyroscope and accelerometer; if that fails it falls back to an Xbox 360 pad without motion.
+This needs write access to `/dev/uinput` and, for the DualSense, `/dev/uhid`; both are root's
+only by default. Udev rules like Sunshine's give them to a group:
 
 ```sh
-echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="uinput", MODE="0660"' |
+printf '%s\n' \
+  'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", GROUP="uinput", MODE="0660"' \
+  'KERNEL=="uhid", SUBSYSTEM=="misc", OPTIONS+="static_node=uhid", GROUP="uinput", MODE="0660"' |
   sudo tee /etc/udev/rules.d/60-glidedesk-uinput.rules
 sudo groupadd -f uinput && sudo usermod -aG uinput "$USER"   # then log in again
-sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
+sudo udevadm control --reload
+sudo udevadm trigger --name-match=uinput && sudo udevadm trigger --name-match=uhid
 ```
 
-Anyone in that group can create input devices, so add only the user the server runs as. On
-Windows the pads need the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver.
-Not done yet: touch and pen (Moonlight turns them into mouse input for now), and gyro.
+Anyone in that group can create input devices, so add only the user the server runs as. Without
+the `uhid` rule, controllers still work as Xbox 360 pads, only without motion. On Windows the
+pads need the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver and are always
+Xbox 360 pads, without motion. Touch works with several fingers on GNOME (on X11 and Windows the
+first finger moves the mouse), and a pen works as the pointer.
 
 If the "Stop screen sharing" button in GNOME's top bar is pressed, the server starts a new
 session by itself within about a second; clients stay connected. Windows that were full
