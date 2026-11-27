@@ -845,7 +845,11 @@ fn offer(
         .clear_codecs()
         .enable_h264(true)
         .enable_h265(front.hevc)
-        .enable_opus(true, false)
+        // RFC 2198 RED on the sound (one level: each packet also carries the previous one),
+        // where the browser offers it: a lost audio packet is recovered without waiting for
+        // a retransmission. str0m 0.24 has no FEC for video (ULPFEC, FlexFEC): video relies on
+        // NACK/RTX.
+        .enable_opus(true, true)
         .enable_bwe(Some(Bitrate::from(INITIAL_BPS)))
         .build(now);
     let desired = front
