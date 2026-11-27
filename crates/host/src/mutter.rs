@@ -47,6 +47,12 @@ pub trait RemoteDesktopSession {
     fn notify_pointer_axis(&self, dx: f64, dy: f64, flags: u32) -> zbus::Result<()>;
     #[zbus(no_reply)]
     fn notify_pointer_axis_discrete(&self, axis: u32, steps: i32) -> zbus::Result<()>;
+    #[zbus(no_reply)]
+    fn notify_touch_down(&self, stream: &str, slot: u32, x: f64, y: f64) -> zbus::Result<()>;
+    #[zbus(no_reply)]
+    fn notify_touch_motion(&self, stream: &str, slot: u32, x: f64, y: f64) -> zbus::Result<()>;
+    #[zbus(no_reply)]
+    fn notify_touch_up(&self, slot: u32) -> zbus::Result<()>;
 
     fn enable_clipboard(&self, options: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
     fn disable_clipboard(&self) -> zbus::Result<()>;

@@ -144,12 +144,17 @@ fn is_private(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// The `DESCRIBE` SDP: no Sunshine feature flags; encryption of the control stream (always),
-/// video and audio (offered: the client opts in; asked for from outside private networks);
-/// reference frame invalidation; HEVC if the encoder makes it (the VPS prefix is how
-/// GameStream says so); and the Opus layouts.
+/// Sunshine feature flags (moonlight-common-c `LI_FF_*`): touch and pen events (1),
+/// controller arrival, touchpad and motion events (2). Without them Moonlight turns touch
+/// into mouse input and sends no motion.
+pub const FEATURE_FLAGS: u32 = 0x01 | 0x02;
+
+/// The `DESCRIBE` SDP: the Sunshine feature flags; encryption of the control stream
+/// (always), video and audio (offered: the client opts in; asked for from outside private
+/// networks); reference frame invalidation; HEVC if the encoder makes it (the VPS prefix is
+/// how GameStream says so); and the Opus layouts.
 fn describe(hevc: bool, remote: bool) -> String {
-    let mut s = String::from("a=x-ss-general.featureFlags:0\r\n");
+    let mut s = format!("a=x-ss-general.featureFlags:{FEATURE_FLAGS}\r\n");
     let supported = SS_ENC_CONTROL_V2 | SS_ENC_VIDEO | SS_ENC_AUDIO;
     let requested = if remote { supported } else { SS_ENC_CONTROL_V2 };
     s.push_str(&format!(

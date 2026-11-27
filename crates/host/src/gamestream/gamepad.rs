@@ -84,24 +84,86 @@ pub fn parse(body: &[u8]) -> Option<(usize, u16, PadState)> {
 /// Rumble for the client: controller number, low and high frequency motors (0-65535).
 pub type Rumble = Arc<dyn Fn(u16, u16, u16) + Send + Sync>;
 
-trait Pad: Send {
+/// Asks the client to report a motion sensor of a controller (Sunshine's control message
+/// 0x5501): controller number, [`MOTION_ACCEL`] or [`MOTION_GYRO`], reports per second (0
+/// stops them).
+pub type MotionRequest = Arc<dyn Fn(u16, u8, u16) + Send + Sync>;
+
+/// `LI_MOTION_TYPE_*`: accelerometer in m/s² (gravity included), gyroscope in °/s.
+pub const MOTION_ACCEL: u8 = 0x01;
+pub const MOTION_GYRO: u8 = 0x02;
+
+/// `LI_CTYPE_*` and `LI_CCAP_*` of the controller arrival message.
+pub const TYPE_PLAYSTATION: u8 = 0x02;
+pub const CAP_ACCEL: u16 = 0x10;
+pub const CAP_GYRO: u16 = 0x20;
+
+/// Motion reports asked for while a pad with sensors is plugged in.
+const MOTION_RATE_HZ: u16 = 100;
+
+/// What the client said about one of its controllers when it arrived.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Arrival {
+    pub kind: u8,
+    pub capabilities: u16,
+}
+
+impl Arrival {
+    /// The controller has motion sensors.
+    pub fn motion(&self) -> bool {
+        self.capabilities & (CAP_ACCEL | CAP_GYRO) != 0
+    }
+}
+
+pub(super) trait Pad: Send {
     fn set(&mut self, s: &PadState) -> Result<()>;
+    /// A motion report ([`MOTION_ACCEL`] or [`MOTION_GYRO`]; x, y, z). Pads without
+    /// sensors ignore it.
+    fn motion(&mut self, _kind: u8, _xyz: [f32; 3]) -> Result<()> {
+        Ok(())
+    }
+    /// The pad passes motion on, so the client should send it.
+    fn has_motion(&self) -> bool {
+        false
+    }
 }
 
 /// The virtual pads of one client.
 pub struct Gamepads {
     pads: Vec<Option<Box<dyn Pad>>>,
+    arrivals: [Option<Arrival>; MAX_PADS],
     rumble: Rumble,
+    motion_request: MotionRequest,
     /// Creating a pad failed once (no permission, no driver): said once, not per message.
     failed: bool,
 }
 
 impl Gamepads {
-    pub fn new(rumble: Rumble) -> Self {
+    pub fn new(rumble: Rumble, motion_request: MotionRequest) -> Self {
         Self {
             pads: (0..MAX_PADS).map(|_| None).collect(),
+            arrivals: [None; MAX_PADS],
             rumble,
+            motion_request,
             failed: false,
+        }
+    }
+
+    /// The client described one of its controllers (it does before the first state message
+    /// when the host announces the Sunshine extensions).
+    pub fn arrival(&mut self, number: usize, kind: u8, capabilities: u16) {
+        if number < MAX_PADS {
+            info!(number, kind, capabilities, "Moonlight controller arrived");
+            self.arrivals[number] = Some(Arrival { kind, capabilities });
+        }
+    }
+
+    /// A motion report for controller `number`.
+    pub fn motion(&mut self, number: usize, kind: u8, xyz: [f32; 3]) {
+        if let Some(Some(pad)) = self.pads.get_mut(number)
+            && let Err(e) = pad.motion(kind, xyz)
+        {
+            tracing::debug!(%e, "Motion update failed");
         }
     }
 
@@ -109,8 +171,14 @@ impl Gamepads {
     /// and set.
     pub fn update(&mut self, number: usize, mask: u16, state: &PadState) {
         for (i, pad) in self.pads.iter_mut().enumerate() {
-            if mask & (1 << i) == 0 && pad.take().is_some() {
+            if mask & (1 << i) == 0 && let Some(old) = pad.take() {
                 info!(number = i, "Moonlight gamepad unplugged");
+                if old.has_motion() {
+                    for kind in [MOTION_ACCEL, MOTION_GYRO] {
+                        (self.motion_request)(i as u16, kind, 0);
+                    }
+                }
+                self.arrivals[i] = None;
             }
         }
         if number >= MAX_PADS || mask & (1 << number) == 0 {
@@ -120,9 +188,17 @@ impl Gamepads {
             if self.failed {
                 return;
             }
-            match backend::create(number, Arc::clone(&self.rumble)) {
+            let arrival = self.arrivals[number].unwrap_or_default();
+            match backend::create(number, arrival, Arc::clone(&self.rumble)) {
                 Ok(pad) => {
-                    info!(number, "Moonlight gamepad plugged in");
+                    info!(number, motion = pad.has_motion(), "Moonlight gamepad plugged in");
+                    if pad.has_motion() {
+                        for (cap, kind) in [(CAP_ACCEL, MOTION_ACCEL), (CAP_GYRO, MOTION_GYRO)] {
+                            if arrival.capabilities & cap != 0 {
+                                (self.motion_request)(number as u16, kind, MOTION_RATE_HZ);
+                            }
+                        }
+                    }
                     self.pads[number] = Some(pad);
                 }
                 Err(e) => {
@@ -147,6 +223,7 @@ impl Gamepads {
         for pad in &mut self.pads {
             *pad = None;
         }
+        self.arrivals = [None; MAX_PADS];
         self.failed = false;
     }
 }
@@ -197,7 +274,24 @@ mod backend {
         }
     }
 
-    pub fn create(number: usize, rumble: Rumble) -> Result<Box<dyn Pad>> {
+    /// A controller with motion sensors becomes a DualSense through UHID (the kernel's
+    /// `hid-playstation` then makes the gamepad, its motion sensors and touchpad, which
+    /// SDL and Steam pair by their shared unique id; uinput devices cannot have one). If that
+    /// fails, or the controller has no sensors, an Xbox 360 pad through uinput.
+    pub fn create(number: usize, arrival: super::Arrival, rumble: Rumble) -> Result<Box<dyn Pad>> {
+        if arrival.motion() || arrival.kind == super::TYPE_PLAYSTATION {
+            match super::super::dualsense::create(number, Arc::clone(&rumble)) {
+                Ok(pad) => return Ok(pad),
+                Err(e) => tracing::warn!(
+                    error = format!("{e:#}"),
+                    "No virtual DualSense (/dev/uhid): an Xbox 360 pad without motion"
+                ),
+            }
+        }
+        xbox(number, rumble)
+    }
+
+    fn xbox(number: usize, rumble: Rumble) -> Result<Box<dyn Pad>> {
         let stick = AbsInfo::new(0, -32768, 32767, 16, 128, 0);
         let trigger = AbsInfo::new(0, 0, 255, 0, 0, 0);
         let hat = AbsInfo::new(0, -1, 1, 0, 0, 0);
@@ -404,7 +498,12 @@ mod backend {
         target: Xbox360Wired<Client>,
     }
 
-    pub fn create(number: usize, rumble: Rumble) -> Result<Box<dyn Pad>> {
+    /// ViGEm's Xbox 360 target has no motion sensors: motion from the client is not asked for.
+    pub fn create(
+        number: usize,
+        _arrival: super::Arrival,
+        rumble: Rumble,
+    ) -> Result<Box<dyn Pad>> {
         let client = Client::connect().context("connecting to ViGEmBus (is it installed?)")?;
         let mut target = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
         target.plugin().context("plugging in the virtual pad")?;
@@ -441,9 +540,9 @@ mod backend {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 mod backend {
-    use super::{Pad, Rumble};
+    use super::{Arrival, Pad, Rumble};
 
-    pub fn create(_: usize, _: Rumble) -> anyhow::Result<Box<dyn Pad>> {
+    pub fn create(_: usize, _: Arrival, _: Rumble) -> anyhow::Result<Box<dyn Pad>> {
         anyhow::bail!("virtual gamepads are not supported on this system")
     }
 }
@@ -491,9 +590,10 @@ mod tests {
         use std::sync::Mutex;
         let rumbles = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&rumbles);
-        let mut pads = Gamepads::new(Arc::new(move |n, lo, hi| {
-            seen.lock().unwrap().push((n, lo, hi))
-        }));
+        let mut pads = Gamepads::new(
+            Arc::new(move |n, lo, hi| seen.lock().unwrap().push((n, lo, hi))),
+            Arc::new(|_, _, _| {}),
+        );
         let first = PadState::default();
         pads.update(0, 1, &first);
         assert!(!pads.failed, "no uinput access");

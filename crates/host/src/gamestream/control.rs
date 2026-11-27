@@ -38,6 +38,8 @@ const INPUT: u16 = 0x0206;
 const START_A: u16 = 0x0305;
 const START_B: u16 = 0x0307;
 const RUMBLE: u16 = 0x010b;
+/// Sunshine extension: report a controller's motion sensor at a rate.
+const SET_MOTION_EVENT: u16 = 0x5501;
 
 /// Runs the control stream on its own thread (ENet polls a non-blocking socket).
 pub fn spawn(stream: Arc<Stream>, bind: SocketAddr, input: Option<InputForwarder>) -> Result<()> {
@@ -54,12 +56,29 @@ pub fn spawn(stream: Arc<Stream>, bind: SocketAddr, input: Option<InputForwarder
     std::thread::Builder::new()
         .name("gs-control".into())
         .spawn(move || {
-            // Rumble from the session's gamepads, to send from this thread.
-            let (tx, rx) = std::sync::mpsc::channel();
-            let rumble: super::gamepad::Rumble = Arc::new(move |n, low, high| {
-                let _ = tx.send((n, low, high));
+            // Messages from the session's gamepads (rumble, motion sensor requests), to send
+            // from this thread.
+            let (tx, rx) = std::sync::mpsc::channel::<(u16, Vec<u8>)>();
+            let rumble: super::gamepad::Rumble = {
+                let tx = tx.clone();
+                Arc::new(move |n, low, high| {
+                    // Sunshine's control_rumble_t: a constant, controller, low and high
+                    // motor (LE).
+                    let mut payload = 0x00c0_ffee_u32.to_le_bytes().to_vec();
+                    for v in [n, low, high] {
+                        payload.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let _ = tx.send((RUMBLE, payload));
+                })
+            };
+            let motion: super::gamepad::MotionRequest = Arc::new(move |n, kind, rate_hz| {
+                // moonlight-common-c reads controller (LE u16), rate (LE u16), type (u8).
+                let mut payload = n.to_le_bytes().to_vec();
+                payload.extend_from_slice(&rate_hz.to_le_bytes());
+                payload.push(kind);
+                let _ = tx.send((SET_MOTION_EVENT, payload));
             });
-            let mut input = input.map(|i| MoonlightInput::new(i, rumble));
+            let mut input = input.map(|i| MoonlightInput::new(i, rumble, motion));
             run(host, &stream, &mut input, &rx)
         })?;
     Ok(())
@@ -76,17 +95,12 @@ fn run(
     mut host: Host<UdpSocket>,
     stream: &Stream,
     input: &mut Option<MoonlightInput>,
-    rumble: &std::sync::mpsc::Receiver<(u16, u16, u16)>,
+    outgoing: &std::sync::mpsc::Receiver<(u16, Vec<u8>)>,
 ) {
     let mut client = Client::default();
     loop {
-        while let Ok((n, low, high)) = rumble.try_recv() {
-            // Sunshine's control_rumble_t: a constant, controller, low and high motor (LE).
-            let mut payload = 0x00c0_ffee_u32.to_le_bytes().to_vec();
-            for v in [n, low, high] {
-                payload.extend_from_slice(&v.to_le_bytes());
-            }
-            send(&mut host, stream, &mut client, RUMBLE, &payload);
+        while let Ok((kind, payload)) = outgoing.try_recv() {
+            send(&mut host, stream, &mut client, kind, &payload);
         }
         match host.service() {
             Ok(Some(event)) => on_event(event, stream, input, &mut client),

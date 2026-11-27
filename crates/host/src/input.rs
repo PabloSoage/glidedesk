@@ -30,6 +30,11 @@ pub enum Input {
     Button(i32, bool),
     /// Wheel notches: axis 0 vertical (positive down), 1 horizontal (positive right).
     Scroll { axis: u32, steps: i32 },
+    /// A finger touched the screen, at desktop pixels. Slots are small numbers, one per
+    /// finger down. Only sent to backends that [`InputBackend::touch`].
+    TouchDown { slot: u32, x: f64, y: f64 },
+    TouchMotion { slot: u32, x: f64, y: f64 },
+    TouchUp { slot: u32 },
 }
 
 /// Applies input to the session.
@@ -38,6 +43,10 @@ pub trait InputBackend: Send + Sync + 'static {
     /// Runs once before the first event.
     async fn start(&self) {}
     async fn apply(&self, ev: &Input) -> anyhow::Result<()>;
+    /// The session takes touch input; without it, the first finger drives the pointer.
+    fn touch(&self) -> bool {
+        false
+    }
 }
 
 /// Mutter's RemoteDesktop session: whichever is current (it is replaced when Mutter closes
@@ -83,6 +92,10 @@ impl InputBackend for MutterInput {
         self.session().await;
     }
 
+    fn touch(&self) -> bool {
+        true
+    }
+
     async fn apply(&self, ev: &Input) -> anyhow::Result<()> {
         let (r, stream_path) = self.session().await;
         match *ev {
@@ -91,6 +104,13 @@ impl InputBackend for MutterInput {
             Input::Motion(x, y) => r.notify_pointer_motion_absolute(&stream_path, x, y).await?,
             Input::Button(b, down) => r.notify_pointer_button(b, down).await?,
             Input::Scroll { axis, steps } => r.notify_pointer_axis_discrete(axis, steps).await?,
+            Input::TouchDown { slot, x, y } => {
+                r.notify_touch_down(&stream_path, slot, x, y).await?
+            }
+            Input::TouchMotion { slot, x, y } => {
+                r.notify_touch_motion(&stream_path, slot, x, y).await?
+            }
+            Input::TouchUp { slot } => r.notify_touch_up(slot).await?,
         }
         Ok(())
     }
@@ -158,11 +178,16 @@ pub struct InputForwarder {
     /// Keys held down. Mutter rejects a release of a key that is not down and a second
     /// press of one that is; clients send both (key repeat, focus synchronisation).
     pressed: std::collections::HashSet<u32>,
+    /// The backend takes touch input.
+    touch: bool,
+    /// Without touch input: the finger driving the pointer.
+    primary: Option<u32>,
 }
 
 impl InputForwarder {
     pub fn spawn(backend: Box<dyn InputBackend>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
+        let touch = backend.touch();
         tokio::spawn(async move {
             backend.start().await;
             let mut last_pos = None;
@@ -199,11 +224,51 @@ impl InputForwarder {
             tx,
             wheel: (0, 0),
             pressed: Default::default(),
+            touch,
+            primary: None,
         }
     }
 
     fn send(&self, ev: Input) {
         let _ = self.tx.send(ev);
+    }
+
+    /// A finger down at desktop pixels. Where the session takes no touch input, the first
+    /// finger down acts as the mouse with the left button held, and the others are ignored.
+    pub fn touch_down(&mut self, slot: u32, x: f64, y: f64) {
+        if self.touch {
+            self.send(Input::TouchDown { slot, x, y });
+        } else if self.primary.is_none() {
+            self.primary = Some(slot);
+            self.send(Input::Motion(x, y));
+            self.send(Input::Button(BTN_LEFT, true));
+        }
+    }
+
+    pub fn touch_motion(&mut self, slot: u32, x: f64, y: f64) {
+        if self.touch {
+            self.send(Input::TouchMotion { slot, x, y });
+        } else if self.primary == Some(slot) {
+            self.send(Input::Motion(x, y));
+        }
+    }
+
+    pub fn touch_up(&mut self, slot: u32) {
+        if self.touch {
+            self.send(Input::TouchUp { slot });
+        } else if self.primary == Some(slot) {
+            self.primary = None;
+            self.send(Input::Button(BTN_LEFT, false));
+        }
+    }
+
+    /// A pen (or any pointer that is not a mouse) at desktop pixels: it moves the pointer;
+    /// `buttons` are evdev button codes and their state.
+    pub fn pointer(&mut self, x: f64, y: f64, buttons: &[(i32, bool)]) {
+        self.send(Input::Motion(x, y));
+        for &(b, down) in buttons {
+            self.send(Input::Button(b, down));
+        }
     }
 
     fn scroll(&mut self, axis: u32, value: i32) {

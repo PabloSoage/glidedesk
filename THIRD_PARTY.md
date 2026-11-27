@@ -13,6 +13,7 @@
 | [rusty_enet](https://github.com/jabuwu/rusty_enet) (ENet 1.3 in Rust) | host dependency (Moonlight control stream) | MIT |
 | [evdev](https://github.com/cmr/evdev) | host dependency on Linux (virtual gamepads through uinput) | Apache-2.0 OR MIT |
 | [vigem-client](https://github.com/CasualX/vigem-client) | host dependency on Windows (virtual gamepads through ViGEmBus) | MIT |
+| [inputtino](https://github.com/games-on-whales/inputtino) DualSense report descriptor and feature reports | `crates/host/src/gamestream/dualsense.rs` | MIT (notice in the file) |
 | `crates/desktop/src/probe.hevc`: a 256×144 HEVC test frame made with FFmpeg's `testsrc2` | desktop client | generated, no license |
 
 Code adapted from [Sunshine](https://github.com/LizardByte/Sunshine) or
@@ -32,6 +33,7 @@ and commit, and marked in the file header.
 | `crates/host/src/gamestream/fec.rs` (Reed-Solomon parity: GF(2^8) 0x11d, Cauchy matrix) | [nanors](https://github.com/sleepybishop/nanors) `rs.c` (MIT); Sunshine `src/stream.cpp` (`fec::encode`, which fields parity covers) | `a9b1636`; `224c6be` |
 | `crates/host/src/gamestream/input.rs` (input message layouts) | moonlight-common-c `src/Input.h`, `src/InputStream.c`; Sunshine `src/input.cpp` | `b4ee1ce`; `224c6be` |
 | `crates/host/src/gamestream/gamepad.rs` (controller message, button bits, rumble message) | moonlight-common-c `src/Input.h`, `src/Limelight.h`, `src/ControlStream.c`; Sunshine `src/input.cpp`, `src/stream.cpp` | `b4ee1ce`; `224c6be` |
+| `crates/host/src/gamestream/dualsense.rs` (virtual DualSense over UHID: report descriptor, feature and input reports, rumble) | [inputtino](https://github.com/games-on-whales/inputtino) `src/uhid/joypad_ps5.cpp`, `src/uhid/include/uhid/ps5.hpp` (MIT) | `d28ec79` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).

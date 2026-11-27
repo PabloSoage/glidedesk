@@ -14,6 +14,8 @@
 
 pub mod audio;
 pub mod control;
+#[cfg(target_os = "linux")]
+pub mod dualsense;
 pub mod fec;
 pub mod gamepad;
 pub mod http;

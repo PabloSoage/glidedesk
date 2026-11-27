@@ -272,6 +272,8 @@ impl InputBackend for XTestInput {
                 }
                 Ok(())
             }
+            // XTest has no touch: the forwarder turns fingers into the pointer.
+            Input::TouchDown { .. } | Input::TouchMotion { .. } | Input::TouchUp { .. } => Ok(()),
         }
     }
 }

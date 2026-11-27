@@ -119,6 +119,7 @@ pub fn start(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<WinSessio
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    raise_gpu_priority();
     let (adapter, output) = primary_output()?;
     // SAFETY: plain DXGI call on a live interface.
     if let Ok(d) = unsafe { adapter.GetDesc1() } {
@@ -622,6 +623,39 @@ fn send(inputs: &[INPUT]) -> Result<()> {
     Ok(())
 }
 
+/// `D3DKMT_SCHEDULINGPRIORITYCLASS`: high, and realtime (which needs
+/// SeIncreaseBasePriorityPrivilege: administrators and SYSTEM have it).
+const GPU_PRIORITY_HIGH: i32 = 4;
+const GPU_PRIORITY_REALTIME: i32 = 5;
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    /// gdi32's export (d3dkmthk.h); a negative NTSTATUS on failure.
+    fn D3DKMTSetProcessSchedulingPriorityClass(process: *mut std::ffi::c_void, priority: i32)
+    -> i32;
+}
+
+/// Asks the GPU scheduler to run this process's work (capture copies, colour conversion,
+/// encoding) ahead of the desktop's: a game that keeps the GPU busy would otherwise delay
+/// every frame (Sunshine does the same). Realtime where the process may, else high.
+fn raise_gpu_priority() {
+    // GetCurrentProcess's pseudo handle.
+    let me = -1isize as *mut std::ffi::c_void;
+    for (class, name) in [(GPU_PRIORITY_REALTIME, "realtime"), (GPU_PRIORITY_HIGH, "high")] {
+        // SAFETY: the pseudo handle of this process and a valid priority class.
+        let status = unsafe { D3DKMTSetProcessSchedulingPriorityClass(me, class) };
+        if status >= 0 {
+            info!(priority = name, "GPU scheduling priority");
+            return;
+        }
+        debug!(
+            priority = name,
+            status = format!("{status:#x}"),
+            "GPU priority not granted"
+        );
+    }
+}
+
 /// A coordinate of the virtual desktop as SendInput's absolute units (0..=65535 across it).
 fn absolute(pos: i32, origin: i32, extent: i32) -> i32 {
     let extent = extent.max(1);
@@ -709,6 +743,8 @@ impl InputBackend for WinInput {
                 };
                 send(&[mouse_input(0, 0, delta as u32, flags)])
             }
+            // Touch injection is not used yet: the forwarder turns fingers into the pointer.
+            Input::TouchDown { .. } | Input::TouchMotion { .. } | Input::TouchUp { .. } => Ok(()),
         }
     }
 }
