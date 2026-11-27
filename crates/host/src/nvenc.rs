@@ -4,7 +4,8 @@
 //! constant quality under a link-adapted ceiling with a VBV of about one frame, intra
 //! refresh instead of periodic IDR). Frames are BGRx in a
 //! pitched CUDA buffer that NVENC reads as `ARGB` (A8R8G8B8 little-endian is B, G, R, A in
-//! memory); NVENC converts to YUV itself.
+//! memory) and converts to YUV itself, or YUV from [`crate::color`]: NV12, or planar 4:4:4
+//! for HEVC Range Extensions (`NV_ENC_HEVC_PROFILE_FREXT_GUID`, `chromaFormatIDC` 3).
 
 use std::ffi::c_void;
 use std::ptr;
@@ -154,6 +155,14 @@ impl Encoder {
             // only the DPB is larger. (Sunshine asks for both; Volta has only the first.)
             this.invalidation = invalidate > 0;
         }
+        if this.cfg.yuv444 {
+            let supported = this.cfg.codec == Codec::Hevc
+                && this.cap(nv::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE) > 0;
+            if !supported {
+                warn!(codec = ?this.cfg.codec, "No 4:4:4 encoding on this GPU: sending 4:2:0");
+                this.cfg.yuv444 = false;
+            }
+        }
         this.initialize()?;
         this.allocate()?;
         info!(
@@ -274,10 +283,14 @@ impl Encoder {
                     v.colourMatrix = nv::NV_ENC_VUI_MATRIX_COEFFS_BT709;
                 }
                 Codec::Hevc => {
+                    if c.yuv444 {
+                        // Range Extensions: 8-bit 4:4:4.
+                        config.profileGUID = nv::NV_ENC_HEVC_PROFILE_FREXT_GUID;
+                    }
                     let h = &mut config.encodeCodecConfig.hevcConfig;
                     h.idrPeriod = nv::NVENC_INFINITE_GOPLENGTH;
                     h.set_repeatSPSPPS(1);
-                    h.set_chromaFormatIDC(1);
+                    h.set_chromaFormatIDC(if c.yuv444 { 3 } else { 1 });
                     if self.invalidation {
                         h.maxNumRefFramesInDPB = INVALIDATION_DPB;
                         h.numRefL0 = nv::NV_ENC_NUM_REF_FRAMES_1;
@@ -382,6 +395,11 @@ impl Encoder {
 
     pub fn size(&self) -> (u32, u32) {
         (self.cfg.width, self.cfg.height)
+    }
+
+    /// The encoder takes planar 4:4:4 and writes HEVC 4:4:4 (asked for and supported).
+    pub fn yuv444(&self) -> bool {
+        self.cfg.yuv444
     }
 
     /// Changes the encode size in place (no new session) and forces an IDR.
@@ -527,6 +545,21 @@ impl Encoder {
             f.width,
             f.height,
             nv::NV_ENC_BUFFER_FORMAT_NV12,
+        )
+    }
+
+    /// Encodes a planar 4:4:4 frame (from [`crate::color::Converter::convert_yuv444`]); only
+    /// for an encoder opened for it ([`Encoder::yuv444`]).
+    pub fn encode_yuv444(&mut self, f: &crate::color::Yuv444) -> Result<EncodedFrame> {
+        if !self.cfg.yuv444 {
+            bail!("this encoder was not opened for 4:4:4");
+        }
+        self.encode_external(
+            f.ptr,
+            f.pitch,
+            f.width,
+            f.height,
+            nv::NV_ENC_BUFFER_FORMAT_YUV444,
         )
     }
 

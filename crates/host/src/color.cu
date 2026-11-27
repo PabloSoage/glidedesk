@@ -1,4 +1,4 @@
-// RGB → YUV for the RDP H.264 codecs (see color.rs). After editing, regenerate the PTX the
+// RGB → YUV for the RDP H.264 codecs and HEVC 4:4:4 (see color.rs). After editing, regenerate the PTX the
 // host embeds with scripts/gen-ptx.sh (needs nvcc; the server itself only needs the driver).
 
 __device__ __forceinline__ unsigned char clamp8(int v) {
@@ -60,4 +60,24 @@ extern "C" __global__ void rgb_to_avc(
     int plane = bx & 1;   // 0 = U plane, 1 = V plane
     auv[(size_t)by * pitch + 2 * k + plane] = U[2];
     auv[(size_t)by * pitch + 2 * (quarter + k) + plane] = V[2];
+}
+
+// src: as above. dst: planar 4:4:4 (Y, then U, then V), each plane h rows of pitch bytes,
+// w × h (multiples of 16). One thread per pixel; the padding repeats the edge pixels.
+extern "C" __global__ void rgb_to_yuv444(
+    const unsigned char* src, int src_pitch, int src_w, int src_h, int order,
+    unsigned char* dst, int pitch, int w, int h)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    int sx = min(x, src_w - 1);
+    int sy = min(y, src_h - 1);
+    int Y, U, V;
+    yuv(src + (size_t)sy * src_pitch + sx * 4, order, &Y, &U, &V);
+    size_t plane = (size_t)pitch * h;
+    size_t at = (size_t)y * pitch + x;
+    dst[at] = Y;
+    dst[plane + at] = U;
+    dst[2 * plane + at] = V;
 }

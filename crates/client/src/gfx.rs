@@ -48,6 +48,11 @@ pub trait VideoSink: Send {
     fn backlog(&self) -> usize {
         0
     }
+    /// The sink decodes and shows HEVC 4:4:4 (native protocol, version 5): the server is
+    /// asked for it when the session uses HEVC. Asked once per connection.
+    fn yuv444(&self) -> bool {
+        false
+    }
 }
 
 pub type SharedSink = Arc<Mutex<dyn VideoSink>>;

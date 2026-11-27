@@ -159,6 +159,10 @@ enum Command {
         /// With AVC444, always send both views (no luma-only frames during motion).
         #[arg(long)]
         no_hybrid: bool,
+        /// Send HEVC 4:4:4 (full chroma: sharp coloured text) to native clients that ask for
+        /// it (`glidedesk --yuv444`). NVENC, on GPUs that encode 4:4:4; others get 4:2:0.
+        #[arg(long)]
+        yuv444: bool,
         /// Do not re-encode a still image to raise its quality after motion.
         #[arg(long)]
         no_refine: bool,
@@ -354,6 +358,7 @@ async fn main() -> Result<()> {
             password,
             avc444,
             no_hybrid,
+            yuv444,
             no_refine,
             max_in_flight,
             gamestream,
@@ -426,6 +431,7 @@ async fn main() -> Result<()> {
                 session,
                 pipeline: pipeline::Options {
                     avc444,
+                    yuv444,
                     hybrid: !no_hybrid,
                     refine: !no_refine,
                     max_in_flight,
@@ -629,6 +635,7 @@ async fn encode_test(
                 bitrate,
                 refs: 1,
                 invalidation: false,
+                yuv444: false,
             },
         )?;
         let mut file = std::fs::File::create(&out)?;

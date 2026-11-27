@@ -1,7 +1,9 @@
 //! Video decoding through FFmpeg: the GPU's decoder where there is one (D3D11VA on Windows:
 //! NVIDIA, AMD and Intel alike; VA-API, then NVDEC, on Linux), FFmpeg's own software
-//! decoders otherwise. H.264 and HEVC. Decoded pictures come back as NV12 in system memory
-//! for the renderer.
+//! decoders otherwise. H.264 and HEVC, 4:2:0 and (HEVC Range Extensions) 4:4:4. Decoded
+//! pictures come back in system memory for the renderer: NV12, or planar 4:4:4. (FFmpeg 8
+//! decodes HEVC 4:4:4 on VA-API and NVDEC, not D3D11VA: on Windows it falls back to
+//! software.)
 //!
 //! Low-latency settings: no frame threading (it holds pictures back), `LOW_DELAY`, one picture
 //! out per access unit. If the GPU refuses a stream (an unsupported profile or size), FFmpeg
@@ -16,7 +18,7 @@ use ffmpeg_sys_next as ff;
 use glidedesk_client::gfx::VideoCodec;
 use tracing::{debug, info};
 
-use crate::video::Picture;
+use crate::video::{Chroma, Picture};
 
 /// PCI vendor of the GPU to decode on (`--gpu`); unset: the system's default one.
 static GPU: OnceLock<u32> = OnceLock::new();
@@ -270,7 +272,11 @@ impl Decoder {
                 let hw = !(*self.frame).hw_frames_ctx.is_null();
                 let src = if hw {
                     ff::av_frame_unref(self.sw);
-                    (*self.sw).format = ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+                    // The GPU's own layout: NV12 for 4:2:0; planar (NVDEC, some VA-API
+                    // drivers) or packed VUYX (other VA-API drivers) for 4:4:4.
+                    let frames =
+                        (*(*self.frame).hw_frames_ctx).data as *const ff::AVHWFramesContext;
+                    (*self.sw).format = (*frames).sw_format as i32;
                     let e = ff::av_hwframe_transfer_data(self.sw, self.frame, 0);
                     if e < 0 {
                         ff::av_frame_unref(self.frame);
@@ -288,21 +294,74 @@ impl Decoder {
     }
 }
 
-/// A decoded frame (NV12, or planar 4:2:0 from the software decoders) as NV12.
+/// A decoded frame as a [`Picture`]: NV12 or planar 4:2:0 (software decoders) as NV12;
+/// planar, semi-planar (NV24) or packed (VUYX) 4:4:4 as planar 4:4:4.
 fn to_picture(f: &ff::AVFrame, received: std::time::Instant) -> Result<Picture> {
+    use ff::AVPixelFormat as P;
     let (w, h) = (f.width as usize, f.height as usize);
     let ch = h.div_ceil(2);
     let plane = |i: usize, rows: usize| -> &[u8] {
         // SAFETY: FFmpeg planes hold `linesize * rows` bytes (positive strides here).
         unsafe { std::slice::from_raw_parts(f.data[i], f.linesize[i] as usize * rows) }
     };
-    let y_stride = f.linesize[0] as usize;
     let fmt = f.format;
-    let (uv, uv_stride) = if fmt == ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32 {
+    let is = |p: P| fmt == p as i32;
+    if is(P::AV_PIX_FMT_YUV444P) || is(P::AV_PIX_FMT_YUVJ444P) {
+        // Rows packed to `w`: the two chroma planes then share one stride.
+        let tight = |i: usize| -> Vec<u8> {
+            let ls = f.linesize[i] as usize;
+            plane(i, h).chunks(ls).flat_map(|row| &row[..w]).copied().collect()
+        };
+        return Ok(Picture {
+            width: w as u32,
+            height: h as u32,
+            y: plane(0, h).to_vec(),
+            y_stride: f.linesize[0] as u32,
+            chroma: Chroma::Planar {
+                u: tight(1),
+                v: tight(2),
+                stride: w as u32,
+            },
+            received,
+        });
+    }
+    if is(P::AV_PIX_FMT_NV24) || is(P::AV_PIX_FMT_VUYX) {
+        // Interleaved samples, split into planes: NV24 is Y, then U V pairs; VUYX is V, U,
+        // Y, X per pixel in one plane.
+        let packed = is(P::AV_PIX_FMT_VUYX);
+        let (mut y, mut u, mut v) = (vec![0u8; w * h], vec![0u8; w * h], vec![0u8; w * h]);
+        for row in 0..h {
+            let at = row * w;
+            let y_line = &plane(0, h)[row * f.linesize[0] as usize..];
+            if packed {
+                for (x, px) in y_line[..w * 4].as_chunks::<4>().0.iter().enumerate() {
+                    (v[at + x], u[at + x], y[at + x]) = (px[0], px[1], px[2]);
+                }
+            } else {
+                y[at..at + w].copy_from_slice(&y_line[..w]);
+                let uv_line = &plane(1, h)[row * f.linesize[1] as usize..][..w * 2];
+                for (x, pair) in uv_line.as_chunks::<2>().0.iter().enumerate() {
+                    (u[at + x], v[at + x]) = (pair[0], pair[1]);
+                }
+            }
+        }
+        return Ok(Picture {
+            width: w as u32,
+            height: h as u32,
+            y,
+            y_stride: w as u32,
+            chroma: Chroma::Planar {
+                u,
+                v,
+                stride: w as u32,
+            },
+            received,
+        });
+    }
+    let y_stride = f.linesize[0] as usize;
+    let (uv, uv_stride) = if is(P::AV_PIX_FMT_NV12) {
         (plane(1, ch).to_vec(), f.linesize[1] as usize)
-    } else if fmt == ff::AVPixelFormat::AV_PIX_FMT_YUV420P as i32
-        || fmt == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32
-    {
+    } else if is(P::AV_PIX_FMT_YUV420P) || is(P::AV_PIX_FMT_YUVJ420P) {
         // Interleave U and V (software decoding only).
         let cw = w.div_ceil(2);
         let (us, vs) = (f.linesize[1] as usize, f.linesize[2] as usize);
@@ -323,9 +382,11 @@ fn to_picture(f: &ff::AVFrame, received: std::time::Instant) -> Result<Picture> 
         width: w as u32,
         height: h as u32,
         y: plane(0, h).to_vec(),
-        uv,
         y_stride: y_stride as u32,
-        uv_stride: uv_stride as u32,
+        chroma: Chroma::Nv12 {
+            uv,
+            stride: uv_stride as u32,
+        },
         received,
     })
 }

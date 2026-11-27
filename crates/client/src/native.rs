@@ -276,6 +276,13 @@ async fn session(
     sink.lock()
         .unwrap()
         .reset(u32::from(width), u32::from(height), codec);
+    // Version 5: HEVC 4:4:4 where this client shows it. Sent before the UDP hello, so the
+    // server usually knows before its first picture (if not, it starts over with a
+    // keyframe).
+    if version >= 5 && codec == Codec::Hevc && sink.lock().unwrap().yuv444() {
+        info!("Asking for HEVC 4:4:4");
+        glidedesk_proto::write_msg(&mut wr, &ClientMsg::Formats { yuv444: true }).await?;
+    }
     if let Some(app) = &opts.app {
         if version < 3 {
             bail!("this server is too old to open apps (it needs glidedesk 0.4 or newer)");

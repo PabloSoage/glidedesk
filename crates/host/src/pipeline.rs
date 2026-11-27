@@ -115,11 +115,18 @@ pub trait Output: Send {
     }
     /// The bitrate ceiling changed (the native front end paces its packets to it).
     fn set_ceiling(&mut self, _bps: u32) {}
+    /// The client asked for HEVC 4:4:4 and the session uses HEVC (native protocol,
+    /// version 5).
+    fn yuv444(&self) -> bool {
+        false
+    }
 }
 
 pub struct Options {
     /// Send AVC444v2 (4:4:4) when the client supports it.
     pub avc444: bool,
+    /// Send HEVC 4:4:4 to native clients that ask for it, where the encoder can.
+    pub yuv444: bool,
     /// H-002: luma-only frames while things move, chroma once still.
     pub hybrid: bool,
     /// Re-encode the still image after motion until its quality settles.
@@ -390,7 +397,7 @@ impl Pipeline {
         let Some(output) = self.outputs.get_mut(index) else {
             return Ok(());
         };
-        let (avc444, codec) =
+        let (avc444, codec, yuv444) =
             match output.prepare(frame.width, frame.height, self.opts.max_in_flight)? {
                 Prepared::Absent => {
                     self.source.client_left();
@@ -419,10 +426,15 @@ impl Pipeline {
                         debug!(index, "Cannot invalidate the lost picture: keyframe");
                         self.backend.request_keyframe();
                     }
-                    (
-                        avc444 && self.opts.avc444 && self.backend.supports_avc444(),
-                        codec,
-                    )
+                    let avc444 = avc444 && self.opts.avc444 && self.backend.supports_avc444();
+                    // HEVC 4:4:4 (both sides opted in). A change starts a new encoder,
+                    // hence a keyframe.
+                    let yuv444 = !avc444
+                        && codec == Codec::Hevc
+                        && self.opts.yuv444
+                        && output.yuv444()
+                        && self.backend.supports_yuv444();
+                    (avc444, codec, yuv444)
                 }
             };
         // Which AVC444 views this frame carries (H-002): luma-only while things move,
@@ -445,6 +457,7 @@ impl Pipeline {
                 main: mode != Mode::ChromaOnly,
                 aux: avc444 && mode != Mode::LumaOnly,
                 const_qp: self.refine_qp,
+                yuv444,
             },
         )?;
         let encode_us = t.elapsed().as_micros();

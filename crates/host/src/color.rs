@@ -9,6 +9,9 @@
 //! - optionally the auxiliary view of AVC444v2 (MS-RDPEGFX 3.3.8.3.3): the chroma samples the
 //!   main view dropped, packed into a second NV12 frame, so the client recovers 4:4:4.
 //!
+//! A second kernel writes planar 4:4:4 (one thread per pixel, the same BT.709 full-range
+//! coefficients) for HEVC Range Extensions on the native protocol.
+//!
 //! Frames are padded to multiples of 16 (MS-RDPEGFX 2.2.4.4); edge pixels are repeated.
 
 use std::sync::Arc;
@@ -37,19 +40,7 @@ pub struct Nv12 {
 impl Nv12 {
     fn new(ctx: &Arc<CudaContext>, width: u32, height: u32) -> Result<Self> {
         let pitch = (width as usize).next_multiple_of(256);
-        let bytes = pitch * height as usize * 3 / 2;
-        ctx.bind_to_thread()?;
-        let mut ptr = 0;
-        // SAFETY: the context is current on this thread.
-        let r = unsafe { cu::cuMemAlloc_v2(&mut ptr, bytes) };
-        if r != cu::CUresult::CUDA_SUCCESS {
-            bail!("cuMemAlloc for an NV12 frame failed: {r:?}");
-        }
-        // SAFETY: clears the allocation (black luma, neutral chroma is not needed: padding
-        // only costs bits if it changes, and it never does).
-        unsafe {
-            cu::cuMemsetD8_v2(ptr, 0, bytes);
-        }
+        let ptr = alloc(ctx, pitch * height as usize * 3 / 2, "an NV12 frame")?;
         Ok(Self {
             ptr,
             pitch,
@@ -70,6 +61,57 @@ impl Drop for Nv12 {
     }
 }
 
+/// A planar 4:4:4 frame on the GPU: Y, U and V planes one after the other, each `height`
+/// rows of `pitch` bytes (NVENC's `NV_ENC_BUFFER_FORMAT_YUV444`).
+pub struct Yuv444 {
+    pub ptr: cu::CUdeviceptr,
+    pub pitch: usize,
+    pub width: u32,
+    pub height: u32,
+    ctx: Arc<CudaContext>,
+}
+
+impl Yuv444 {
+    fn new(ctx: &Arc<CudaContext>, width: u32, height: u32) -> Result<Self> {
+        let pitch = (width as usize).next_multiple_of(256);
+        let ptr = alloc(ctx, pitch * height as usize * 3, "a 4:4:4 frame")?;
+        Ok(Self {
+            ptr,
+            pitch,
+            width,
+            height,
+            ctx: Arc::clone(ctx),
+        })
+    }
+}
+
+impl Drop for Yuv444 {
+    fn drop(&mut self) {
+        let _ = self.ctx.bind_to_thread();
+        // SAFETY: allocated in `new`, freed once.
+        unsafe {
+            cu::cuMemFree_v2(self.ptr);
+        }
+    }
+}
+
+/// `bytes` of device memory, cleared (black luma, neutral chroma is not needed: padding only
+/// costs bits if it changes, and it never does).
+fn alloc(ctx: &Arc<CudaContext>, bytes: usize, what: &str) -> Result<cu::CUdeviceptr> {
+    ctx.bind_to_thread()?;
+    let mut ptr = 0;
+    // SAFETY: the context is current on this thread.
+    let r = unsafe { cu::cuMemAlloc_v2(&mut ptr, bytes) };
+    if r != cu::CUresult::CUDA_SUCCESS {
+        bail!("cuMemAlloc for {what} failed: {r:?}");
+    }
+    // SAFETY: `ptr` holds `bytes` bytes.
+    unsafe {
+        cu::cuMemsetD8_v2(ptr, 0, bytes);
+    }
+    Ok(ptr)
+}
+
 /// Size the encoder works at: the frame padded to multiples of 16.
 pub fn coded_size(width: u32, height: u32) -> (u32, u32) {
     (width.next_multiple_of(16), height.next_multiple_of(16))
@@ -79,8 +121,11 @@ pub struct Converter {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     func: CudaFunction,
+    /// The 4:4:4 kernel; missing from a color.ptx generated before it existed.
+    func444: Option<CudaFunction>,
     main: Option<Nv12>,
     aux: Option<Nv12>,
+    full: Option<Yuv444>,
 }
 
 impl Converter {
@@ -89,14 +134,75 @@ impl Converter {
             .load_module(cudarc::nvrtc::Ptx::from_src(PTX))
             .context("loading the colour kernel")?;
         let func = module.load_function("rgb_to_avc")?;
+        let func444 = module
+            .load_function("rgb_to_yuv444")
+            .inspect_err(|e| {
+                tracing::warn!(%e, "No 4:4:4 kernel in color.ptx (run scripts/gen-ptx.sh)");
+            })
+            .ok();
         let stream = ctx.default_stream();
         Ok(Self {
             ctx,
             stream,
             func,
+            func444,
             main: None,
             aux: None,
+            full: None,
         })
+    }
+
+    /// Whether [`Converter::convert_yuv444`] is available.
+    pub fn has_yuv444(&self) -> bool {
+        self.func444.is_some()
+    }
+
+    /// Converts `src` into a planar 4:4:4 frame of the coded size.
+    pub fn convert_yuv444(&mut self, src: &DeviceBuffer) -> Result<&Yuv444> {
+        let Some(func) = self.func444.as_ref() else {
+            bail!("the 4:4:4 kernel is not available");
+        };
+        let (w, h) = coded_size(src.width, src.height);
+        if self
+            .full
+            .as_ref()
+            .is_none_or(|f| (f.width, f.height) != (w, h))
+        {
+            self.full = Some(Yuv444::new(&self.ctx, w, h)?);
+        }
+        let dst = self.full.as_ref().expect("allocated above");
+        let (src_ptr, src_pitch, src_w, src_h) = (
+            src.ptr,
+            src.pitch as i32,
+            src.width as i32,
+            src.height as i32,
+        );
+        let order: i32 = match src.order {
+            PixelOrder::Bgrx => 0,
+            PixelOrder::Rgba => 1,
+        };
+        let (dst_ptr, pitch, cw, ch) = (dst.ptr, dst.pitch as i32, w as i32, h as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (w.div_ceil(16), h.div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(func);
+        launch
+            .arg(&src_ptr)
+            .arg(&src_pitch)
+            .arg(&src_w)
+            .arg(&src_h)
+            .arg(&order)
+            .arg(&dst_ptr)
+            .arg(&pitch)
+            .arg(&cw)
+            .arg(&ch);
+        // SAFETY: the arguments match the kernel signature; the buffers cover the sizes
+        // passed (three planes of `h` rows of `pitch` bytes).
+        unsafe { launch.launch(cfg) }?;
+        self.stream.synchronize()?;
+        Ok(dst)
     }
 
     /// Converts `src` into the main view and, with `avc444`, the auxiliary view.

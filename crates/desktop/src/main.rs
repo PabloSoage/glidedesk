@@ -80,6 +80,11 @@ struct Args {
     /// Video codec to ask for (the native protocol; RDP is always H.264).
     #[arg(long, value_enum, default_value_t = CodecChoice::Auto)]
     codec: CodecChoice,
+    /// Ask for HEVC 4:4:4 (full chroma: sharp coloured text) from servers started with
+    /// `--yuv444`. Native protocol; HEVC even without a GPU decoder (FFmpeg decodes 4:4:4 in
+    /// software where the GPU cannot, e.g. D3D11VA on Windows).
+    #[arg(long)]
+    yuv444: bool,
     /// Do not share the clipboard.
     #[arg(long)]
     no_clipboard: bool,
@@ -252,6 +257,7 @@ impl App {
             Arc::clone(&notify),
             player,
             !self.args.software_decode,
+            self.args.yuv444 && !self.args.rdp,
         )));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if !self.args.rdp && !self.args.no_clipboard {
@@ -269,14 +275,16 @@ impl App {
             .map_or(60, |mhz| (mhz + 500) / 1000);
         // HEVC (fewer bits for the same picture) only where the GPU decodes it.
         let can_hevc = !self.args.rdp && !self.args.software_decode && decode::hardware_hevc();
+        // 4:4:4 needs HEVC, whoever decodes it.
+        let want_444 = self.args.yuv444 && !self.args.rdp;
         let hevc = match self.args.codec {
-            CodecChoice::Auto => can_hevc,
+            CodecChoice::Auto => can_hevc || want_444,
             CodecChoice::H264 => false,
             CodecChoice::Hevc => {
-                if !can_hevc {
+                if !can_hevc && !want_444 {
                     warn!("HEVC asked for, but this client cannot decode it here: H.264");
                 }
-                can_hevc
+                can_hevc || want_444
             }
         };
         self.runtime.spawn(async move {

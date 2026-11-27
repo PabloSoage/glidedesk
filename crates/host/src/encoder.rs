@@ -5,7 +5,8 @@
 //!   software, fed by the CPU colour conversion; the capture goes through system memory.
 //!
 //! Each backend turns a captured frame into the H.264 pictures of one EGFX frame: the main
-//! view (AVC420, or the first stream of AVC444v2) and optionally the auxiliary view.
+//! view (AVC420, or the first stream of AVC444v2) and optionally the auxiliary view; or into
+//! one HEVC picture, 4:2:0 or (NVENC, native clients that ask) 4:4:4.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,6 +39,8 @@ pub struct EncoderConfig {
     pub refs: u32,
     /// Keep extra pictures in the DPB so lost ones can be invalidated (NVENC, not AVC444).
     pub invalidation: bool,
+    /// HEVC 4:4:4 (Range Extensions) from a planar YUV444 input (NVENC only).
+    pub yuv444: bool,
 }
 
 #[derive(Default)]
@@ -76,6 +79,8 @@ pub struct Request {
     pub aux: bool,
     /// Constant QP for a quality pass, where supported.
     pub const_qp: Option<u32>,
+    /// HEVC 4:4:4 instead of 4:2:0, where [`Backend::supports_yuv444`].
+    pub yuv444: bool,
 }
 
 pub trait Backend: Send {
@@ -83,6 +88,11 @@ pub trait Backend: Send {
     /// Whether AVC444 (both views through one encoder, two references) is available.
     fn supports_avc444(&self) -> bool;
     fn supports_hevc(&self) -> bool;
+    /// Whether HEVC 4:4:4 may be asked for ([`Request::yuv444`]). The encoder still falls
+    /// back to 4:2:0 when the GPU turns out not to have it.
+    fn supports_yuv444(&self) -> bool {
+        false
+    }
     /// `Request::const_qp` is honoured only where the rate control can switch in place
     /// (NVENC); elsewhere a quality pass is a plain re-encode.
     fn request_keyframe(&mut self);
@@ -108,13 +118,14 @@ fn config(codec: Codec, w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) ->
         bitrate,
         refs: if avc444 { 2 } else { 1 },
         invalidation: !avc444,
+        yuv444: false,
     }
 }
 
 // ---------------------------------------------------------------------------------------
 
-/// Codec and whether the two AVC444 views go through the encoder.
-type EncoderKey = (Codec, bool);
+/// Codec, whether the two AVC444 views go through the encoder, and HEVC 4:4:4.
+type EncoderKey = (Codec, bool, bool);
 
 pub struct Nvenc {
     ctx: Arc<CudaContext>,
@@ -155,6 +166,11 @@ impl Backend for Nvenc {
         true
     }
 
+    fn supports_yuv444(&self) -> bool {
+        // Needs the 4:4:4 kernel in color.ptx.
+        self.converter.has_yuv444()
+    }
+
     fn request_keyframe(&mut self) {
         if let Some((e, _, _)) = self.encoder.as_mut() {
             e.request_keyframe();
@@ -188,12 +204,15 @@ impl Backend for Nvenc {
             }
         };
         let size = color::coded_size(w, h);
+        let yuv444 =
+            req.yuv444 && req.codec == Codec::Hevc && !req.avc444 && self.converter.has_yuv444();
+        let key = (req.codec, req.avc444, yuv444);
         if self
             .encoder
             .as_ref()
-            .is_none_or(|(_, k, s)| *s != size || *k != (req.codec, req.avc444))
+            .is_none_or(|(_, k, s)| *s != size || *k != key)
         {
-            let cfg = config(
+            let mut cfg = config(
                 req.codec,
                 size.0,
                 size.1,
@@ -201,18 +220,20 @@ impl Backend for Nvenc {
                 self.fps,
                 self.bitrate,
             );
+            cfg.yuv444 = yuv444;
             // The old session goes first: the driver crashes (in a thread of its own) when a
             // session is destroyed after another one was opened on the same context.
             self.encoder = None;
-            self.encoder = Some((
-                Encoder::new(Arc::clone(&self.ctx), cfg)?,
-                (req.codec, req.avc444),
-                size,
-            ));
-            info!(w, h, codec = ?req.codec, avc444 = req.avc444, "NVENC encoder ready");
+            self.encoder = Some((Encoder::new(Arc::clone(&self.ctx), cfg)?, key, size));
+            info!(w, h, codec = ?req.codec, avc444 = req.avc444, yuv444, "NVENC encoder ready");
         }
         let (encoder, _, _) = self.encoder.as_mut().expect("created above");
         encoder.set_const_qp(req.const_qp)?;
+        if encoder.yuv444() {
+            // One full-chroma picture; never an AVC444 frame (see `yuv444` above).
+            let picture = self.converter.convert_yuv444(&src)?;
+            return Ok((encoder.encode_yuv444(picture)?, Default::default()));
+        }
         let (main, aux) = self.converter.convert(&src, req.aux)?;
         // Both views go through the same encoder as consecutive pictures: clients decode
         // AVC444 with a single H.264 decoder.
@@ -527,6 +548,7 @@ mod tests {
                         main: true,
                         aux: false,
                         const_qp: None,
+                        yuv444: false,
                     };
                     let (main, _) = backend.encode(&frame, &req).expect("encoding");
                     assert!(
