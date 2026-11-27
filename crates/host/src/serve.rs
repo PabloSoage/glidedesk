@@ -282,7 +282,8 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let (rdp_output, rdp_server) = crate::rdp::new(Arc::clone(&shared), RDP);
     let mut outputs: Vec<Box<dyn Output>> = vec![Box::new(rdp_output)];
     // The outputs of the front ends for further monitors, in the same order.
-    let mut monitor_outputs: Vec<Option<Arc<dyn MonitorOutputs>>> = vec![None];
+    let mut monitor_outputs: Vec<Option<Arc<dyn MonitorOutputs>>> =
+        vec![Some(rdp_server.monitors())];
     let native = match opts.native_bind {
         Some(bind) => {
             let (output, server) = crate::native::new(
@@ -363,6 +364,11 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         input: input.clone(),
         clipboard: parts.clipboard,
         auth_limiter: Arc::clone(&auth_limiter),
+        monitors: if parts.displays.is_some() {
+            crate::layout::MAX_MONITORS
+        } else {
+            1
+        },
     };
     let rdp_on = opts.rdp;
     let rdp = async move {

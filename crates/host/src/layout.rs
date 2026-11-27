@@ -166,10 +166,12 @@ impl Manager {
             let mut wanted = normalize(&asked, max);
             let had_extras = !running.is_empty();
             stop_all(std::mem::take(&mut running)).await;
-            let (w, h) = *self.shared.current_size.lock().unwrap();
+            // Monitor 0's size: the one asked for and not applied yet, or the one captured.
+            let pending = *self.shared.wanted_size.lock().unwrap();
+            let (w, h) = pending.unwrap_or_else(|| *self.shared.current_size.lock().unwrap());
             if wanted.len() > 1 {
-                // Monitor 0 keeps the size it is captured at (its client asked for it at
-                // login, or with a resize).
+                // Monitor 0 keeps that size (its client asked for it at login, with a resize
+                // or in the layout itself).
                 wanted[0].width = w as u16;
                 wanted[0].height = h as u16;
             }
