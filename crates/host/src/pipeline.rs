@@ -533,8 +533,12 @@ impl Pipeline {
         if !self.opts.fps_adapt {
             return None;
         }
-        let (w, h) = *self.shared.current_size.lock().unwrap();
-        let interval = crate::rate::frame_interval(self.rate.bps(), w, h)?;
+        // This stream's size and share of the ceiling (the whole of both with one monitor).
+        let (w, h) = match (self.monitor, &self.last_frame) {
+            (0, _) | (_, None) => *self.shared.current_size.lock().unwrap(),
+            (_, Some(f)) => (f.width, f.height),
+        };
+        let interval = crate::rate::frame_interval(self.applied_bps, w, h)?;
         Some(self.last_sent? + interval)
     }
 

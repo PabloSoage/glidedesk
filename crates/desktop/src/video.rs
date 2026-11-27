@@ -74,20 +74,60 @@ pub struct Sink {
     /// Ask native servers for HEVC 4:4:4 (`--yuv444`).
     yuv444: bool,
     hardware: bool,
+    /// The session's codec, from the last reset of monitor 0.
+    codec: Option<VideoCodec>,
     /// The windows of further monitors (native protocol, version 6).
     monitors: Vec<MonitorVideo>,
 }
 
-/// The video of a further monitor: its window's slot, and its decoder thread once the server
-/// starts the monitor's video.
+/// The video of a further monitor: its window's slot, and its decoder thread once its
+/// video starts.
 struct MonitorVideo {
     monitor: u8,
     slot: Arc<Mutex<Option<Picture>>>,
-    decoder: Option<(mpsc::Sender<Unit>, Arc<AtomicUsize>)>,
+    decoder: Option<MonitorDecoder>,
+}
+
+struct MonitorDecoder {
+    units: mpsc::Sender<Unit>,
+    /// Access units sent to it and not decoded yet.
+    queued: Arc<AtomicUsize>,
+    codec: VideoCodec,
+}
+
+impl Sink {
+    /// The decoder of `monitor`'s video. It starts with the first video of the monitor:
+    /// the size message (`codec`) or a frame (the session's codec), whichever comes first,
+    /// as the first keyframe can overtake the size message (UDP and TCP). A size change
+    /// keeps the decoder (the stream's parameter sets carry the size); another codec
+    /// starts it over.
+    fn monitor_decoder(
+        &mut self,
+        monitor: u8,
+        codec: Option<VideoCodec>,
+    ) -> Option<&MonitorDecoder> {
+        let (notify, hardware, session) = (Arc::clone(&self.notify), self.hardware, self.codec);
+        let m = self.monitors.iter_mut().find(|m| m.monitor == monitor)?;
+        let wanted = codec.or(m.decoder.as_ref().map(|d| d.codec)).or(session)?;
+        if m.decoder.as_ref().is_none_or(|d| d.codec != wanted) {
+            let d = m.decoder.get_or_insert_with(|| {
+                let (units, queued) = spawn(monitor, Arc::clone(&m.slot), notify, hardware);
+                MonitorDecoder {
+                    units,
+                    queued,
+                    codec: wanted,
+                }
+            });
+            d.codec = wanted;
+            let _ = d.units.send(Unit::Reset(wanted));
+        }
+        m.decoder.as_ref()
+    }
 }
 
 impl VideoSink for Sink {
     fn reset(&mut self, _width: u32, _height: u32, codec: VideoCodec) {
+        self.codec = Some(codec);
         let _ = self.units.send(Unit::Reset(codec));
     }
 
@@ -137,33 +177,18 @@ impl VideoSink for Sink {
     }
 
     fn reset_monitor(&mut self, monitor: u8, _width: u32, _height: u32, codec: VideoCodec) {
-        let Some(m) = self.monitors.iter_mut().find(|m| m.monitor == monitor) else {
+        if self.monitor_decoder(monitor, Some(codec)).is_none() {
             warn!(monitor, "Video for a monitor with no window");
-            return;
-        };
-        let (units, _) = m.decoder.get_or_insert_with(|| {
-            spawn(
-                monitor,
-                Arc::clone(&m.slot),
-                Arc::clone(&self.notify),
-                self.hardware,
-            )
-        });
-        let _ = units.send(Unit::Reset(codec));
+        }
     }
 
     fn frame_monitor(&mut self, monitor: u8, data: &[u8]) {
-        let Some((units, queued)) = self
-            .monitors
-            .iter()
-            .find(|m| m.monitor == monitor)
-            .and_then(|m| m.decoder.as_ref())
-        else {
+        let Some(d) = self.monitor_decoder(monitor, None) else {
             return;
         };
-        queued.fetch_add(1, Ordering::Relaxed);
-        if units.send(Unit::Data(data.to_vec(), Instant::now())).is_err() {
-            queued.fetch_sub(1, Ordering::Relaxed);
+        d.queued.fetch_add(1, Ordering::Relaxed);
+        if d.units.send(Unit::Data(data.to_vec(), Instant::now())).is_err() {
+            d.queued.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -172,7 +197,7 @@ impl VideoSink for Sink {
             .iter()
             .find(|m| m.monitor == monitor)
             .and_then(|m| m.decoder.as_ref())
-            .map_or(0, |(_, queued)| queued.load(Ordering::Relaxed))
+            .map_or(0, |d| d.queued.load(Ordering::Relaxed))
     }
 }
 
@@ -197,6 +222,7 @@ pub fn start(
         audio,
         yuv444,
         hardware,
+        codec: None,
         monitors: monitors
             .into_iter()
             .map(|(monitor, slot)| MonitorVideo {

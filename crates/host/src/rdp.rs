@@ -61,6 +61,18 @@ struct Shared {
     graphics: Mutex<Graphics>,
     /// The client's monitors (GCC, then Display Control), monitor 0 its primary.
     client_monitors: Arc<Mutex<Vec<glidedesk_proto::Monitor>>>,
+    /// The layout this front end asked for last, until the layout manager publishes it
+    /// ([`Display::size`] is asked right after the initial size).
+    asked: Mutex<Asked>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// Nothing pending: the published layout holds.
+    Nothing,
+    Single,
+    /// Several monitors, with this bounding box.
+    Several(u32, u32),
 }
 
 /// The client's monitors as a layout to ask for: `(left, top, width, height, primary)` each,
@@ -187,6 +199,7 @@ impl Display {
     fn several(&self, asked: Vec<glidedesk_proto::Monitor>) -> Option<DesktopSize> {
         let s = &self.shared.session;
         if self.monitors < 2 || asked.len() < 2 {
+            *self.shared.asked.lock().unwrap() = Asked::Single;
             s.request_layout(Vec::new());
             return None;
         }
@@ -195,6 +208,7 @@ impl Display {
         *s.current_size.lock().unwrap() = (w, h);
         let (dw, dh) = crate::layout::bounds(&layout);
         info!(monitors = layout.len(), w, h, dw, dh, "Client monitors");
+        *self.shared.asked.lock().unwrap() = Asked::Several(dw, dh);
         s.request_layout(layout);
         Some(DesktopSize {
             width: dw.min(u32::from(u16::MAX)) as u16,
@@ -250,10 +264,22 @@ impl RdpServerDisplayUpdates for PointerUpdates {
 impl RdpServerDisplay for Display {
     async fn size(&mut self) -> DesktopSize {
         let layout = self.shared.session.layout.borrow().clone();
-        let (w, h) = if layout.len() > 1 {
-            crate::layout::bounds(&layout)
-        } else {
-            *self.shared.session.current_size.lock().unwrap()
+        let several = layout.len() > 1;
+        let (w, h) = {
+            let mut asked = self.shared.asked.lock().unwrap();
+            // What was asked for while the layout manager has not published it yet.
+            match *asked {
+                Asked::Several(..) | Asked::Nothing if several => {
+                    *asked = Asked::Nothing;
+                    crate::layout::bounds(&layout)
+                }
+                Asked::Several(w, h) => (w, h),
+                Asked::Single if several => *self.shared.session.current_size.lock().unwrap(),
+                Asked::Single | Asked::Nothing => {
+                    *asked = Asked::Nothing;
+                    *self.shared.session.current_size.lock().unwrap()
+                }
+            }
         };
         DesktopSize {
             width: w as u16,
@@ -624,6 +650,7 @@ pub fn new(session: Arc<pipeline::Shared>, index: usize) -> (RdpOutput, Server) 
         events: Mutex::new(None),
         graphics: Mutex::default(),
         client_monitors: Arc::default(),
+        asked: Mutex::new(Asked::Nothing),
     });
     (RdpOutput::new(Arc::clone(&shared), 0), Server { shared })
 }
@@ -663,7 +690,7 @@ impl Server {
             // MS-RDPEFS, mstsc) waits for before announcing drives, and keeps the device
             // type private. IronRDP has both from 2e65d08 (#2440) on.
             .with_connection_handler(Some(Box::new(Connections {
-                monitors: Some(Arc::clone(&self.shared.client_monitors)),
+                shared: Some(Arc::clone(&self.shared)),
                 ..Connections::new(front.auth_limiter)
             })))
             // RDP-UDP on the same port, as Windows does; TCP stays as the fallback.
@@ -697,7 +724,7 @@ struct Connections {
     /// whether it got past the login.
     current: Option<(SocketAddr, bool)>,
     /// Where the client's monitors go, for the display handler.
-    monitors: Option<Arc<Mutex<Vec<glidedesk_proto::Monitor>>>>,
+    shared: Option<Arc<Shared>>,
 }
 
 impl Connections {
@@ -705,7 +732,7 @@ impl Connections {
         Self {
             limiter,
             current: None,
-            monitors: None,
+            shared: None,
         }
     }
 }
@@ -732,9 +759,15 @@ impl ConnectionHandler for Connections {
             reconnect = info.auto_reconnect,
             "Client session"
         );
-        // Called before the display handler's initial size, which uses them.
-        if let Some(slot) = &self.monitors {
-            *slot.lock().unwrap() = from_gcc(&info.client_monitors);
+        // Called before the display handler's initial size, which uses them (and which a
+        // client that cannot resize never gets: one monitor for it, whatever came before).
+        if let Some(shared) = &self.shared {
+            let monitors = from_gcc(&info.client_monitors);
+            if monitors.len() < 2 {
+                *shared.asked.lock().unwrap() = Asked::Single;
+                shared.session.request_layout(Vec::new());
+            }
+            *shared.client_monitors.lock().unwrap() = monitors;
         }
     }
 

@@ -846,6 +846,23 @@ where
             }
             ClientMsg::Clipboard(_) | ClientMsg::Files { .. } | ClientMsg::FileData(_) => {}
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
+            // One screen: a client that asks for several monitors (version 6) gets it alone.
+            ClientMsg::Monitors(_) => {
+                let told = shared.link.lock().unwrap().as_ref().map(|l| l.told);
+                if let Some((w, h)) = told {
+                    let _ = ctl_tx.send(ServerMsg::Layout(vec![glidedesk_proto::Monitor {
+                        id: 0,
+                        x: 0,
+                        y: 0,
+                        width: w.min(u32::from(u16::MAX)) as u16,
+                        height: h.min(u32::from(u16::MAX)) as u16,
+                        refresh: 60,
+                        primary: true,
+                    }]));
+                }
+            }
+            // MediaCodec here encodes 4:2:0 only; no monitor but the first.
+            ClientMsg::Formats { .. } | ClientMsg::MonitorVideo { .. } => {}
         }
     };
     shared.release_input(&mut input);

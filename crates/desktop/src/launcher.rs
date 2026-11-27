@@ -262,6 +262,7 @@ impl Launcher {
             fingerprint,
             codec: self.codec,
             yuv444: false,
+            register_files: false,
             no_clipboard: !self.clipboard,
             app: if self.rdp { None } else { self.app() },
             monitors,

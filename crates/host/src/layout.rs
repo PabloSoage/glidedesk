@@ -132,6 +132,8 @@ impl Manager {
         let mut requests = self.shared.layout_request.subscribe();
         let mut lost = self.displays.as_ref().map(|d| d.lost());
         let mut running: Vec<Running> = Vec::new();
+        // The session has monitors after the first (with a pipeline or not).
+        let mut extras_up = false;
         loop {
             let again = tokio::select! {
                 r = requests.changed() => {
@@ -154,7 +156,7 @@ impl Manager {
                 }
             };
             // The session lost the further monitors: set them up again, if there were any.
-            if again && running.is_empty() {
+            if again && !extras_up {
                 continue;
             }
             let asked = requests.borrow_and_update().clone();
@@ -164,7 +166,6 @@ impl Manager {
                 1
             };
             let mut wanted = normalize(&asked, max);
-            let had_extras = !running.is_empty();
             stop_all(std::mem::take(&mut running)).await;
             // Monitor 0's size: the one asked for and not applied yet, or the one captured.
             let pending = *self.shared.wanted_size.lock().unwrap();
@@ -187,20 +188,34 @@ impl Manager {
                 }]
             };
             let layout = match &self.displays {
-                Some(d) if wanted.len() > 1 || had_extras => {
-                    let target = if wanted.len() > 1 {
+                Some(d) if wanted.len() > 1 || extras_up => {
+                    let mut target = if wanted.len() > 1 {
                         wanted.clone()
                     } else {
                         single()
                     };
-                    match d.apply(&target).await {
-                        Ok((streams, placed)) => {
-                            let placed = self.start(streams, placed, &mut running).await;
-                            if placed.is_empty() { single() } else { placed }
-                        }
-                        Err(e) => {
-                            warn!(error = format!("{e:#}"), "Setting up the monitors failed");
-                            single()
+                    // Once more without the monitors that got no encoder, so that the
+                    // session does not keep monitors no client sees.
+                    let mut tries = 0;
+                    loop {
+                        tries += 1;
+                        match d.apply(&target).await {
+                            Ok((streams, placed)) => {
+                                extras_up = !streams.is_empty();
+                                let count = streams.len();
+                                let placed = self.start(streams, placed, &mut running).await;
+                                if running.len() == count || tries >= 2 {
+                                    break if placed.len() > 1 { placed } else { single() };
+                                }
+                                stop_all(std::mem::take(&mut running)).await;
+                                target.retain(|m| m.id == 0 || placed.iter().any(|p| p.id == m.id));
+                            }
+                            Err(e) => {
+                                warn!(error = format!("{e:#}"), "Setting up the monitors failed");
+                                // Whatever it left is removed with the next layout.
+                                extras_up = true;
+                                break single();
+                            }
                         }
                     }
                 }
