@@ -388,10 +388,30 @@ XFCE desktop in termux-x11 on a phone, or a Linux desktop running on X.
 # Termux: build it on the device (no prebuilt binary yet)
 pkg install rust clang ffmpeg pulseaudio
 cargo build --release -p glidedesk-host --no-default-features --features x11
-GLIDEDESK_PASSWORD='...' target/release/glidedesk-host serve --x11 :0 --encoder software
+GLIDEDESK_PASSWORD='...' target/release/glidedesk-host serve --x11 :0 --encoder software --user phone
 ```
 
-The display keeps its own size; input goes through XTEST, sound through PulseAudio.
+The display keeps its own size (termux-x11 changes it when the phone rotates, and the clients
+follow); input goes through XTEST, sound through PulseAudio. Give `--user`: the user name
+otherwise comes from `$USER`, which Termux may leave unset (the server would then expect an
+empty one, which the Android client cannot send).
+
+## Serving an Android phone's own screen (preview)
+
+The Android app can also share the phone itself with any glidedesk client (low latency
+mode): open **glidedesk server** (a second launcher entry), set a user name and password,
+choose how, and press Start. Clients connect to the phone's address, port 3391 (TCP and
+UDP), and trust its certificate the first time (its fingerprint is shown in the app).
+
+| How | Setup | What you get |
+|---|---|---|
+| **Shizuku** (recommended) | install [Shizuku](https://shizuku.rikka.app), start it (wireless debugging, or root), allow glidedesk in it | no prompt; a copy of the screen or a display of its own at the client's size; real touch, mouse wheel and keyboard |
+| **ADB helper** | run the command the app shows (again after a reboot, or when the app was closed) from a computer or from Termux connected to the phone's wireless debugging (`pkg install android-tools`, `adb pair`, `adb connect`) | the same as Shizuku |
+| **Screen capture** | nothing; for input, turn on *glidedesk server input* in the accessibility settings | Android asks each time; a copy of the screen; taps and swipes, Back, Home, Recents, typing into text fields |
+
+With the helper, the left button is a finger, the right one Back, the middle one Home, the
+side ones Recents and the notifications. The video is H.264, or HEVC where the phone has a
+hardware HEVC encoder. No sound or clipboard yet.
 
 ## Serving a Windows desktop (preview)
 

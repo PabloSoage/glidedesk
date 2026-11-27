@@ -7,7 +7,8 @@
 //! - Input: XTEST fake events (key codes are evdev + 8, as on X servers using evdev/xkb).
 //!
 //! The size is the display's: a client's resize request changes nothing here, the frames
-//! carry the real size and the front ends tell the client.
+//! carry the real size and the front ends tell the client. The display may change it on its
+//! own (termux-x11 follows the phone's rotation): the root window's ConfigureNotify says so.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -19,7 +20,9 @@ use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::xfixes::{ConnectionExt as _, CursorNotifyMask};
-use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux, ConnectionExt as _, EventMask, ImageFormat,
+};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
@@ -105,6 +108,10 @@ pub fn start(display: Option<&str>, fps: u32) -> Result<X11Session> {
     let damage = conn.generate_id()?;
     conn.damage_create(damage, root, ReportLevel::NON_EMPTY)?;
     conn.xfixes_select_cursor_input(root, CursorNotifyMask::DISPLAY_CURSOR)?;
+    conn.change_window_attributes(
+        root,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+    )?;
     conn.flush()?;
     info!(w, h, depth, "X display ready");
 
@@ -114,6 +121,7 @@ pub fn start(display: Option<&str>, fps: u32) -> Result<X11Session> {
     std::thread::Builder::new()
         .name("x11-capture".into())
         .spawn(move || {
+            let (mut w, mut h) = (w, h);
             let mut dirty = true;
             let mut cursor_dirty = true;
             let mut last = Instant::now() - interval;
@@ -122,6 +130,14 @@ pub fn start(display: Option<&str>, fps: u32) -> Result<X11Session> {
                     match conn.poll_for_event() {
                         Ok(Some(Event::DamageNotify(_))) => dirty = true,
                         Ok(Some(Event::XfixesCursorNotify(_))) => cursor_dirty = true,
+                        Ok(Some(Event::ConfigureNotify(e)))
+                            if e.window == root
+                                && (u32::from(e.width), u32::from(e.height)) != (w, h) =>
+                        {
+                            (w, h) = (u32::from(e.width), u32::from(e.height));
+                            info!(w, h, "X display resized");
+                            dirty = true;
+                        }
                         Ok(Some(_)) => {}
                         Ok(None) => break,
                         Err(e) => {
@@ -150,6 +166,12 @@ pub fn start(display: Option<&str>, fps: u32) -> Result<X11Session> {
                     .and_then(|c| c.reply().ok());
                 let Some(image) = image else {
                     warn!("GetImage failed");
+                    // A display that shrank before its ConfigureNotify arrived: read its size
+                    // again and retry.
+                    if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
+                        (w, h) = (u32::from(g.width), u32::from(g.height));
+                    }
+                    dirty = true;
                     continue;
                 };
                 tx.send(Frame {

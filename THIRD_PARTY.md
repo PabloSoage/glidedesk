@@ -17,6 +17,8 @@
 | [SudoVDA](https://github.com/SudoMaker/SudoVDA) virtual display driver | installed separately for `--virtual-display` on Windows, not shipped; its control codes and structures (`Common/Include/sudovda-ioctl.h`, commit `a4b09fa`) are in `crates/host/src/winvdisplay.rs` | MIT |
 | [inputtino](https://github.com/games-on-whales/inputtino) DualSense report descriptor and feature reports | `crates/host/src/gamestream/dualsense.rs` | MIT (notice in the file) |
 | `crates/desktop/src/probe.hevc`: a 256×144 HEVC test frame made with FFmpeg's `testsrc2` | desktop client | generated, no license |
+| [Shizuku API](https://github.com/RikkaApps/Shizuku-API) 13.1.5 (`dev.rikka.shizuku:api`, `:provider`) | Android app dependency (the phone server's privileged helper as a user service) | MIT |
+| [scrcpy](https://github.com/Genymobile/scrcpy) server: hidden API calls for displays and input, the encoder format | adapted into `android/app/src/main/java/io/github/pablosoage/glidedesk/shell/` and `server/VideoEncoder.kt` (see below) | Apache-2.0 (notice in the files) |
 
 Code adapted from [Sunshine](https://github.com/LizardByte/Sunshine) or
 [Moonlight](https://github.com/moonlight-stream) (GPL-3.0) is listed here with the source file
@@ -40,6 +42,10 @@ and commit, and marked in the file header.
 | `crates/host/src/winservice.rs` (service starting the host in the console session with its SYSTEM token, job object, restart on console session changes) | Sunshine `tools/sunshinesvc.cpp` | `224c6be` |
 | `crates/host/src/winsession.rs` (following the input desktop before duplication and SendInput; SeIncreaseBasePriorityPrivilege, realtime GPU priority and `SetGPUThreadPriority`) | Sunshine `src/platform/windows/misc.cpp` (`syncThreadDesktop`), `src/platform/windows/display_base.cpp` | `224c6be` |
 | `crates/host/src/winvdisplay.rs` (SudoVDA control: opening the device, watchdog ping, the new monitor's GDI name, its mode) | [Apollo](https://github.com/ClassicOldSong/Apollo) `third-party/sudovda/sudovda.h`, `src/platform/windows/virtual_display.cpp` (GPL-3.0) | `adc5c5a` |
+| `android/.../shell/Hidden.kt` (shell context, mirror and new displays through `DisplayManager` and `SurfaceControl`) | [scrcpy](https://github.com/Genymobile/scrcpy) `server/.../FakeContext.java`, `wrappers/DisplayManager.java`, `wrappers/SurfaceControl.java`, `video/ScreenCapture.java`, `video/NewDisplayCapture.java` (Apache-2.0) | `c939183` |
+| `android/.../shell/ShellInput.kt` (touch, mouse, scroll and key injection) | scrcpy `server/.../control/Controller.java`, `device/Device.java`, `wrappers/InputManager.java` (Apache-2.0) | `c939183` |
+| `android/.../shell/ShellMain.kt` (content provider lookup and call from the shell user) | scrcpy `server/.../wrappers/ActivityManager.java`, `wrappers/ContentProvider.java` (Apache-2.0) | `c939183` |
+| `android/.../server/VideoEncoder.kt` (MediaCodec surface encoder format, output loop) | scrcpy `server/.../video/SurfaceEncoder.java` (Apache-2.0) | `c939183` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).

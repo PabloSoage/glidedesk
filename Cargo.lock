@@ -1953,9 +1953,16 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "glidedesk-client",
+ "glidedesk-proto",
  "jni 0.21.1",
  "ndk",
+ "rcgen",
+ "rustls",
+ "sha2 0.10.9",
+ "socket2",
+ "subtle",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
