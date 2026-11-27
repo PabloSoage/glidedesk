@@ -453,6 +453,10 @@ impl Server {
                     as Box<dyn ironrdp_server::SoundServerFactory>
             }))
             .with_cliprdr_factory(front.clipboard)
+            // No drive redirection (`with_rdpdr_factory`) at this IronRDP revision: its
+            // RdpdrServer never sends PAKID_CORE_USER_LOGGEDON, which FreeRDP (and, per
+            // MS-RDPEFS, mstsc) waits for before announcing drives, and keeps the device
+            // type private. IronRDP has both from 2e65d08 (#2440) on.
             .with_connection_handler(Some(Box::new(Connections::new(front.auth_limiter))))
             // RDP-UDP on the same port, as Windows does; TCP stays as the fallback.
             .with_udp_transport(front.bind)

@@ -121,6 +121,7 @@ fingerprint). The details of every server and client follow below.
 | Desktop follows the window | FreeRDP: yes. `mstsc`: not yet | yes | yes |
 | Sound | yes | yes (desktop and Termux clients) | yes (Opus) |
 | Clipboard | text and files | text (desktop client) | not yet |
+| Local drives and printers | not yet (see below) | no | no |
 | Pointer | drawn by the client | drawn by the client | drawn by the browser |
 
 Use RDP or the browser when you cannot install anything; use the glidedesk client for the
@@ -274,6 +275,16 @@ session, with `--no-native` since the daemon holds 3391.
 `mstsc /v:<server>`, user name = your Linux user, password = `GLIDEDESK_PASSWORD`. Accept the
 self-signed certificate the first time. Full screen works; resizing the `mstsc` window does
 not change the remote resolution yet (FreeRDP's `/dynamic-resolution` does).
+
+Sound and the clipboard (text and files) work over RDP. The client's drives and
+printers are not offered in the session yet: the IronRDP version glidedesk is built on never
+tells the client that the user has logged on (`PAKID_CORE_USER_LOGGEDON`), which FreeRDP (and,
+as the protocol describes, `mstsc`) waits for before announcing them, and it keeps the kind of
+each announced device to itself. Newer IronRDP has both; the plan for drives is then a folder
+in the session (a FUSE mount, as xrdp does). Printing will stay limited even so: `mstsc`
+prints through Easy Print (XPS over a channel of its own, which IronRDP does not implement)
+or wants data in the printer driver's own language, so only clients that take PDF or
+PostScript, such as FreeRDP printing through CUPS, could get print jobs.
 
 ### Windows and Linux: `glidedesk`
 
