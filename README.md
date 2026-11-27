@@ -320,10 +320,13 @@ XFCE desktop in termux-x11 on a phone, or a Linux desktop running on X.
 # Termux: build it on the device (no prebuilt binary yet)
 pkg install rust clang ffmpeg pulseaudio
 cargo build --release -p glidedesk-host --no-default-features --features x11
-GLIDEDESK_PASSWORD='...' target/release/glidedesk-host serve --x11 :0 --encoder software
+GLIDEDESK_PASSWORD='...' target/release/glidedesk-host serve --x11 :0 --encoder software --user phone
 ```
 
-The display keeps its own size; input goes through XTEST, sound through PulseAudio.
+The display keeps its own size (termux-x11 changes it when the phone rotates, and the clients
+follow); input goes through XTEST, sound through PulseAudio. Give `--user`: the user name
+otherwise comes from `$USER`, which Termux may leave unset (the server would then expect an
+empty one, which the Android client cannot send).
 
 ## Serving a Windows desktop (preview)
 
