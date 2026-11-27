@@ -244,6 +244,7 @@ mod android {
                     refresh: refresh.clamp(30, 240) as u32,
                     trust: Default::default(),
                     app,
+                    monitors: Vec::new(),
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await

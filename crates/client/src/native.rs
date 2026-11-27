@@ -5,6 +5,9 @@
 //! shards and go to the same [`VideoSink`] as RDP's; a frame that cannot be rebuilt makes
 //! the client ask for an IDR and skip frames until it arrives (decoding P-frames without
 //! their reference would only show garbage).
+//!
+//! With several monitors (protocol version 6, [`NativeOptions::monitors`]) the video of each
+//! monitor is a stream of its own: its own frames, losses and acknowledgements.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use glidedesk_proto::crypto::{Direction, PacketKey, ReplayWindow};
-use glidedesk_proto::{ClientMsg, Codec, InputEvent, ServerMsg, fec, files, link};
+use glidedesk_proto::{ClientMsg, Codec, InputEvent, ServerMsg, VideoMsg, fec, files, link};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -55,6 +58,10 @@ pub struct NativeOptions {
     /// Open this app of the server instead of the desktop (protocol version 3); the session
     /// ends when the app does.
     pub app: Option<String>,
+    /// Show the desktop on these monitors (servers from version 6): monitor 0, with the size
+    /// above, and the others ([`crate::gfx::VideoSink::reset_monitor`] and the rest). Empty
+    /// or one: a single-monitor session.
+    pub monitors: Vec<glidedesk_proto::Monitor>,
 }
 
 /// Accepts the server's self-signed certificate if [`Trust`](crate::trust::Trust) does, and
@@ -162,6 +169,131 @@ enum Wait {
     Keyframe,
     /// A frame with the recovery flag, after an [`ClientMsg::InvalidateFrames`].
     Recovery,
+}
+
+/// The video of one monitor, as the media task follows it.
+struct Stream {
+    monitor: u8,
+    frames: fec::Reassembler,
+    /// Until the first IDR, and after a lost frame until the server's recovery frame (or an
+    /// IDR), P-frames cannot be decoded. Either can be lost too: a keyframe is asked for
+    /// while waiting too long.
+    wait: Wait,
+    asked: Instant,
+    /// Received frames not acknowledged yet, oldest first.
+    held: std::collections::VecDeque<u32>,
+}
+
+impl Stream {
+    fn new(monitor: u8) -> Self {
+        Self {
+            monitor,
+            frames: fec::Reassembler::default(),
+            wait: Wait::Keyframe,
+            asked: Instant::now(),
+            held: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn send(&self, ctl: &mpsc::UnboundedSender<ClientMsg>, msg: VideoMsg) {
+        let _ = ctl.send(msg.for_monitor(self.monitor));
+    }
+
+    /// Acts on what the reassembler found; returns the frames delivered and lost.
+    fn handle(
+        &mut self,
+        events: Vec<fec::Event>,
+        invalidation: bool,
+        sink: &SharedSink,
+        ctl: &mpsc::UnboundedSender<ClientMsg>,
+        spread_total: &mut Duration,
+    ) -> (u32, u32) {
+        let (mut got, mut lost) = (0, 0);
+        for ev in events {
+            match ev {
+                fec::Event::Frame {
+                    frame_id,
+                    keyframe,
+                    recovery,
+                    data,
+                    spread,
+                } => {
+                    got += 1;
+                    *spread_total += spread;
+                    if keyframe || (recovery && self.wait == Wait::Recovery) {
+                        if self.wait != Wait::Nothing {
+                            debug!(monitor = self.monitor, frame_id, keyframe, "Recovered");
+                        }
+                        self.wait = Wait::Nothing;
+                    }
+                    if self.wait == Wait::Nothing {
+                        let mut sink = sink.lock().unwrap();
+                        if self.monitor == 0 {
+                            sink.frame(&data);
+                        } else {
+                            sink.frame_monitor(self.monitor, &data);
+                        }
+                    } else if self.asked.elapsed() > KEYFRAME_RETRY {
+                        self.asked = Instant::now();
+                        self.wait = Wait::Keyframe;
+                        self.send(ctl, VideoMsg::RequestKeyframe);
+                    }
+                    self.held.push_back(frame_id);
+                }
+                fec::Event::Lost { frame_id } => {
+                    lost += 1;
+                    debug!(monitor = self.monitor, frame_id, "Frame lost");
+                    match self.wait {
+                        // Version 2: the server stops referencing it. (The wait for recovery
+                        // keeps its start: a keyframe is still asked for if recovery takes
+                        // too long.)
+                        Wait::Nothing | Wait::Recovery if invalidation => {
+                            if self.wait == Wait::Nothing {
+                                self.asked = Instant::now();
+                            }
+                            self.wait = Wait::Recovery;
+                            self.send(ctl, VideoMsg::InvalidateFrames { first: frame_id });
+                        }
+                        Wait::Nothing => {
+                            self.wait = Wait::Keyframe;
+                            self.asked = Instant::now();
+                            self.send(ctl, VideoMsg::RequestKeyframe);
+                        }
+                        _ if self.asked.elapsed() > KEYFRAME_RETRY => {
+                            self.wait = Wait::Keyframe;
+                            self.asked = Instant::now();
+                            self.send(ctl, VideoMsg::RequestKeyframe);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (got, lost)
+    }
+
+    /// Acknowledges the received frames the decoder has caught up with. One may still be
+    /// decoding, so the server can already send the next one.
+    fn release_acks(&mut self, sink: &SharedSink, ctl: &mpsc::UnboundedSender<ClientMsg>) {
+        if self.held.is_empty() {
+            return;
+        }
+        let backlog = {
+            let sink = sink.lock().unwrap();
+            if self.monitor == 0 {
+                sink.backlog()
+            } else {
+                sink.backlog_monitor(self.monitor)
+            }
+        };
+        let waiting = backlog.saturating_sub(1);
+        while self.held.len() > waiting {
+            let Some(frame_id) = self.held.pop_front() else {
+                break;
+            };
+            self.send(ctl, VideoMsg::FrameAck { frame_id });
+        }
+    }
 }
 
 /// A server that speaks an older protocol refused ours: the fingerprint of its certificate
@@ -289,6 +421,16 @@ async fn session(
         }
         glidedesk_proto::write_msg(&mut wr, &ClientMsg::OpenApp(app.clone())).await?;
     }
+    if opts.monitors.len() > 1 {
+        if version >= 6 {
+            info!(monitors = opts.monitors.len(), "Asking for several monitors");
+            glidedesk_proto::write_msg(&mut wr, &ClientMsg::Monitors(opts.monitors.clone()))
+                .await?;
+        } else {
+            warn!(version, "This server shows one monitor (several need protocol version 6)");
+            sink.lock().unwrap().layout(&opts.monitors[..1]);
+        }
+    }
 
     let key = Arc::new(PacketKey::new(&key));
     let udp = {
@@ -350,12 +492,8 @@ async fn session(
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             let mut replay = ReplayWindow::default();
-            let mut frames = fec::Reassembler::default();
-            // Until the first IDR, and after a lost frame until the server's recovery frame
-            // (or an IDR), P-frames cannot be decoded. Either can be lost too: a keyframe is
-            // asked for while waiting too long.
-            let mut wait = Wait::Keyframe;
-            let mut asked = Instant::now();
+            // Monitor 0, and the others as their first packets come (version 6).
+            let mut streams = vec![Stream::new(0)];
             // GLIDEDESK_DROP=PERCENT throws away that share of the packets, to test recovery.
             let drop: u64 = std::env::var("GLIDEDESK_DROP")
                 .ok()
@@ -365,16 +503,16 @@ async fn session(
             let (mut got, mut lost, mut since) = (0u32, 0u32, Instant::now());
             // Time the frames took to arrive (first packet to last), for the statistics.
             let mut spread_total = Duration::ZERO;
-            // Received frames not acknowledged yet, oldest first.
-            let mut held = std::collections::VecDeque::new();
             loop {
-                let received = if held.is_empty() {
+                let received = if streams.iter().all(|s| s.held.is_empty()) {
                     udp.recv(&mut buf).await
                 } else {
                     match tokio::time::timeout(ACK_POLL, udp.recv(&mut buf)).await {
                         Ok(r) => r,
                         Err(_) => {
-                            release_acks(&mut held, &sink, &ctl);
+                            for s in &mut streams {
+                                s.release_acks(&sink, &ctl);
+                            }
                             continue;
                         }
                     }
@@ -399,85 +537,38 @@ async fn session(
                 // Counted after the simulated losses, so GLIDEDESK_DROP shows in the reports.
                 counts.lock().unwrap().packets.packet(seq);
                 flowing.store(true, Ordering::Relaxed);
-                let events = match plain.first() {
-                    Some(&fec::VIDEO) => frames.push(&plain),
+                let video = match fec::video_monitor(&plain) {
+                    Some(m) => Some((m, None)),
                     // The server waits for acknowledgements: frames it sent that have not
                     // come (and are not still coming) are lost.
-                    Some(&fec::SYNC) => match fec::parse_sync(&plain) {
-                        Some(last) => frames.sync(last, SYNC_QUIET),
-                        None => Vec::new(),
-                    },
-                    _ => Vec::new(),
+                    None => fec::parse_sync_monitor(&plain).map(|(m, last)| (m, Some(last))),
                 };
-                match plain.first() {
-                    Some(&fec::VIDEO | &fec::SYNC) => {
-                        for ev in events {
-                            match ev {
-                                fec::Event::Frame {
-                                    frame_id,
-                                    keyframe,
-                                    recovery,
-                                    data,
-                                    spread,
-                                } => {
-                                    got += 1;
-                                    spread_total += spread;
-                                    if keyframe || (recovery && wait == Wait::Recovery) {
-                                        if wait != Wait::Nothing {
-                                            debug!(frame_id, keyframe, "Recovered");
-                                        }
-                                        wait = Wait::Nothing;
-                                    }
-                                    if wait == Wait::Nothing {
-                                        sink.lock().unwrap().frame(&data);
-                                    } else if asked.elapsed() > KEYFRAME_RETRY {
-                                        asked = Instant::now();
-                                        wait = Wait::Keyframe;
-                                        let _ = ctl.send(ClientMsg::RequestKeyframe);
-                                    }
-                                    held.push_back(frame_id);
-                                }
-                                fec::Event::Lost { frame_id } => {
-                                    lost += 1;
-                                    counts.lock().unwrap().frames_lost += 1;
-                                    debug!(frame_id, "Frame lost");
-                                    match wait {
-                                        // Version 2: the server stops referencing it. (The
-                                        // wait for recovery keeps its start: a keyframe is
-                                        // still asked for if recovery takes too long.)
-                                        Wait::Nothing | Wait::Recovery if invalidation => {
-                                            if wait == Wait::Nothing {
-                                                asked = Instant::now();
-                                            }
-                                            wait = Wait::Recovery;
-                                            let _ = ctl.send(ClientMsg::InvalidateFrames {
-                                                first: frame_id,
-                                            });
-                                        }
-                                        Wait::Nothing => {
-                                            wait = Wait::Keyframe;
-                                            asked = Instant::now();
-                                            let _ = ctl.send(ClientMsg::RequestKeyframe);
-                                        }
-                                        _ if asked.elapsed() > KEYFRAME_RETRY => {
-                                            wait = Wait::Keyframe;
-                                            asked = Instant::now();
-                                            let _ = ctl.send(ClientMsg::RequestKeyframe);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
+                if let Some((monitor, sync)) = video {
+                    let i = match streams.iter().position(|s| s.monitor == monitor) {
+                        Some(i) => i,
+                        None => {
+                            streams.push(Stream::new(monitor));
+                            streams.len() - 1
                         }
-                    }
-                    Some(&fec::AUDIO) => {
-                        if let Some((_, pcm)) = fec::parse_audio(&plain) {
-                            sink.lock().unwrap().audio(pcm);
-                        }
-                    }
-                    _ => {}
+                    };
+                    let stream = &mut streams[i];
+                    let events = match sync {
+                        None => stream.frames.push(&plain),
+                        Some(last) => stream.frames.sync(last, SYNC_QUIET),
+                    };
+                    let (g, l) =
+                        stream.handle(events, invalidation, &sink, &ctl, &mut spread_total);
+                    got += g;
+                    lost += l;
+                    counts.lock().unwrap().frames_lost += l;
+                } else if plain.first() == Some(&fec::AUDIO)
+                    && let Some((_, pcm)) = fec::parse_audio(&plain)
+                {
+                    sink.lock().unwrap().audio(pcm);
                 }
-                release_acks(&mut held, &sink, &ctl);
+                for s in &mut streams {
+                    s.release_acks(&sink, &ctl);
+                }
                 if since.elapsed() >= Duration::from_secs(5) {
                     info!(
                         frames = got,
@@ -566,6 +657,16 @@ async fn session(
                 Ok(ServerMsg::Size { width, height }) => {
                     info!(width, height, "Desktop size");
                     sink.lock().unwrap().reset(u32::from(width), u32::from(height), codec);
+                }
+                Ok(ServerMsg::Layout(monitors)) => {
+                    info!(?monitors, "Monitors");
+                    sink.lock().unwrap().layout(&monitors);
+                }
+                Ok(ServerMsg::MonitorSize { monitor, width, height }) => {
+                    info!(monitor, width, height, "Monitor size");
+                    sink.lock()
+                        .unwrap()
+                        .reset_monitor(monitor, u32::from(width), u32::from(height), codec);
                 }
                 Ok(ServerMsg::Cursor(c)) => sink.lock().unwrap().cursor(&c),
                 Ok(ServerMsg::Pong { t_us }) => {
@@ -721,25 +822,6 @@ fn step_download(
             warn!(%e, "Fetching the server's files failed");
             *download = None;
         }
-    }
-}
-
-/// Acknowledges the received frames the decoder has caught up with. One may still be
-/// decoding, so the server can already send the next one.
-fn release_acks(
-    held: &mut std::collections::VecDeque<u32>,
-    sink: &SharedSink,
-    ctl: &mpsc::UnboundedSender<ClientMsg>,
-) {
-    if held.is_empty() {
-        return;
-    }
-    let waiting = sink.lock().unwrap().backlog().saturating_sub(1);
-    while held.len() > waiting {
-        let Some(frame_id) = held.pop_front() else {
-            break;
-        };
-        let _ = ctl.send(ClientMsg::FrameAck { frame_id });
     }
 }
 

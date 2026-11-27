@@ -3,6 +3,12 @@
 //! Speaks the native low-latency protocol by default (RDP with `--rdp`). The desktop
 //! follows the window size, the pointer is the local one with the remote shape, keys are
 //! sent as scan codes, session audio plays on the default output.
+//!
+//! With `--monitors` (native protocol, servers from version 5) the desktop spans several
+//! monitors of this computer: a borderless full-screen window on each, each showing a
+//! monitor of the remote desktop (one window per monitor, not one across them all, so each
+//! keeps its own scale and refresh rate). Pointer positions are mapped from each window to
+//! the remote desktop's space.
 
 // A window program: no console next to it. The log goes to a file (`platform::log_path`).
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -35,6 +41,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
+use winit::monitor::MonitorHandle;
 use winit::window::{CustomCursor, Fullscreen, Icon, Window, WindowId};
 
 use video::{Event, Picture};
@@ -96,6 +103,52 @@ struct Args {
     /// exit.
     #[arg(long)]
     register_files: bool,
+    /// Show the desktop on several monitors of this computer, a full-screen window on each:
+    /// `all`, or their numbers, such as `1,2` (numbered left to right; the log lists them).
+    /// Native protocol, servers from version 5.
+    #[arg(long, value_parser = parse_monitors)]
+    monitors: Option<MonitorChoice>,
+}
+
+/// Which monitors of this computer show the desktop (`--monitors`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MonitorChoice {
+    All,
+    /// Numbered from 1, left to right (then top to bottom).
+    Numbers(Vec<usize>),
+}
+
+/// `all`, or monitor numbers separated by commas.
+pub fn parse_monitors(s: &str) -> Result<MonitorChoice, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("all") {
+        return Ok(MonitorChoice::All);
+    }
+    let mut numbers = Vec::new();
+    for part in s.split(',') {
+        let n: usize = part
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&n| n >= 1)
+            .ok_or_else(|| format!("{part:?}: not a monitor number (all, or numbers: 1,2)"))?;
+        if !numbers.contains(&n) {
+            numbers.push(n);
+        }
+    }
+    Ok(MonitorChoice::Numbers(numbers))
+}
+
+/// A position in a window of `win` pixels that shows monitor `m` of the remote layout, in
+/// the remote desktop's pixels.
+fn window_to_desktop(m: &glidedesk_proto::Monitor, win: (u32, u32), x: f64, y: f64) -> (u16, u16) {
+    let (w, h) = (f64::from(m.width), f64::from(m.height));
+    let fx = (x / f64::from(win.0.max(1)) * w).clamp(0.0, (w - 1.0).max(0.0));
+    let fy = (y / f64::from(win.1.max(1)) * h).clamp(0.0, (h - 1.0).max(0.0));
+    (
+        (f64::from(m.x.max(0)) + fx) as u16,
+        (f64::from(m.y.max(0)) + fy) as u16,
+    )
 }
 
 #[derive(
@@ -160,6 +213,12 @@ fn apply_profile(args: &mut Args, prof: profile::Profile) -> Result<()> {
         args.gpu =
             Some(parse_vendor(&g).map_err(|e| anyhow::anyhow!("gpu = {g:?} in the profile: {e}"))?);
     }
+    if let Some(m) = prof.monitors.filter(|m| !m.trim().is_empty()) {
+        args.monitors = Some(
+            parse_monitors(&m)
+                .map_err(|e| anyhow::anyhow!("monitors = {m:?} in the profile: {e}"))?,
+        );
+    }
     Ok(())
 }
 
@@ -204,6 +263,15 @@ fn trust_for(a: &Args, host: &str, port: u16) -> Result<Trust, String> {
 /// (each change rebuilds the encoder and starts with an IDR).
 const RESIZE_SETTLE: Duration = Duration::from_millis(250);
 
+/// The window on a further monitor of this computer (`--monitors`).
+struct Screen {
+    /// The remote monitor it shows (its id in the layout).
+    monitor: u8,
+    window: Arc<Window>,
+    renderer: render::Renderer,
+    slot: Arc<Mutex<Option<Picture>>>,
+}
+
 struct App {
     args: Args,
     launcher_state: Option<launcher::LauncherState>,
@@ -224,6 +292,11 @@ struct App {
     stats: (u32, Duration, Instant),
     /// The user closed the window: the session's end is no error.
     closing: bool,
+    /// Windows on further monitors of this computer (`--monitors`).
+    screens: Vec<Screen>,
+    /// The monitors of the remote desktop as the server set them up; empty or one: the
+    /// desktop is the window's.
+    layout: Vec<glidedesk_proto::Monitor>,
 }
 
 impl App {
@@ -233,7 +306,126 @@ impl App {
         }
     }
 
-    fn start_session(&mut self, size: PhysicalSize<u32>) {
+    /// With `--monitors`, a full-screen window on each chosen monitor of this computer: the
+    /// main window on the first (the primary, if chosen), a new window on each of the
+    /// others. Returns them as the layout to ask the server for, monitor 0 the main
+    /// window's; empty for one window.
+    fn open_screens(
+        &mut self,
+        el: &ActiveEventLoop,
+        window: &Arc<Window>,
+    ) -> Vec<glidedesk_proto::Monitor> {
+        let Some(choice) = self.args.monitors.clone() else {
+            return Vec::new();
+        };
+        if self.args.rdp {
+            warn!("Several monitors need the native protocol: one window");
+            return Vec::new();
+        }
+        let mut all: Vec<MonitorHandle> = el.available_monitors().collect();
+        all.sort_by_key(|m| (m.position().x, m.position().y));
+        let primary = el.primary_monitor();
+        for (i, m) in all.iter().enumerate() {
+            info!(
+                number = i + 1,
+                name = m.name().as_deref().unwrap_or(""),
+                width = m.size().width,
+                height = m.size().height,
+                x = m.position().x,
+                y = m.position().y,
+                primary = primary.as_ref() == Some(m),
+                "Monitor of this computer"
+            );
+        }
+        let mut chosen: Vec<MonitorHandle> = match &choice {
+            MonitorChoice::All => all.clone(),
+            MonitorChoice::Numbers(numbers) => numbers
+                .iter()
+                .filter_map(|&n| {
+                    let m = all.get(n - 1).cloned();
+                    if m.is_none() {
+                        warn!(number = n, monitors = all.len(), "No such monitor");
+                    }
+                    m
+                })
+                .collect(),
+        };
+        if let Some(p) = chosen.iter().position(|m| primary.as_ref() == Some(m)) {
+            chosen[..=p].rotate_right(1);
+        }
+        let Some(first) = chosen.first() else {
+            return Vec::new();
+        };
+        window.set_fullscreen(Some(Fullscreen::Borderless(Some(first.clone()))));
+        let mut layout = Vec::new();
+        for (i, m) in chosen.iter().enumerate() {
+            let Ok(id) = u8::try_from(i) else { break };
+            if i > 0 {
+                match self.open_screen(el, id, m) {
+                    Ok(s) => self.screens.push(s),
+                    Err(e) => {
+                        let error = format!("{e:#}");
+                        warn!(number = i + 1, error, "No window on the monitor");
+                        continue;
+                    }
+                }
+            }
+            layout.push(glidedesk_proto::Monitor {
+                id,
+                x: m.position().x,
+                y: m.position().y,
+                width: m.size().width.min(u32::from(u16::MAX)) as u16,
+                height: m.size().height.min(u32::from(u16::MAX)) as u16,
+                refresh: m
+                    .refresh_rate_millihertz()
+                    .map_or(60, |mhz| (mhz + 500) / 1000),
+                primary: primary.as_ref() == Some(m),
+            });
+        }
+        if layout.len() < 2 {
+            return Vec::new();
+        }
+        layout
+    }
+
+    /// A borderless full-screen window on monitor `m`, for remote monitor `monitor`.
+    fn open_screen(
+        &self,
+        el: &ActiveEventLoop,
+        monitor: u8,
+        m: &MonitorHandle,
+    ) -> Result<Screen> {
+        let attrs = Window::default_attributes()
+            .with_title(format!(
+                "glidedesk - {} ({})",
+                self.args.host.as_deref().unwrap_or_default(),
+                u32::from(monitor) + 1
+            ))
+            .with_window_icon(Icon::from_rgba(ICON.to_vec(), 64, 64).ok())
+            .with_position(m.position())
+            .with_inner_size(m.size())
+            .with_fullscreen(Some(Fullscreen::Borderless(Some(m.clone()))));
+        let window = Arc::new(el.create_window(attrs)?);
+        let instance = self
+            .instance
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no graphics instance"))?;
+        let renderer = render::Renderer::new(instance, Arc::clone(&window), self.args.gpu)?;
+        Ok(Screen {
+            monitor,
+            window,
+            renderer,
+            slot: Arc::default(),
+        })
+    }
+
+    /// The session spans several monitors: their sizes are fixed, the windows' resizes are
+    /// not sent.
+    fn spanning(&self) -> bool {
+        !self.screens.is_empty() || self.layout.len() > 1
+    }
+
+    fn start_session(&mut self, size: PhysicalSize<u32>, monitors: Vec<glidedesk_proto::Monitor>) {
         let proxy = self.proxy.clone();
         let notify: video::Notify = Arc::new(move |e| {
             let _ = proxy.send_event(e);
@@ -252,12 +444,18 @@ impl App {
                 }
             }
         };
+        let screens = self
+            .screens
+            .iter()
+            .map(|s| (s.monitor, Arc::clone(&s.slot)))
+            .collect();
         let sink: SharedSink = Arc::new(Mutex::new(video::start(
             Arc::clone(&self.slot),
             Arc::clone(&notify),
             player,
             !self.args.software_decode,
             self.args.yuv444 && !self.args.rdp,
+            screens,
         )));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if !self.args.rdp && !self.args.no_clipboard {
@@ -330,6 +528,7 @@ impl App {
                     refresh,
                     trust,
                     app: a.app,
+                    monitors,
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await
@@ -342,18 +541,27 @@ impl App {
         });
     }
 
-    /// Window position to desktop pixels.
-    fn to_desktop(&self, x: f64, y: f64) -> (u16, u16) {
-        let Some(win) = &self.window else {
-            return (0, 0);
+    /// A position in the main window, or in `screen`'s, to desktop pixels; `None` where the
+    /// window shows nothing yet.
+    fn to_desktop(&self, screen: Option<usize>, x: f64, y: f64) -> Option<(u16, u16)> {
+        let (monitor, win) = match screen {
+            Some(i) => (self.screens[i].monitor, &self.screens[i].window),
+            None => (0, self.window.as_ref()?),
         };
         let s = win.inner_size();
+        if self.layout.len() > 1 {
+            let m = self.layout.iter().find(|m| m.id == monitor)?;
+            return Some(window_to_desktop(m, (s.width, s.height), x, y));
+        }
+        if screen.is_some() {
+            return None;
+        }
         let (dw, dh) = self.desktop;
         let fx =
             (x / f64::from(s.width.max(1)) * f64::from(dw)).clamp(0.0, f64::from(dw.max(1) - 1));
         let fy =
             (y / f64::from(s.height.max(1)) * f64::from(dh)).clamp(0.0, f64::from(dh.max(1) - 1));
-        (fx as u16, fy as u16)
+        Some((fx as u16, fy as u16))
     }
 
     fn release_all(&mut self) {
@@ -438,7 +646,11 @@ impl ApplicationHandler<Event> for App {
             ));
             window.request_redraw();
         } else {
-            self.start_session(size);
+            let monitors = self.open_screens(el, &window);
+            let size = monitors.first().map_or(size, |m| {
+                PhysicalSize::new(u32::from(m.width), u32::from(m.height))
+            });
+            self.start_session(size, monitors);
         }
         self.window = Some(window);
     }
@@ -464,14 +676,36 @@ impl ApplicationHandler<Event> for App {
                     }
                 }
             }
+            Event::MonitorPicture(monitor) => {
+                let Some(s) = self.screens.iter_mut().find(|s| s.monitor == monitor) else {
+                    return;
+                };
+                let pic = s.slot.lock().unwrap().take();
+                if let Some(p) = pic {
+                    s.renderer.draw(Some(&p));
+                }
+            }
+            Event::Layout(monitors) => {
+                // Windows of monitors the server did not set up would show nothing.
+                let asked = self.screens.len() + 1;
+                self.screens.retain(|s| monitors.iter().any(|m| m.id == s.monitor));
+                if monitors.len() < asked {
+                    warn!(shown = monitors.len(), asked, "The server shows fewer monitors");
+                }
+                self.layout = monitors;
+            }
             Event::Cursor(c) => {
                 let Some(win) = &self.window else { return };
+                let windows = std::iter::once(win).chain(self.screens.iter().map(|s| &s.window));
                 match c {
                     // A transparent cursor rather than set_cursor_visible: on Windows a
                     // hidden cursor may not come back until the pointer leaves the window.
                     glidedesk_proto::Cursor::Hidden => {
                         if let Ok(src) = CustomCursor::from_rgba(vec![0; 4], 1, 1, 0, 0) {
-                            win.set_cursor(el.create_custom_cursor(src));
+                            let cursor = el.create_custom_cursor(src);
+                            for w in windows {
+                                w.set_cursor(cursor.clone());
+                            }
                         }
                     }
                     glidedesk_proto::Cursor::Shape {
@@ -484,7 +718,9 @@ impl ApplicationHandler<Event> for App {
                         if let Ok(src) = CustomCursor::from_rgba(rgba, width, height, hot_x, hot_y)
                         {
                             let cursor = el.create_custom_cursor(src);
-                            win.set_cursor(cursor.clone());
+                            for w in windows {
+                                w.set_cursor(cursor.clone());
+                            }
                             self.cursor = Some(cursor);
                         }
                     }
@@ -534,7 +770,7 @@ impl ApplicationHandler<Event> for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -612,7 +848,11 @@ impl ApplicationHandler<Event> for App {
                                 r.resize(size.width, size.height);
                             }
                             self.desktop = (size.width, size.height);
-                            self.start_session(size);
+                            let monitors = self.open_screens(el, &window);
+                            let size = monitors.first().map_or(size, |m| {
+                                PhysicalSize::new(u32::from(m.width), u32::from(m.height))
+                            });
+                            self.start_session(size, monitors);
                         }
                     }
                 }
@@ -629,6 +869,11 @@ impl ApplicationHandler<Event> for App {
             return;
         }
 
+        // The main window, or the window on a further monitor (`screen`).
+        let screen = self.screens.iter().position(|s| s.window.id() == id);
+        if screen.is_none() && id != window.id() {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.closing = true;
@@ -636,21 +881,32 @@ impl ApplicationHandler<Event> for App {
                 el.exit();
             }
             WindowEvent::Resized(size) => {
-                if let Some(r) = self.renderer.as_mut() {
+                let renderer = match screen {
+                    Some(i) => Some(&mut self.screens[i].renderer),
+                    None => self.renderer.as_mut(),
+                };
+                if let Some(r) = renderer {
                     r.resize(size.width, size.height);
                     r.draw(None);
                 }
-                self.pending_resize = Some((size, Instant::now()));
+                if screen.is_none() && !self.spanning() {
+                    self.pending_resize = Some((size, Instant::now()));
+                }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(r) = self.renderer.as_mut() {
+                let renderer = match screen {
+                    Some(i) => Some(&mut self.screens[i].renderer),
+                    None => self.renderer.as_mut(),
+                };
+                if let Some(r) = renderer {
                     r.draw(None);
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::CursorMoved { position, .. } => {
-                let (x, y) = self.to_desktop(position.x, position.y);
-                self.send(Input::MouseMove { x, y });
+                if let Some((x, y)) = self.to_desktop(screen, position.x, position.y) {
+                    self.send(Input::MouseMove { x, y });
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let button = match button {
@@ -816,7 +1072,39 @@ fn main() -> Result<()> {
             .build()?,
         stats: (0, Duration::ZERO, Instant::now()),
         closing: false,
+        screens: Vec::new(),
+        layout: Vec::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_choices() {
+        assert_eq!(parse_monitors("all"), Ok(MonitorChoice::All));
+        assert_eq!(parse_monitors(" 2, 1,2 "), Ok(MonitorChoice::Numbers(vec![2, 1])));
+        assert!(parse_monitors("0").is_err());
+        assert!(parse_monitors("1,x").is_err());
+    }
+
+    #[test]
+    fn window_positions_land_on_their_monitor() {
+        let m = glidedesk_proto::Monitor {
+            id: 1,
+            x: 1920,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            refresh: 60,
+            primary: false,
+        };
+        // A window of the monitor's size, and one at half its resolution (scaled).
+        assert_eq!(window_to_desktop(&m, (2560, 1440), 10.0, 20.0), (1930, 20));
+        assert_eq!(window_to_desktop(&m, (1280, 720), 640.0, 360.0), (3200, 720));
+        assert_eq!(window_to_desktop(&m, (2560, 1440), 9999.0, -5.0), (4479, 0));
+    }
 }

@@ -598,6 +598,41 @@ pub fn default_render_node() -> String {
     }
 }
 
+/// One more backend of the kind [`select`] chose (`name` is its [`Backend::name`], `hevc`
+/// its [`Backend::supports_hevc`]), for the stream of a further monitor. NVENC goes on the
+/// same CUDA context, which the captures import onto; FFmpeg skips the start-up trial the
+/// first backend already passed.
+pub fn another(
+    name: &str,
+    hevc: bool,
+    cuda: Option<&Arc<CudaContext>>,
+    render_node: Option<String>,
+    fps: u32,
+    bitrate: u32,
+) -> Result<Box<dyn Backend>> {
+    let kind = match name {
+        "nvenc" => {
+            let ctx = cuda.context("NVENC without a CUDA context")?;
+            return Ok(Box::new(Nvenc::new(Arc::clone(ctx), fps, bitrate)?));
+        }
+        "vaapi" => Kind::Vaapi,
+        "qsv" => Kind::Qsv,
+        "amf" => Kind::Amf,
+        "software" => Kind::Software,
+        other => bail!("no encoder named {other}"),
+    };
+    Ok(Box::new(Ffmpeg {
+        hevc,
+        kind,
+        device: render_node.unwrap_or_else(default_render_node),
+        main: None,
+        aux: None,
+        encoder: None,
+        fps,
+        bitrate,
+    }))
+}
+
 /// The backend for `choice`, and the CUDA context when NVENC is used (the capture then
 /// imports DMA-BUFs onto it).
 pub fn select(

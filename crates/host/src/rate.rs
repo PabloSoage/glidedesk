@@ -241,9 +241,38 @@ pub fn frame_interval(bps: u32, width: u32, height: u32) -> Option<Duration> {
     (fps < NO_CAP_FPS).then(|| Duration::from_secs_f64(1.0 / fps))
 }
 
+/// The part of the link's ceiling `total` that the stream of `monitor` gets when several
+/// monitors share the link: in proportion to its pixels (`areas`: each monitor of the layout
+/// and its width × height). With one monitor, or one not in the layout, all of it.
+pub fn share(total: u32, areas: &[(u8, u64)], monitor: u8) -> u32 {
+    let sum: u64 = areas.iter().map(|&(_, a)| a).sum();
+    let Some(&(_, area)) = areas.iter().find(|&&(m, _)| m == monitor) else {
+        return total;
+    };
+    if areas.len() < 2 || sum == 0 {
+        return total;
+    }
+    let part = (u64::from(total) * area / sum) as u32;
+    part.max(MIN_BPS.min(total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitors_share_the_ceiling_by_area() {
+        assert_eq!(share(50_000_000, &[], 0), 50_000_000);
+        assert_eq!(share(50_000_000, &[(0, 100)], 0), 50_000_000);
+        let two = [(0, 3840 * 2160), (1, 1920 * 1080)];
+        assert_eq!(share(50_000_000, &two, 0), 40_000_000);
+        assert_eq!(share(50_000_000, &two, 1), 10_000_000);
+        // A monitor not (or no longer) in the layout keeps the whole ceiling.
+        assert_eq!(share(50_000_000, &two, 7), 50_000_000);
+        // Never below the least ceiling, unless the link itself is.
+        assert_eq!(share(2_000_000, &[(0, 1000), (1, 1)], 1), MIN_BPS);
+        assert_eq!(share(500_000, &[(0, 1000), (1, 1)], 1), 500_000);
+    }
 
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)

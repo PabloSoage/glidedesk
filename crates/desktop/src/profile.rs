@@ -23,6 +23,9 @@ pub struct Profile {
     pub clipboard: Option<bool>,
     /// An app of the server to open instead of the desktop.
     pub app: Option<String>,
+    /// Monitors of this computer to show the desktop on: `all`, or numbers such as `1,2`
+    /// (see `--monitors`).
+    pub monitors: Option<String>,
 }
 
 impl Profile {
@@ -167,6 +170,7 @@ mod tests {
             fingerprint: Some(
                 "eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573".into(),
             ),
+            monitors: Some("1,2".into()),
         };
 
         let temp_dir = std::env::temp_dir().join(format!("glidedesk-test-{}", std::process::id()));
@@ -184,6 +188,7 @@ mod tests {
         assert_eq!(loaded.gpu.as_deref(), Some("nvidia"));
         assert_eq!(loaded.codec, Some(crate::CodecChoice::Hevc));
         assert_eq!(loaded.clipboard, Some(false));
+        assert_eq!(loaded.monitors.as_deref(), Some("1,2"));
         assert_eq!(
             loaded.fingerprint.as_deref(),
             Some("eeeecd4bc30d461bd13e236cb674a734b3f2198ccf60ccfac11fe740c4ee9573")

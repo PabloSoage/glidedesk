@@ -8,7 +8,12 @@
 //! Under the system daemon ([`Listen::Handover`]) clients arrive already logged in over a
 //! Unix socket instead, and the UDP socket is on the loopback, where the daemon relays the
 //! (still sealed) datagrams.
+//!
+//! With several monitors (protocol version 6) each monitor's pipeline has a
+//! [`NativeOutput`] of its own ([`NativeMonitors`]); their video shares the link, the
+//! session key and the packet numbers, and has its own frames and acknowledgements.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -17,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use glidedesk_proto::crypto::{Direction, PacketKey};
 use glidedesk_proto::{
-    ClientMsg, Codec as WireCodec, Cursor, InputEvent, ServerMsg, fec, files, link,
+    ClientMsg, Codec as WireCodec, Cursor, InputEvent, ServerMsg, VideoMsg, fec, files, link,
 };
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 use tokio::net::TcpListener;
@@ -41,28 +46,35 @@ struct Link {
     /// Where its UDP hello came from; no video before it.
     peer: Option<SocketAddr>,
     codec: Codec,
-    /// Size the client was last told about.
-    size: Option<(u32, u32)>,
     control: mpsc::UnboundedSender<ServerMsg>,
     seq: u64,
-    frame_id: u32,
     /// The client speaks protocol version 2: lost frames are invalidated, not answered
     /// with a keyframe.
     invalidation: bool,
-    /// Recent frames and their encoder picture index, oldest first.
-    sent: std::collections::VecDeque<(u32, u64)>,
+    /// The client asked for several monitors (version 6): the video of the monitors after
+    /// the first goes to it.
+    layout: bool,
+    /// What it was sent of each monitor's video, by monitor.
+    video: HashMap<u8, Sent>,
     /// The client asked for HEVC 4:4:4 (version 5) and the session is HEVC.
     yuv444: bool,
+}
+
+/// What the current client was sent of one monitor's video.
+#[derive(Default)]
+struct Sent {
+    /// Size the client was last told about.
+    size: Option<(u32, u32)>,
+    frame_id: u32,
+    /// Recent frames and their encoder picture index, oldest first.
+    recent: VecDeque<(u32, u64)>,
 }
 
 /// Frames remembered for invalidation requests (a loss further back needs a keyframe).
 const SENT_KEPT: usize = 32;
 
-struct Shared {
-    session: Arc<pipeline::Shared>,
-    index: usize,
-    udp: Arc<UdpSocket>,
-    link: Mutex<Option<Link>>,
+/// The video of one monitor, as its pipeline output and the control task share it.
+struct Video {
     /// Newest frame the client acknowledged.
     acked_id: AtomicU32,
     acked: AtomicU64,
@@ -71,12 +83,41 @@ struct Shared {
     lost: Mutex<Option<u64>>,
     /// Send-to-acknowledge delays, for the rate control.
     meter: Mutex<DelayMeter>,
+    /// Bitrate ceiling (this stream's share of the link's), for pacing.
+    ceiling: AtomicU32,
+}
+
+impl Video {
+    fn new() -> Self {
+        Self {
+            acked_id: AtomicU32::new(0),
+            acked: AtomicU64::new(0),
+            keyframe_requested: AtomicBool::new(false),
+            lost: Mutex::new(None),
+            meter: Mutex::default(),
+            ceiling: AtomicU32::new(crate::rate::START_BPS),
+        }
+    }
+
+    /// A new client: its frames are numbered from the start.
+    fn reset(&self) {
+        *self.lost.lock().unwrap() = None;
+        self.acked_id.store(0, Ordering::SeqCst);
+        self.meter.lock().unwrap().clear();
+    }
+}
+
+struct Shared {
+    session: Arc<pipeline::Shared>,
+    index: usize,
+    udp: Arc<UdpSocket>,
+    link: Mutex<Option<Link>>,
+    /// The video of monitor 0, and of the monitors set up after it, by monitor.
+    video: Mutex<HashMap<u8, Arc<Video>>>,
     /// Parity from the client's loss reports.
     fec: Mutex<link::FecControl>,
     /// Share lost in the newest report not yet taken by the rate control.
     loss: Mutex<Option<f32>>,
-    /// Bitrate ceiling, for pacing.
-    ceiling: AtomicU32,
 }
 
 impl Shared {
@@ -94,6 +135,8 @@ impl Shared {
 
 pub struct NativeOutput {
     shared: Arc<Shared>,
+    monitor: u8,
+    video: Arc<Video>,
     /// Since when frames have been held back for lack of acknowledgements.
     busy_since: Option<std::time::Instant>,
     /// Last SYNC sent while held back.
@@ -113,42 +156,54 @@ impl Output for NativeOutput {
         let Some(link) = guard.as_mut() else {
             return Ok(Prepared::Absent);
         };
-        if link.peer.is_none() {
+        let Some(peer) = link.peer else {
+            return Ok(Prepared::Absent);
+        };
+        // The monitors after the first only go to a client that asked for them.
+        if self.monitor != 0 && !link.layout {
             return Ok(Prepared::Absent);
         }
-        let mut new_surface = self.shared.keyframe_requested.swap(false, Ordering::SeqCst);
-        if link.size != Some((w, h)) {
-            link.size = Some((w, h));
-            let _ = link.control.send(ServerMsg::Size {
-                width: w as u16,
-                height: h as u16,
+        let mut new_surface = self.video.keyframe_requested.swap(false, Ordering::SeqCst);
+        let sent = link.video.entry(self.monitor).or_default();
+        if sent.size != Some((w, h)) {
+            sent.size = Some((w, h));
+            let (width, height) = (w as u16, h as u16);
+            let _ = link.control.send(if self.monitor == 0 {
+                ServerMsg::Size { width, height }
+            } else {
+                ServerMsg::MonitorSize {
+                    monitor: self.monitor,
+                    width,
+                    height,
+                }
             });
             new_surface = true;
         }
-        let acked = self.shared.acked_id.load(Ordering::SeqCst);
-        let in_flight = link.frame_id.wrapping_sub(acked);
+        let last = sent.frame_id;
+        let acked = self.video.acked_id.load(Ordering::SeqCst);
+        let in_flight = last.wrapping_sub(acked);
         if !new_surface && in_flight >= max_in_flight {
             let since = *self.busy_since.get_or_insert_with(std::time::Instant::now);
             if since.elapsed() < STALL {
                 if since.elapsed() >= SYNC_EVERY
                     && self.synced.is_none_or(|t| t.elapsed() >= SYNC_EVERY)
-                    && let Some(peer) = link.peer
                 {
                     self.synced = Some(std::time::Instant::now());
-                    let last = link.frame_id;
-                    Shared::seal_and_send(link, &self.shared.udp, peer, &fec::sync_packet(last));
+                    let sync = fec::sync_packet_monitor(self.monitor, last);
+                    Shared::seal_and_send(link, &self.shared.udp, peer, &sync);
                 }
                 return Ok(Prepared::Busy);
             }
             // No acknowledgement for a long time while frames wait: whatever got lost,
             // start over from a keyframe rather than freeze the picture.
             warn!(
-                sent = link.frame_id,
+                monitor = self.monitor,
+                sent = last,
                 acked,
                 ms = since.elapsed().as_millis() as u64,
                 "No acknowledgements: resending a keyframe"
             );
-            self.shared.acked_id.store(link.frame_id, Ordering::SeqCst);
+            self.video.acked_id.store(last, Ordering::SeqCst);
             new_surface = true;
         }
         self.busy_since = None;
@@ -168,28 +223,30 @@ impl Output for NativeOutput {
         let Some(peer) = link.peer else {
             return Ok(false);
         };
-        link.frame_id = link.frame_id.wrapping_add(1);
-        self.shared
+        let recovery = main.recovery && link.invalidation;
+        let sent = link.video.entry(self.monitor).or_default();
+        sent.frame_id = sent.frame_id.wrapping_add(1);
+        let frame_id = sent.frame_id;
+        self.video
             .meter
             .lock()
             .unwrap()
-            .sent(link.frame_id, main.data.len());
+            .sent(frame_id, main.data.len());
         if main.index != 0 {
-            if link.sent.len() >= SENT_KEPT {
-                link.sent.pop_front();
+            if sent.recent.len() >= SENT_KEPT {
+                sent.recent.pop_front();
             }
-            link.sent.push_back((link.frame_id, main.index));
+            sent.recent.push_back((frame_id, main.index));
         }
         let start = std::time::Instant::now();
         let parity = self.shared.fec.lock().unwrap().percent();
-        let (pace_bps, burst) = link::pacing(
-            self.shared.ceiling.load(Ordering::Relaxed),
-            fec::SHARD,
-        );
-        let packets = fec::packetize_frame(
-            link.frame_id,
+        let (pace_bps, burst) =
+            link::pacing(self.video.ceiling.load(Ordering::Relaxed), fec::SHARD);
+        let packets = fec::packetize_monitor(
+            self.monitor,
+            frame_id,
             main.keyframe,
-            main.recovery && link.invalidation,
+            recovery,
             &main.data,
             parity,
         );
@@ -211,34 +268,64 @@ impl Output for NativeOutput {
     }
 
     fn take_acked(&mut self) -> u64 {
-        self.shared.acked.swap(0, Ordering::Relaxed)
+        self.video.acked.swap(0, Ordering::Relaxed)
     }
 
     fn take_delays(&mut self) -> Vec<(std::time::Duration, usize)> {
-        self.shared.meter.lock().unwrap().take()
+        self.video.meter.lock().unwrap().take()
     }
 
     fn reset(&mut self) {
-        if let Some(link) = self.shared.link.lock().unwrap().as_mut() {
-            link.size = None;
+        if let Some(link) = self.shared.link.lock().unwrap().as_mut()
+            && let Some(sent) = link.video.get_mut(&self.monitor)
+        {
+            sent.size = None;
         }
     }
 
     fn wants_refresh(&self) -> bool {
-        self.shared.keyframe_requested.load(Ordering::SeqCst)
-            || self.shared.lost.lock().unwrap().is_some()
+        self.video.keyframe_requested.load(Ordering::SeqCst)
+            || self.video.lost.lock().unwrap().is_some()
     }
 
     fn take_lost(&mut self) -> Option<u64> {
-        self.shared.lost.lock().unwrap().take()
+        self.video.lost.lock().unwrap().take()
     }
 
     fn take_loss(&mut self) -> Option<f32> {
-        self.shared.loss.lock().unwrap().take()
+        // The link's losses, for monitor 0's rate control.
+        if self.monitor == 0 {
+            self.shared.loss.lock().unwrap().take()
+        } else {
+            None
+        }
     }
 
     fn set_ceiling(&mut self, bps: u32) {
-        self.shared.ceiling.store(bps, Ordering::Relaxed);
+        self.video.ceiling.store(bps, Ordering::Relaxed);
+    }
+}
+
+/// The native front end's outputs for the monitors after the first (protocol version 6).
+pub struct NativeMonitors(Arc<Shared>);
+
+impl pipeline::MonitorOutputs for NativeMonitors {
+    fn output(&self, monitor: u8) -> Box<dyn Output> {
+        let video = Arc::clone(
+            self.0
+                .video
+                .lock()
+                .unwrap()
+                .entry(monitor)
+                .or_insert_with(|| Arc::new(Video::new())),
+        );
+        Box::new(NativeOutput {
+            shared: Arc::clone(&self.0),
+            monitor,
+            video,
+            busy_since: None,
+            synced: None,
+        })
     }
 
     fn yuv444(&self) -> bool {
@@ -357,23 +444,21 @@ pub async fn new(
             .with_context(|| format!("binding UDP {bind}"))?;
         UdpSocket::from(s)
     };
+    let video = Arc::new(Video::new());
     let shared = Arc::new(Shared {
         session,
         index,
         udp: Arc::new(udp),
         link: Mutex::new(None),
-        acked_id: AtomicU32::new(0),
-        acked: AtomicU64::new(0),
-        meter: Mutex::default(),
-        keyframe_requested: AtomicBool::new(false),
-        lost: Mutex::new(None),
+        video: Mutex::new(HashMap::from([(0, Arc::clone(&video))])),
         fec: Mutex::default(),
         loss: Mutex::new(None),
-        ceiling: AtomicU32::new(crate::rate::START_BPS),
     });
     Ok((
         NativeOutput {
             shared: Arc::clone(&shared),
+            monitor: 0,
+            video,
             busy_since: None,
             synced: None,
         },
@@ -396,6 +481,11 @@ pub(crate) fn tls_config(dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
 }
 
 impl Server {
+    /// The outputs for the pipelines of further monitors.
+    pub fn monitors(&self) -> Arc<dyn pipeline::MonitorOutputs> {
+        Arc::new(NativeMonitors(Arc::clone(&self.shared)))
+    }
+
     pub async fn run(self, front: Front) -> Result<()> {
         let front = Arc::new(front);
         {
@@ -611,22 +701,23 @@ where
         token,
         peer: None,
         codec: codec.0,
-        size: None,
         control: ctl_tx.clone(),
         seq: 0,
-        frame_id: 0,
         invalidation: version >= 2,
-        sent: Default::default(),
         yuv444: false,
+        layout: false,
+        video: HashMap::new(),
     });
-    *shared.lost.lock().unwrap() = None;
+    for v in shared.video.lock().unwrap().values() {
+        v.reset();
+    }
+    // One monitor until this client asks for more (a previous client may have had several).
+    shared.session.request_layout(Vec::new());
     if let Some(old) = previous {
         let _ = old.control.send(ServerMsg::Denied(format!(
             "another client ({peer}) took over the session"
         )));
     }
-    shared.acked_id.store(0, Ordering::SeqCst);
-    shared.meter.lock().unwrap().clear();
     // A new client, maybe on another link: its losses are learned from the start.
     *shared.fec.lock().unwrap() = link::FecControl::default();
     *shared.loss.lock().unwrap() = None;
@@ -663,11 +754,21 @@ where
     let opened: Arc<Mutex<Option<String>>> = Arc::default();
     let mut app_exits = front.apps.subscribe();
     let watched = Arc::clone(&opened);
+    // The monitors set up, sent to a client that asked for several (version 6).
+    let mut layout = shared.session.layout.subscribe();
+    let asked_layout = Arc::new(AtomicBool::new(false));
+    let wants_layout = Arc::clone(&asked_layout);
     let writer = tokio::spawn(async move {
         let mut next_id = 0u32;
         loop {
             let msg = tokio::select! {
                 m = ctl_rx.recv() => match m { Some(m) => m, None => break },
+                l = layout.changed() => {
+                    if l.is_err() { break }
+                    let monitors = layout.borrow_and_update().clone();
+                    if monitors.is_empty() || !wants_layout.load(Ordering::Relaxed) { continue }
+                    ServerMsg::Layout(monitors)
+                }
                 f = async { match session_files.as_mut() { Some(f) => f.recv().await, None => std::future::pending().await } } => match f {
                     Ok(paths) => {
                         let offer = match tokio::task::spawn_blocking(move || files::Offer::new(&paths)).await {
@@ -743,29 +844,20 @@ where
                     .request_size(u32::from(width), u32::from(height));
             }
             ClientMsg::FrameAck { frame_id } => {
-                shared.acked_id.store(frame_id, Ordering::SeqCst);
-                shared.acked.fetch_add(1, Ordering::Relaxed);
-                shared.meter.lock().unwrap().acked(frame_id);
+                on_video(shared, 0, VideoMsg::FrameAck { frame_id });
             }
-            ClientMsg::RequestKeyframe => {
-                shared.keyframe_requested.store(true, Ordering::SeqCst);
-            }
+            ClientMsg::RequestKeyframe => on_video(shared, 0, VideoMsg::RequestKeyframe),
             ClientMsg::InvalidateFrames { first } => {
-                let index = shared.link.lock().unwrap().as_ref().and_then(|l| {
-                    l.sent
-                        .iter()
-                        .find(|&&(id, _)| id == first)
-                        .map(|&(_, index)| index)
-                });
-                debug!(first, ?index, "Client lost frames");
-                match index {
-                    Some(index) => {
-                        let mut lost = shared.lost.lock().unwrap();
-                        *lost = Some(lost.map_or(index, |l| l.min(index)));
-                    }
-                    // Too far back, or not from an encoder that can invalidate.
-                    None => shared.keyframe_requested.store(true, Ordering::SeqCst),
+                on_video(shared, 0, VideoMsg::InvalidateFrames { first });
+            }
+            ClientMsg::MonitorVideo { monitor, msg } => on_video(shared, monitor, msg),
+            ClientMsg::Monitors(asked) => {
+                info!(%peer, monitors = asked.len(), "Client asked for monitors");
+                if let Some(l) = shared.link.lock().unwrap().as_mut() {
+                    l.layout = asked.len() > 1;
                 }
+                asked_layout.store(true, Ordering::Relaxed);
+                shared.session.request_layout(asked);
             }
             ClientMsg::Ping { t_us } => {
                 let _ = ctl_tx.send(ServerMsg::Pong { t_us });
@@ -877,8 +969,11 @@ where
                 if changed {
                     info!(%peer, yuv444, "Client picture formats");
                     // Pictures sent so far were 4:2:0: start over (the pipeline decides
-                    // whether 4:4:4 is possible and opens the encoder for it).
-                    shared.keyframe_requested.store(true, Ordering::SeqCst);
+                    // whether 4:4:4 is possible and opens the encoder for it), on every
+                    // monitor.
+                    for v in shared.video.lock().unwrap().values() {
+                        v.keyframe_requested.store(true, Ordering::SeqCst);
+                    }
                 }
             }
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
@@ -895,6 +990,47 @@ where
     }
     writer.abort();
     result
+}
+
+/// An acknowledgement, keyframe request or invalidation for the video of `monitor`.
+fn on_video(shared: &Shared, monitor: u8, msg: VideoMsg) {
+    let Some(video) = shared.video.lock().unwrap().get(&monitor).cloned() else {
+        debug!(monitor, "Video message for a monitor not set up");
+        return;
+    };
+    match msg {
+        VideoMsg::FrameAck { frame_id } => {
+            video.acked_id.store(frame_id, Ordering::SeqCst);
+            video.acked.fetch_add(1, Ordering::Relaxed);
+            video.meter.lock().unwrap().acked(frame_id);
+        }
+        VideoMsg::RequestKeyframe => {
+            video.keyframe_requested.store(true, Ordering::SeqCst);
+        }
+        VideoMsg::InvalidateFrames { first } => {
+            let index = shared
+                .link
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|l| l.video.get(&monitor))
+                .and_then(|s| {
+                    s.recent
+                        .iter()
+                        .find(|&&(id, _)| id == first)
+                        .map(|&(_, index)| index)
+                });
+            debug!(monitor, first, ?index, "Client lost frames");
+            match index {
+                Some(index) => {
+                    let mut lost = video.lost.lock().unwrap();
+                    *lost = Some(lost.map_or(index, |l| l.min(index)));
+                }
+                // Too far back, or not from an encoder that can invalidate.
+                None => video.keyframe_requested.store(true, Ordering::SeqCst),
+            }
+        }
+    }
 }
 
 /// Asks the client for the next range of its files; once they have all arrived, puts them

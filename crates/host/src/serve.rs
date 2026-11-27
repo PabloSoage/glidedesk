@@ -11,7 +11,8 @@
 //!
 //! Threads: the tokio runtime runs both front ends and the input task; the capture threads
 //! produce frames; the pipeline thread encodes the newest frame and hands it to the output
-//! of whichever front end has the client.
+//! of whichever front end has the client. With several monitors ([`crate::layout`]), each
+//! monitor after the first has a capture and a pipeline thread of its own.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -25,7 +26,7 @@ use tracing::{info, warn};
 use crate::encoder;
 use crate::frame::{CursorEvent, FrameReceiver, Source};
 use crate::input::{InputBackend, InputForwarder};
-use crate::pipeline::{self, Output, Pipeline};
+use crate::pipeline::{self, MonitorOutputs, Output, Pipeline};
 
 /// Where the desktop comes from.
 #[derive(Clone, Debug)]
@@ -88,6 +89,8 @@ struct Parts {
     text_clipboard: Option<Arc<dyn crate::native::TextClipboard>>,
     /// Size the session starts with.
     size: (u32, u32),
+    /// Further monitors, where the session can show them.
+    displays: Option<Arc<dyn crate::layout::Displays>>,
     /// Run when the server stops.
     stop: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 }
@@ -129,7 +132,20 @@ async fn gnome(
     let (live_tx, live) = watch::channel(Arc::new(mutter::Live {
         remote: session.remote.clone(),
         stream_path: session.stream_path.clone(),
+        screen_cast: session.screen_cast.clone(),
     }));
+    // Further monitors: their streams in the same session, input placed on them.
+    let placements = crate::gnome::Placements::default();
+    let (lost, _) = watch::channel(0);
+    let displays = crate::gnome::GnomeDisplays::new(
+        conn.clone(),
+        live.clone(),
+        cursor_mode,
+        &sinks,
+        cuda.clone(),
+        Arc::clone(&placements),
+        lost.clone(),
+    );
     tokio::spawn(crate::gnome::supervise(
         conn.clone(),
         cursor_mode,
@@ -137,6 +153,7 @@ async fn gnome(
         Arc::clone(&followed),
         sinks,
         cuda,
+        lost,
     ));
     let (audio, surround) = match crate::audio::start() {
         Ok((stereo, surround)) => (Some(stereo), Some(surround)),
@@ -152,12 +169,13 @@ async fn gnome(
         source: Box::new(crate::gnome::FollowedSource(followed)),
         frames: rx,
         cursor: cursor_rx,
-        input: Box::new(crate::input::MutterInput::new(live)),
+        input: Box::new(crate::input::MutterInput::new(live, placements)),
         audio,
         surround,
         clipboard: Some(Box::new(clipboard)),
         text_clipboard: Some(Arc::new(hub)),
         size: (w, h),
+        displays: Some(Arc::new(displays)),
         stop: Some(Box::pin(async move {
             let remote = current.borrow().remote.clone();
             remote.stop().await.ok();
@@ -180,6 +198,7 @@ fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
         surround: None,
         clipboard: None,
         text_clipboard: None,
+        displays: None,
         stop: None,
     })
 }
@@ -213,6 +232,7 @@ fn windows(
             .clone()
             .map(|c| Box::new(c) as Box<dyn ironrdp_server::CliprdrServerFactory>),
         text_clipboard: clipboard.map(|c| Arc::new(c) as Arc<dyn crate::native::TextClipboard>),
+        displays: None,
         stop,
     })
 }
@@ -237,6 +257,12 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     if backend.d3d11_input() {
         crate::wind3d::enable();
     }
+    // The encoders of further monitors: the same kind, on the same GPU context.
+    let encoders: crate::layout::EncoderFactory = {
+        let (name, cuda, node) = (backend.name(), cuda.clone(), opts.render_node.clone());
+        let (fps, bitrate) = (opts.fps, opts.bitrate);
+        Arc::new(move || encoder::another(name, hevc, cuda.as_ref(), node.clone(), fps, bitrate))
+    };
 
     let parts = match &opts.session {
         #[cfg(feature = "gnome")]
@@ -255,6 +281,9 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     crate::rdp::ensure_identity(&opts.state_dir)?;
     let (rdp_output, rdp_server) = crate::rdp::new(Arc::clone(&shared), RDP);
     let mut outputs: Vec<Box<dyn Output>> = vec![Box::new(rdp_output)];
+    // The outputs of the front ends for further monitors, in the same order.
+    let mut monitor_outputs: Vec<Option<Arc<dyn MonitorOutputs>>> =
+        vec![Some(rdp_server.monitors())];
     let native = match opts.native_bind {
         Some(bind) => {
             let (output, server) = crate::native::new(
@@ -265,6 +294,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             )
             .await?;
             outputs.push(Box::new(output));
+            monitor_outputs.push(Some(server.monitors()));
             Some((server, bind))
         }
         None => None,
@@ -275,6 +305,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             let (output, server) =
                 crate::web::new(Arc::clone(&shared), outputs.len(), bind).await?;
             outputs.push(Box::new(output));
+            monitor_outputs.push(None);
             Some((server, bind))
         }
         None => None,
@@ -291,12 +322,23 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                 parts.surround.clone(),
             )?;
             outputs.push(Box::new(output));
+            monitor_outputs.push(None);
             Some(stream)
         }
         None => None,
     };
     #[cfg(feature = "web")]
     let max_bitrate = opts.pipeline.max_bitrate;
+    tokio::spawn(
+        crate::layout::Manager {
+            shared: Arc::clone(&shared),
+            displays: parts.displays.clone(),
+            encoders,
+            outputs: monitor_outputs,
+            opts: opts.pipeline.clone(),
+        }
+        .run(),
+    );
     let pipeline = Pipeline::new(
         Arc::clone(&shared),
         parts.source,
@@ -322,6 +364,11 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         input: input.clone(),
         clipboard: parts.clipboard,
         auth_limiter: Arc::clone(&auth_limiter),
+        monitors: if parts.displays.is_some() {
+            crate::layout::MAX_MONITORS
+        } else {
+            1
+        },
     };
     let rdp_on = opts.rdp;
     let rdp = async move {

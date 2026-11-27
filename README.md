@@ -341,6 +341,12 @@ say); the picture still shows on whichever screen the window is on. `--codec h26
 decodes it on VA-API or NVDEC where the GPU can, in software otherwise (always on Windows:
 D3D11VA has no HEVC 4:4:4 in FFmpeg).
 
+`--monitors all` (or `--monitors 1,2`, numbered left to right as the log lists them; the
+**Monitors** field of the connection window) spreads the desktop over several monitors of this
+computer, like `mstsc /multimon`: a full-screen window on each, each a monitor of the remote
+desktop with its own video stream. It needs the native protocol and a GNOME server of this
+version; other servers show one monitor.
+
 The first connection to a server shows the SHA-256 fingerprint of its certificate and asks
 whether to trust it, before any password is sent; the answer is remembered
 (`%APPDATA%\glidedesk\known_hosts.toml`; on Linux, `~/.config/glidedesk/known_hosts.toml`,

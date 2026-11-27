@@ -72,6 +72,8 @@ pub struct Launcher {
     pub clipboard: bool,
     /// An app of the server to open instead of the desktop (empty: the desktop).
     pub app: String,
+    /// Monitors to show the desktop on (`--monitors`; empty: the window).
+    pub monitors: String,
     pub history: History,
     pub known_hosts: KnownHosts,
     pub fingerprint: String,
@@ -106,6 +108,7 @@ impl Launcher {
             mute: false,
             clipboard: true,
             app: String::new(),
+            monitors: String::new(),
             history,
             known_hosts,
             fingerprint: String::new(),
@@ -144,6 +147,11 @@ impl Launcher {
         (!a.is_empty()).then(|| a.to_owned())
     }
 
+    fn monitors(&self) -> Option<String> {
+        let m = self.monitors.trim();
+        (!m.is_empty()).then(|| m.to_owned())
+    }
+
     fn user(&self) -> Option<String> {
         let u = self.user.trim();
         (!u.is_empty()).then(|| u.to_owned())
@@ -174,6 +182,7 @@ impl Launcher {
         self.codec = p.codec.unwrap_or(CodecChoice::Auto);
         self.clipboard = p.clipboard.unwrap_or(true);
         self.app = p.app.unwrap_or_default();
+        self.monitors = p.monitors.unwrap_or_default();
         self.gpu = match p.gpu.as_deref().map(str::to_ascii_lowercase).as_deref() {
             Some("amd") => GpuOption::Amd,
             Some("intel") => GpuOption::Intel,
@@ -208,6 +217,7 @@ impl Launcher {
             codec: (self.codec != CodecChoice::Auto).then_some(self.codec),
             clipboard: (!self.clipboard).then_some(false),
             app: self.app(),
+            monitors: self.monitors(),
         };
         p.save_file(path).map_err(|e| format!("{e:#}"))
     }
@@ -224,6 +234,10 @@ impl Launcher {
             glidedesk_client::trust::parse_fingerprint(f)?;
         }
         let (width, height) = self.size();
+        let monitors = self
+            .monitors()
+            .map(|m| crate::parse_monitors(&m))
+            .transpose()?;
         self.history.add(&host, self.user().as_deref());
         if let Err(e) = self.history.save() {
             tracing::warn!(error = format!("{e:#}"), "Could not save the history");
@@ -248,8 +262,10 @@ impl Launcher {
             fingerprint,
             codec: self.codec,
             yuv444: false,
+            register_files: false,
             no_clipboard: !self.clipboard,
             app: if self.rdp { None } else { self.app() },
+            monitors,
         })
     }
 }
@@ -464,6 +480,21 @@ pub fn render_ui(launcher: &mut Launcher, ui: &mut egui::Ui) -> LauncherAction {
                             .size(11.0)
                             .color(Color32::from_gray(160)),
                     );
+                    ui.add_space(6.0);
+                    ui.add_enabled_ui(!launcher.rdp, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Monitors:");
+                            ui.add_sized(
+                                [120.0, 20.0],
+                                egui::TextEdit::singleline(&mut launcher.monitors)
+                                    .hint_text("this window"),
+                            )
+                            .on_hover_text(
+                                "all, or the numbers of this computer's monitors (1,2: left to \
+                                 right): a full-screen window on each",
+                            );
+                        });
+                    });
                 });
             }
 

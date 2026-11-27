@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
             refresh: 60,
             trust: Default::default(),
             app: a.app,
+            monitors: Vec::new(),
         };
         tokio::spawn(async move {
             glidedesk_client::native::run(opts, shared, rx)

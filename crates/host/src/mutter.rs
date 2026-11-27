@@ -4,6 +4,9 @@
 //! monitor whose size follows the format negotiated on its PipeWire stream, which is how the
 //! desktop follows the client window. No portal dialog is involved: the caller must be on
 //! the compositor's own session bus.
+//!
+//! Several monitors are several `RecordVirtual` streams of one session ([`add_virtual`]),
+//! placed with `org.gnome.Mutter.DisplayConfig` ([`DisplayConfigProxy`]).
 
 use std::collections::HashMap;
 
@@ -97,8 +100,68 @@ pub trait ScreenCastSession {
     default_service = "org.gnome.Mutter.ScreenCast"
 )]
 pub trait ScreenCastStream {
+    /// Starts a stream added to a session already started.
+    fn start(&self) -> zbus::Result<()>;
+    /// Ends the stream (a virtual one takes its monitor with it).
+    fn stop(&self) -> zbus::Result<()>;
+
     #[zbus(signal)]
     fn pipe_wire_stream_added(&self, node_id: u32) -> zbus::Result<()>;
+}
+
+/// A monitor in `GetCurrentState`: (connector, vendor, product, serial), modes (id, width,
+/// height, refresh rate, preferred scale, supported scales, properties), properties.
+pub type MonitorState = (
+    (String, String, String, String),
+    Vec<(String, i32, i32, f64, f64, Vec<f64>, HashMap<String, zbus::OwnedVariant>)>,
+    HashMap<String, zbus::OwnedVariant>,
+);
+/// A logical monitor in `GetCurrentState`: x, y, scale, transform, primary, its monitors
+/// (connector, vendor, product, serial), properties.
+pub type LogicalMonitorState = (
+    i32,
+    i32,
+    f64,
+    u32,
+    bool,
+    Vec<(String, String, String, String)>,
+    HashMap<String, zbus::OwnedVariant>,
+);
+/// A logical monitor for `ApplyMonitorsConfig`: x, y, scale, transform, primary, its
+/// monitors (connector, mode id, properties).
+pub type LogicalMonitorConfig<'a> = (
+    i32,
+    i32,
+    f64,
+    u32,
+    bool,
+    Vec<(String, String, HashMap<&'a str, Value<'a>>)>,
+);
+
+#[proxy(
+    interface = "org.gnome.Mutter.DisplayConfig",
+    default_service = "org.gnome.Mutter.DisplayConfig",
+    default_path = "/org/gnome/Mutter/DisplayConfig"
+)]
+pub trait DisplayConfig {
+    #[allow(clippy::type_complexity)]
+    fn get_current_state(
+        &self,
+    ) -> zbus::Result<(
+        u32,
+        Vec<MonitorState>,
+        Vec<LogicalMonitorState>,
+        HashMap<String, zbus::OwnedVariant>,
+    )>;
+
+    /// `method`: 0 verify, 1 temporary, 2 persistent.
+    fn apply_monitors_config(
+        &self,
+        serial: u32,
+        method: u32,
+        logical_monitors: Vec<LogicalMonitorConfig<'_>>,
+        properties: HashMap<&str, Value<'_>>,
+    ) -> zbus::Result<()>;
 }
 
 /// Cursor modes of `RecordVirtual`.
@@ -118,6 +181,8 @@ pub struct Live {
     pub remote: RemoteDesktopSessionProxy<'static>,
     /// Stream object path, needed for absolute pointer motion.
     pub stream_path: String,
+    /// Its screen cast session, where the streams of further monitors are added.
+    pub screen_cast: ScreenCastSessionProxy<'static>,
 }
 
 pub type LiveRx = tokio::sync::watch::Receiver<std::sync::Arc<Live>>;
@@ -129,6 +194,7 @@ pub struct Session {
     pub node_id: u32,
     /// Stream object path, needed for absolute pointer motion.
     pub stream_path: String,
+    pub screen_cast: ScreenCastSessionProxy<'static>,
 }
 
 impl Session {
@@ -184,8 +250,49 @@ impl Session {
             remote,
             node_id,
             stream_path: stream_path.to_string(),
+            screen_cast: sc_session,
         })
     }
+}
+
+/// A virtual monitor added to a started session.
+pub struct VirtualStream {
+    pub stream: ScreenCastStreamProxy<'static>,
+    /// Stream object path, for absolute pointer motion on it.
+    pub path: String,
+    /// PipeWire node of its stream.
+    pub node_id: u32,
+}
+
+/// Adds a virtual monitor to the started session of `screen_cast`; Mutter creates it once
+/// the PipeWire stream is connected and its size negotiated.
+pub async fn add_virtual(
+    conn: &zbus::Connection,
+    screen_cast: &ScreenCastSessionProxy<'static>,
+    cursor: CursorMode,
+) -> Result<VirtualStream> {
+    let path = screen_cast
+        .record_virtual(HashMap::from([
+            ("cursor-mode", Value::from(cursor as u32)),
+            ("is-platform", Value::from(true)),
+        ]))
+        .await
+        .context("RecordVirtual")?;
+    let stream = ScreenCastStreamProxy::builder(conn)
+        .path(path.clone())
+        .build()
+        .await?;
+    let mut added = stream.receive_pipe_wire_stream_added().await?;
+    stream.start().await.context("starting the stream")?;
+    let signal = tokio::time::timeout(std::time::Duration::from_secs(10), added.next())
+        .await
+        .context("Mutter did not announce the PipeWire stream")?
+        .context("signal stream ended")?;
+    Ok(VirtualStream {
+        stream,
+        path: path.to_string(),
+        node_id: signal.args()?.node_id,
+    })
 }
 
 #[proxy(

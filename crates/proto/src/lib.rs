@@ -21,7 +21,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///   files on the clipboard ([`files`]: `Files`, `FileRead`, `FileData` both ways).
 /// - 5: [`ClientMsg::Formats`] (HEVC 4:4:4), sent by the client right after
 ///   [`ServerMsg::Welcome`].
-pub const VERSION: u32 = 5;
+/// - 6: several monitors: [`ClientMsg::Monitors`] asks for a layout, [`ServerMsg::Layout`]
+///   says what the server set up, [`ServerMsg::MonitorSize`]; the video of the monitors
+///   after the first comes in [`fec::VIDEO2`] packets and is acknowledged with
+///   [`ClientMsg::MonitorVideo`].
+///
+/// A client learns the server's version from the login itself: a server refuses versions it
+/// does not know, and the client then retries with the newest one the refusal names (so the
+/// version of an accepted `Hello` is one both speak).
+pub const VERSION: u32 = 6;
 /// Oldest client version a server accepts (it then uses only what that version knows).
 pub const MIN_VERSION: u32 = 1;
 /// Default TCP and UDP port.
@@ -53,6 +61,47 @@ pub enum InputEvent {
     Unicode { ch: char, down: bool },
     /// The client window lost the focus: release everything held.
     ReleaseAll,
+}
+
+/// One monitor of a layout (version 6), in desktop pixels.
+///
+/// From the client ([`ClientMsg::Monitors`]): its screens, positioned relative to each other
+/// as its system places them (any origin). From the server ([`ServerMsg::Layout`]): the
+/// monitors of the remote desktop, the top left corner of their bounding box at 0,0; pointer
+/// positions ([`InputEvent::MouseMove`]) are in that space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Monitor {
+    /// Chosen by the client, kept by the server. Monitor 0 is the one of `Hello`'s size:
+    /// its video uses the messages and packets of a single-monitor session.
+    pub id: u8,
+    pub x: i32,
+    pub y: i32,
+    pub width: u16,
+    pub height: u16,
+    /// Hz.
+    pub refresh: u32,
+    pub primary: bool,
+}
+
+/// (Version 6.) What a client says about the video of one monitor other than monitor 0
+/// ([`ClientMsg::MonitorVideo`]); monitor 0 keeps the plain messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoMsg {
+    FrameAck { frame_id: u32 },
+    RequestKeyframe,
+    InvalidateFrames { first: u32 },
+}
+
+impl VideoMsg {
+    /// The message for the video of `monitor`: the single-monitor message for monitor 0.
+    pub fn for_monitor(self, monitor: u8) -> ClientMsg {
+        match (monitor, self) {
+            (0, Self::FrameAck { frame_id }) => ClientMsg::FrameAck { frame_id },
+            (0, Self::RequestKeyframe) => ClientMsg::RequestKeyframe,
+            (0, Self::InvalidateFrames { first }) => ClientMsg::InvalidateFrames { first },
+            (monitor, msg) => ClientMsg::MonitorVideo { monitor, msg },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +156,14 @@ pub enum ClientMsg {
     /// Extensions, `chroma_format_idc` 3, full-range BT.709) from its next keyframe on; the
     /// stream itself says which it is. Only sent when the client wants something.
     Formats { yuv444: bool },
+    /// (Version 6.) Show the desktop on these monitors (monitor 0 among them, with the size
+    /// of `Hello` or of the last `Resize`). The server answers with [`ServerMsg::Layout`],
+    /// which may have fewer monitors than asked for (one, if it cannot do more). A layout
+    /// of one monitor goes back to a single-monitor session.
+    Monitors(Vec<Monitor>),
+    /// (Version 6.) Acknowledgement, keyframe request or invalidation for the video of a
+    /// monitor other than 0 (see [`VideoMsg::for_monitor`]).
+    MonitorVideo { monitor: u8, msg: VideoMsg },
 }
 
 /// One copied file or folder ([`files`]).
@@ -192,6 +249,17 @@ pub enum ServerMsg {
     FileRead(FileRead),
     /// (Version 4.) The answer to a [`ClientMsg::FileRead`].
     FileData(FileData),
+    /// (Version 6, to clients that sent [`ClientMsg::Monitors`].) The monitors of the
+    /// remote desktop, after each change; the video of those other than monitor 0 comes in
+    /// [`fec::VIDEO2`] packets.
+    Layout(Vec<Monitor>),
+    /// (Version 6.) Monitor `monitor` (not 0, which has [`ServerMsg::Size`]) has a new
+    /// size; its frames that follow have it, starting with a keyframe.
+    MonitorSize {
+        monitor: u8,
+        width: u16,
+        height: u16,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -266,6 +334,16 @@ mod tests {
             }),
             ClientMsg::FrameAck { frame_id: 7 },
             ClientMsg::Formats { yuv444: true },
+            ClientMsg::Monitors(vec![Monitor {
+                id: 1,
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                refresh: 60,
+                primary: false,
+            }]),
+            VideoMsg::FrameAck { frame_id: 3 }.for_monitor(2),
         ];
         let mut buf = Vec::new();
         for m in &msgs {
@@ -276,5 +354,35 @@ mod tests {
             let got: ClientMsg = read_msg(&mut r).await.unwrap();
             assert_eq!(&got, m);
         }
+    }
+
+    #[test]
+    fn monitor_zero_keeps_the_single_monitor_messages() {
+        assert_eq!(
+            VideoMsg::FrameAck { frame_id: 9 }.for_monitor(0),
+            ClientMsg::FrameAck { frame_id: 9 }
+        );
+        assert_eq!(
+            VideoMsg::RequestKeyframe.for_monitor(0),
+            ClientMsg::RequestKeyframe
+        );
+        assert_eq!(
+            VideoMsg::InvalidateFrames { first: 4 }.for_monitor(1),
+            ClientMsg::MonitorVideo {
+                monitor: 1,
+                msg: VideoMsg::InvalidateFrames { first: 4 }
+            }
+        );
+    }
+
+    /// Older peers decode the enums by variant index: the new variants must come last.
+    #[test]
+    fn new_variants_come_after_the_old_ones() {
+        let index = |m: &ClientMsg| postcard::to_stdvec(m).unwrap()[0];
+        assert_eq!(index(&ClientMsg::Monitors(Vec::new())), 14);
+        assert_eq!(
+            postcard::to_stdvec(&ServerMsg::Layout(Vec::new())).unwrap()[0],
+            12
+        );
     }
 }

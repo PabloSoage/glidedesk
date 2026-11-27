@@ -1,6 +1,7 @@
 //! Decoding: access units from the session go to a decoder thread ([`crate::decode`]: the
 //! GPU's decoder, or FFmpeg in software), which keeps only the newest decoded picture and
-//! wakes the window to show it.
+//! wakes the window to show it. With several monitors each has a decoder thread of its own,
+//! started when the server starts its video.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -36,6 +37,10 @@ pub enum Chroma {
 pub enum Event {
     /// A new picture is in the slot.
     Picture,
+    /// A new picture is in the slot of the window of this further monitor.
+    MonitorPicture(u8),
+    /// The monitors of the remote desktop, as the server set them up.
+    Layout(Vec<glidedesk_proto::Monitor>),
     Cursor(glidedesk_proto::Cursor),
     /// Text copied in the session.
     Clipboard(String),
@@ -68,10 +73,61 @@ pub struct Sink {
     audio: Option<crate::audio::Player>,
     /// Ask native servers for HEVC 4:4:4 (`--yuv444`).
     yuv444: bool,
+    hardware: bool,
+    /// The session's codec, from the last reset of monitor 0.
+    codec: Option<VideoCodec>,
+    /// The windows of further monitors (native protocol, version 6).
+    monitors: Vec<MonitorVideo>,
+}
+
+/// The video of a further monitor: its window's slot, and its decoder thread once its
+/// video starts.
+struct MonitorVideo {
+    monitor: u8,
+    slot: Arc<Mutex<Option<Picture>>>,
+    decoder: Option<MonitorDecoder>,
+}
+
+struct MonitorDecoder {
+    units: mpsc::Sender<Unit>,
+    /// Access units sent to it and not decoded yet.
+    queued: Arc<AtomicUsize>,
+    codec: VideoCodec,
+}
+
+impl Sink {
+    /// The decoder of `monitor`'s video. It starts with the first video of the monitor:
+    /// the size message (`codec`) or a frame (the session's codec), whichever comes first,
+    /// as the first keyframe can overtake the size message (UDP and TCP). A size change
+    /// keeps the decoder (the stream's parameter sets carry the size); another codec
+    /// starts it over.
+    fn monitor_decoder(
+        &mut self,
+        monitor: u8,
+        codec: Option<VideoCodec>,
+    ) -> Option<&MonitorDecoder> {
+        let (notify, hardware, session) = (Arc::clone(&self.notify), self.hardware, self.codec);
+        let m = self.monitors.iter_mut().find(|m| m.monitor == monitor)?;
+        let wanted = codec.or(m.decoder.as_ref().map(|d| d.codec)).or(session)?;
+        if m.decoder.as_ref().is_none_or(|d| d.codec != wanted) {
+            let d = m.decoder.get_or_insert_with(|| {
+                let (units, queued) = spawn(monitor, Arc::clone(&m.slot), notify, hardware);
+                MonitorDecoder {
+                    units,
+                    queued,
+                    codec: wanted,
+                }
+            });
+            d.codec = wanted;
+            let _ = d.units.send(Unit::Reset(wanted));
+        }
+        m.decoder.as_ref()
+    }
 }
 
 impl VideoSink for Sink {
     fn reset(&mut self, _width: u32, _height: u32, codec: VideoCodec) {
+        self.codec = Some(codec);
         let _ = self.units.send(Unit::Reset(codec));
     }
 
@@ -115,33 +171,90 @@ impl VideoSink for Sink {
     fn files(&mut self, paths: Vec<std::path::PathBuf>) {
         (self.notify)(Event::Files(paths));
     }
+
+    fn layout(&mut self, monitors: &[glidedesk_proto::Monitor]) {
+        (self.notify)(Event::Layout(monitors.to_vec()));
+    }
+
+    fn reset_monitor(&mut self, monitor: u8, _width: u32, _height: u32, codec: VideoCodec) {
+        if self.monitor_decoder(monitor, Some(codec)).is_none() {
+            warn!(monitor, "Video for a monitor with no window");
+        }
+    }
+
+    fn frame_monitor(&mut self, monitor: u8, data: &[u8]) {
+        let Some(d) = self.monitor_decoder(monitor, None) else {
+            return;
+        };
+        d.queued.fetch_add(1, Ordering::Relaxed);
+        if d.units.send(Unit::Data(data.to_vec(), Instant::now())).is_err() {
+            d.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn backlog_monitor(&self, monitor: u8) -> usize {
+        self.monitors
+            .iter()
+            .find(|m| m.monitor == monitor)
+            .and_then(|m| m.decoder.as_ref())
+            .map_or(0, |d| d.queued.load(Ordering::Relaxed))
+    }
 }
 
 /// Starts the decoder thread; pictures land in `slot`. `hardware`: use the GPU's decoder
 /// when there is one. `yuv444`: ask for HEVC 4:4:4 (decoded on the GPU where FFmpeg can,
 /// else in software).
+/// `monitors`: the windows of further monitors and their slots, by monitor id (their
+/// decoders start with their video).
 pub fn start(
     slot: Arc<Mutex<Option<Picture>>>,
     notify: Notify,
     audio: Option<crate::audio::Player>,
     hardware: bool,
     yuv444: bool,
+    monitors: Vec<(u8, Arc<Mutex<Option<Picture>>>)>,
 ) -> Sink {
-    let (tx, rx) = mpsc::channel::<Unit>();
-    let n = Arc::clone(&notify);
-    let queued = Arc::new(AtomicUsize::new(0));
-    let q = Arc::clone(&queued);
-    std::thread::Builder::new()
-        .name("decoder".into())
-        .spawn(move || decode_loop(&rx, &slot, &n, &q, hardware))
-        .expect("spawning the decoder thread");
+    let (units, queued) = spawn(0, slot, Arc::clone(&notify), hardware);
     Sink {
-        units: tx,
+        units,
         queued,
         notify,
         audio,
         yuv444,
+        hardware,
+        codec: None,
+        monitors: monitors
+            .into_iter()
+            .map(|(monitor, slot)| MonitorVideo {
+                monitor,
+                slot,
+                decoder: None,
+            })
+            .collect(),
     }
+}
+
+/// A decoder thread for the video of `monitor`: where its access units go, and how many
+/// wait.
+fn spawn(
+    monitor: u8,
+    slot: Arc<Mutex<Option<Picture>>>,
+    notify: Notify,
+    hardware: bool,
+) -> (mpsc::Sender<Unit>, Arc<AtomicUsize>) {
+    let (tx, rx) = mpsc::channel::<Unit>();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let q = Arc::clone(&queued);
+    let name = if monitor == 0 {
+        "decoder".to_owned()
+    } else {
+        format!("decoder-{monitor}")
+    };
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(move || decode_loop(&rx, &slot, &notify, &q, hardware, monitor))
+        .expect("spawning the decoder thread");
+    (tx, queued)
 }
 
 fn decode_loop(
@@ -150,6 +263,7 @@ fn decode_loop(
     notify: &Notify,
     queued: &AtomicUsize,
     hardware: bool,
+    monitor: u8,
 ) {
     let mut decoder: Option<Decoder> = None;
     let (mut frames, mut on_gpu, mut decode_us, mut since) = (0u32, 0u32, 0u128, Instant::now());
@@ -159,7 +273,12 @@ fn decode_loop(
                 // A new stream starts with an IDR; a fresh decoder drops stale state.
                 decoder = match Decoder::new(codec, hardware) {
                     Ok(d) => {
-                        info!(?codec, hardware = d.hardware().unwrap_or("none"), "Decoder");
+                        info!(
+                            monitor,
+                            ?codec,
+                            hardware = d.hardware().unwrap_or("none"),
+                            "Decoder"
+                        );
                         Some(d)
                     }
                     Err(e) => {
@@ -182,7 +301,11 @@ fn decode_loop(
                         frames += 1;
                         on_gpu += u32::from(gpu);
                         *slot.lock().unwrap() = Some(pic);
-                        notify(Event::Picture);
+                        notify(if monitor == 0 {
+                            Event::Picture
+                        } else {
+                            Event::MonitorPicture(monitor)
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => debug!(%e, "Decode error"),
