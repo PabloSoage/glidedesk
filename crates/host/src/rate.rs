@@ -71,6 +71,8 @@ const CUT_HOLD: Duration = Duration::from_millis(400);
 const RAISE_AFTER: Duration = Duration::from_secs(1);
 /// The floor is the least delay over this long, so a slower route is learned.
 const FLOOR_WINDOW: Duration = Duration::from_secs(10);
+/// Share of lost packets that lowers the ceiling (below it, parity does the work).
+const LOSS_CUT: f32 = 0.05;
 
 pub struct Rate {
     bps: u32,
@@ -168,6 +170,30 @@ impl Rate {
         None
     }
 
+    /// The client's share of lost packets over its last report (native protocol, version
+    /// 4). Parity covers random losses; this only reacts to losses parity cannot sensibly
+    /// cover, which on most links mean the bitrate is above what gets through: the
+    /// ceiling drops (no more often than the delay cuts), and the climb back waits for a
+    /// clean second.
+    pub fn loss(&mut self, fraction: f32) -> Option<u32> {
+        self.loss_at(fraction, Instant::now())
+    }
+
+    fn loss_at(&mut self, fraction: f32, now: Instant) -> Option<u32> {
+        if fraction < LOSS_CUT {
+            return None;
+        }
+        self.clean_since = now;
+        if now.duration_since(self.last_cut) < CUT_HOLD {
+            return None;
+        }
+        self.last_cut = now;
+        // Heavier losses, a deeper cut: 20 % lost takes the ceiling to 60 %.
+        let keep = (1.0 - f64::from(fraction) * 2.0).clamp(0.5, 0.85);
+        let bps = ((f64::from(self.bps) * keep).round() as u32).max(MIN_BPS);
+        self.set(bps)
+    }
+
     /// The transport's own estimate of the link (WebRTC's congestion control) instead of
     /// acknowledgement delays: the ceiling follows it, ignoring changes under 10 %.
     pub fn follow(&mut self, estimate_bps: u32) -> Option<u32> {
@@ -250,6 +276,23 @@ mod tests {
         assert_eq!(r.follow(20_000_000), Some(20_000_000));
         assert_eq!(r.follow(500_000_000), Some(80_000_000)); // the user's limit
         assert_eq!(r.follow(10), Some(MIN_BPS));
+    }
+
+    #[test]
+    fn rate_cuts_on_heavy_losses_only() {
+        let mut r = Rate::new(None);
+        let t0 = Instant::now();
+        // Within the hold after creation: nothing yet.
+        assert_eq!(r.loss_at(0.2, t0), None);
+        let t = t0 + CUT_HOLD;
+        // Light losses are left to the parity.
+        assert_eq!(r.loss_at(0.01, t), None);
+        // 20 % lost: down to 60 %.
+        assert_eq!(r.loss_at(0.2, t), Some(30_000_000));
+        // Not again within the hold.
+        assert_eq!(r.loss_at(0.2, t + CUT_HOLD / 2), None);
+        // 6 % lost: the mildest cut, to 85 %.
+        assert_eq!(r.loss_at(0.06, t + CUT_HOLD), Some(25_500_000));
     }
 
     #[test]

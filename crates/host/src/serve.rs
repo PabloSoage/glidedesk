@@ -287,6 +287,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         audio: parts.audio.clone(),
         input: input.clone(),
         clipboard: parts.clipboard,
+        auth_limiter: Arc::clone(&auth_limiter),
     });
     let native_limiter = Arc::clone(&auth_limiter);
     let native = async {

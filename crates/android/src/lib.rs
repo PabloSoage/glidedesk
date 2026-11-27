@@ -122,6 +122,8 @@ mod android {
         connected: bool,
         ended: bool,
         error: Option<String>,
+        /// The link is poor (native protocol): a line to show over the desktop.
+        warning: Option<String>,
     }
 
     struct Session {
@@ -144,6 +146,9 @@ mod android {
         }
         fn frame(&mut self, h264: &[u8]) {
             self.decoder.lock().unwrap().frame(h264);
+        }
+        fn link_warning(&mut self, warning: Option<&str>) {
+            self.status.lock().unwrap().warning = warning.map(str::to_owned);
         }
     }
 
@@ -396,6 +401,21 @@ mod android {
         let msg = session(h)
             .and_then(|s| s.status.lock().unwrap().error.clone())
             .unwrap_or_default();
+        env.new_string(msg)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// The link warning to show, or null when the link is good.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_io_github_pablosoage_glidedesk_NativeSession_nativeWarning(
+        env: JNIEnv,
+        _c: JClass,
+        h: jlong,
+    ) -> jstring {
+        let Some(msg) = session(h).and_then(|s| s.status.lock().unwrap().warning.clone()) else {
+            return std::ptr::null_mut();
+        };
         env.new_string(msg)
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut())

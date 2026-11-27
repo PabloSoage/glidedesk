@@ -176,9 +176,11 @@ private fun ConnectScreen(
 private fun SessionScreen(session: NativeSession, scale: Float, onEnd: (String) -> Unit) {
     var state by remember { mutableStateOf(NativeSession.State.CONNECTING) }
     var view by remember { mutableStateOf<SessionView?>(null) }
+    var warning by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(session) {
         while (true) {
             state = session.state
+            warning = session.warning
             when (state) {
                 NativeSession.State.FAILED -> { onEnd(session.error.ifEmpty { "Connection failed" }); return@LaunchedEffect }
                 NativeSession.State.ENDED -> { onEnd("Session ended"); return@LaunchedEffect }
@@ -204,6 +206,20 @@ private fun SessionScreen(session: NativeSession, scale: Float, onEnd: (String) 
         )
         if (state == NativeSession.State.CONNECTING) {
             CircularProgressIndicator(Modifier.align(Alignment.Center))
+        }
+        warning?.let {
+            androidx.compose.material3.Surface(
+                color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f),
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier.align(Alignment.TopStart).padding(16.dp),
+            ) {
+                Text(
+                    it,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                )
+            }
         }
         Column(Modifier.align(Alignment.TopEnd).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SmallFloatingActionButton(onClick = {

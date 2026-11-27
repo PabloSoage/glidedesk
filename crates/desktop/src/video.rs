@@ -32,6 +32,8 @@ pub enum Event {
     Cursor(glidedesk_proto::Cursor),
     /// Text copied in the session.
     Clipboard(String),
+    /// The link is poor (a short line), or good again.
+    LinkWarning(Option<String>),
     Ended(String),
     /// Window menu entries (Windows).
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -89,6 +91,10 @@ impl VideoSink for Sink {
 
     fn clipboard(&mut self, text: &str) {
         (self.notify)(Event::Clipboard(text.to_owned()));
+    }
+
+    fn link_warning(&mut self, warning: Option<&str>) {
+        (self.notify)(Event::LinkWarning(warning.map(str::to_owned)));
     }
 }
 

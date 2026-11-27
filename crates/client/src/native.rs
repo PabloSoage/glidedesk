@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use glidedesk_proto::crypto::{Direction, PacketKey, ReplayWindow};
-use glidedesk_proto::{ClientMsg, Codec, InputEvent, ServerMsg, fec};
+use glidedesk_proto::{ClientMsg, Codec, InputEvent, ServerMsg, fec, link};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -29,6 +29,15 @@ const SYNC_QUIET: Duration = Duration::from_millis(15);
 const ACK_POLL: Duration = Duration::from_millis(2);
 /// Socket buffers for UDP: a large frame arrives as a burst of hundreds of packets.
 pub const UDP_BUFFER: usize = 8 << 20;
+/// How often the link is reported to the server (version 4), pinged and shown.
+const LINK_PERIOD: Duration = Duration::from_secs(1);
+
+/// What the media task counts for the link report.
+#[derive(Default)]
+struct LinkCount {
+    packets: link::LossCounter,
+    frames_lost: u32,
+}
 
 pub struct NativeOptions {
     pub host: String,
@@ -295,6 +304,7 @@ async fn session(
 
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ClientMsg>();
     let media_flowing = Arc::new(AtomicBool::new(false));
+    let counts = Arc::new(std::sync::Mutex::new(LinkCount::default()));
 
     // UDP hello until media flows, then a keepalive every second (NAT mappings).
     let hello = {
@@ -328,6 +338,7 @@ async fn session(
             ctl_tx.clone(),
         );
         let flowing = Arc::clone(&media_flowing);
+        let counts = Arc::clone(&counts);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             let mut replay = ReplayWindow::default();
@@ -375,6 +386,8 @@ async fn session(
                         continue;
                     }
                 }
+                // Counted after the simulated losses, so GLIDEDESK_DROP shows in the reports.
+                counts.lock().unwrap().packets.packet(seq);
                 flowing.store(true, Ordering::Relaxed);
                 let events = match plain.first() {
                     Some(&fec::VIDEO) => frames.push(&plain),
@@ -414,6 +427,7 @@ async fn session(
                                 }
                                 fec::Event::Lost { frame_id } => {
                                     lost += 1;
+                                    counts.lock().unwrap().frames_lost += 1;
                                     debug!(frame_id, "Frame lost");
                                     match wait {
                                         // Version 2: the server stops referencing it. (The
@@ -460,17 +474,79 @@ async fn session(
         })
     };
 
-    // Control: server messages in, client messages out.
+    // Server messages are read by a task of their own: `read_msg` is not cancel safe, and a
+    // message cut by another branch of the select below would lose the stream's framing.
+    let (srv_tx, mut srv_rx) = mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        loop {
+            let m = glidedesk_proto::read_msg::<_, ServerMsg>(&mut rd).await;
+            let end = m.is_err();
+            if srv_tx.send(m).is_err() || end {
+                break;
+            }
+        }
+    });
+
+    // Control: server messages in, client messages out, and once a second the link.
+    let mut tick = tokio::time::interval(LINK_PERIOD);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut rtt: Option<Duration> = None;
+    let mut filter = link::QualityFilter::default();
+    let mut shown: Option<String> = None;
     let result = loop {
         tokio::select! {
-            msg = glidedesk_proto::read_msg::<_, ServerMsg>(&mut rd) => match msg {
+            _ = tick.tick() => {
+                let (sample, frames_lost) = {
+                    let mut c = counts.lock().unwrap();
+                    (c.packets.take(), std::mem::take(&mut c.frames_lost))
+                };
+                if version >= 4
+                    && let Some(s) = sample
+                    && let Err(e) = glidedesk_proto::write_msg(
+                        &mut wr,
+                        &ClientMsg::LinkReport { received: s.received, lost: s.lost },
+                    )
+                    .await
+                {
+                    break Err(e.into());
+                }
+                if let Err(e) =
+                    glidedesk_proto::write_msg(&mut wr, &ClientMsg::Ping { t_us: now_us() }).await
+                {
+                    break Err(e.into());
+                }
+                let stats = link::LinkStats {
+                    loss: sample.map_or(0.0, |s| s.fraction()),
+                    frames_lost,
+                    rtt,
+                };
+                let quality = filter.update(stats.quality()).unwrap_or(filter.shown());
+                let warning = if quality == link::Quality::Good {
+                    None
+                } else {
+                    // The numbers of this second, under the level the filter keeps.
+                    stats.warning().or_else(|| shown.clone())
+                };
+                if warning != shown {
+                    if let Some(w) = &warning {
+                        info!(warning = w.as_str(), "Link");
+                    }
+                    sink.lock().unwrap().link_warning(warning.as_deref());
+                    shown = warning;
+                }
+            }
+            msg = srv_rx.recv() => match msg.unwrap_or_else(|| {
+                Err(glidedesk_proto::Error::Io(std::io::ErrorKind::UnexpectedEof.into()))
+            }) {
                 Ok(ServerMsg::Size { width, height }) => {
                     info!(width, height, "Desktop size");
                     sink.lock().unwrap().reset(u32::from(width), u32::from(height), codec);
                 }
                 Ok(ServerMsg::Cursor(c)) => sink.lock().unwrap().cursor(&c),
                 Ok(ServerMsg::Pong { t_us }) => {
-                    debug!(rtt_us = now_us().saturating_sub(t_us), "Pong");
+                    let us = now_us().saturating_sub(t_us);
+                    debug!(rtt_us = us, "Pong");
+                    rtt = Some(Duration::from_micros(us));
                 }
                 Ok(ServerMsg::Clipboard(text)) => sink.lock().unwrap().clipboard(&text),
                 Ok(ServerMsg::Denied(reason)) => break Err(anyhow::anyhow!(reason)),
@@ -507,6 +583,7 @@ async fn session(
     };
     hello.abort();
     media.abort();
+    reader.abort();
     if result.is_ok() {
         // Leaving on purpose: close TLS properly so the server sees a clean end.
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;

@@ -380,6 +380,8 @@ pub struct Front {
     pub input: InputForwarder,
     /// Clipboard bridge, when the session has one.
     pub clipboard: Option<Box<dyn ironrdp_server::CliprdrServerFactory>>,
+    /// Failed logins per address, shared with the other front ends.
+    pub auth_limiter: Arc<crate::auth::RateLimiter>,
 }
 
 /// The RDP front end as output `index` of the pipeline: the output, and the server to run.
@@ -426,7 +428,7 @@ impl Server {
                     as Box<dyn ironrdp_server::SoundServerFactory>
             }))
             .with_cliprdr_factory(front.clipboard)
-            .with_connection_handler(Some(Box::new(Connections)))
+            .with_connection_handler(Some(Box::new(Connections::new(front.auth_limiter))))
             // RDP-UDP on the same port, as Windows does; TCP stays as the fallback.
             .with_udp_transport(front.bind)
             .build();
@@ -443,16 +445,47 @@ impl Server {
     }
 }
 
-/// Logs connections: who, with which keyboard layout, for how long.
-struct Connections;
+/// Logs connections (who, with which keyboard layout, for how long) and limits failed
+/// logins per address, like the native and web front ends.
+///
+/// NLA runs inside IronRDP, which does not say why a connection failed. A connection that
+/// ends in an error before the session starts ([`ConnectionHandler::on_connection_info`]
+/// is called only after the credentials were accepted) counts as a failed login: a wrong
+/// password, or a scanner that gives up during the handshake. The first two are free, as
+/// elsewhere, so a client that probes once (mstsc does, before showing a certificate
+/// warning) is not held back.
+struct Connections {
+    limiter: Arc<crate::auth::RateLimiter>,
+    /// The connection being served (IronRDP serves one at a time): its address, and
+    /// whether it got past the login.
+    current: Option<(SocketAddr, bool)>,
+}
+
+impl Connections {
+    fn new(limiter: Arc<crate::auth::RateLimiter>) -> Self {
+        Self {
+            limiter,
+            current: None,
+        }
+    }
+}
 
 impl ConnectionHandler for Connections {
     fn on_accept(&mut self, peer: SocketAddr) -> bool {
+        if let Some(wait) = self.limiter.check(peer.ip()) {
+            warn!(%peer, wait_secs = wait.as_secs_f64().ceil() as u64, "Too many failed logins: connection refused");
+            return false;
+        }
         info!(%peer, "Client connecting");
+        self.current = Some((peer, false));
         true
     }
 
     fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        if let Some((peer, logged_in)) = self.current.as_mut() {
+            *logged_in = true;
+            self.limiter.record_success(peer.ip());
+        }
         info!(
             keyboard_layout = format!("0x{:08x}", info.keyboard_layout),
             monitors = info.client_monitors.len(),
@@ -467,7 +500,63 @@ impl ConnectionHandler for Connections {
         duration: Duration,
         error: Option<&ironrdp_server::ServerError>,
     ) -> PostConnectionAction {
+        let logged_in = self
+            .current
+            .take()
+            .is_some_and(|(p, logged_in)| p == peer && logged_in);
+        if !logged_in && error.is_some() {
+            match self.limiter.record_failure(peer.ip()) {
+                Some(wait) => {
+                    warn!(%peer, lockout_secs = wait.as_secs(), "Login failed; backoff applied");
+                }
+                None => warn!(%peer, "Login failed (or the client gave up)"),
+            }
+        }
         info!(%peer, seconds = duration.as_secs(), error = ?error.map(|e| e.to_string()), "Client disconnected");
         PostConnectionAction::Continue
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use ironrdp_server::ServerErrorExt as _;
+
+    #[test]
+    fn failed_logins_lock_the_address_out() {
+        let limiter = Arc::new(crate::auth::RateLimiter::new());
+        let mut c = Connections::new(Arc::clone(&limiter));
+        let peer: SocketAddr = "192.0.2.5:50000".parse().unwrap();
+        let err = || ironrdp_server::ServerError::reason("test", "handshake failed");
+        for _ in 0..3 {
+            assert!(c.on_accept(peer));
+            let e = err();
+            c.on_disconnected(peer, Duration::from_secs(1), Some(&e));
+        }
+        // The third failure imposes a wait: the next connection is refused at once.
+        assert!(!c.on_accept(peer));
+        assert!(limiter.check(peer.ip()).is_some());
+    }
+
+    #[test]
+    fn a_session_that_started_is_not_a_failure() {
+        let limiter = Arc::new(crate::auth::RateLimiter::new());
+        let mut c = Connections::new(Arc::clone(&limiter));
+        let peer: SocketAddr = "192.0.2.6:50000".parse().unwrap();
+        for _ in 0..5 {
+            assert!(c.on_accept(peer));
+            c.on_connection_info(&ConnectionInfo::new(
+                0x409,
+                ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED,
+                String::new(),
+            ));
+            let e = err_any();
+            c.on_disconnected(peer, Duration::from_secs(600), Some(&e));
+        }
+        assert!(c.on_accept(peer));
+    }
+
+    fn err_any() -> ironrdp_server::ServerError {
+        ironrdp_server::ServerError::reason("test", "connection reset")
     }
 }

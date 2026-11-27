@@ -481,6 +481,17 @@ impl ApplicationHandler<Event> for App {
                     c.remote(text);
                 }
             }
+            Event::LinkWarning(warning) => {
+                // In the title bar: visible in a window, and in the task bar when full
+                // screen. The log has it too (the session logs every change).
+                if let Some(win) = &self.window {
+                    let host = self.args.host.as_deref().unwrap_or_default();
+                    win.set_title(&match warning {
+                        Some(w) => format!("glidedesk - {host} ({w})"),
+                        None => format!("glidedesk - {host}"),
+                    });
+                }
+            }
             Event::Ended(reason) => {
                 if reason.contains("wrong user name or password")
                     && let Some(h) = &self.args.host

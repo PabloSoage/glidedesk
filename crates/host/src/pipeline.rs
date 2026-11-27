@@ -108,6 +108,13 @@ pub trait Output: Send {
     fn take_lost(&mut self) -> Option<u64> {
         None
     }
+    /// The client's share of lost packets since the last call (native protocol, version
+    /// 4), 0 to 1.
+    fn take_loss(&mut self) -> Option<f32> {
+        None
+    }
+    /// The bitrate ceiling changed (the native front end paces its packets to it).
+    fn set_ceiling(&mut self, _bps: u32) {}
 }
 
 pub struct Options {
@@ -272,7 +279,11 @@ impl Pipeline {
                 }
                 // Another client, maybe on another link: learn it from the start.
                 self.rate = Rate::new(self.opts.max_bitrate);
-                if let Err(e) = self.backend.set_max_bitrate(self.rate.bps()) {
+                let bps = self.rate.bps();
+                for o in &mut self.outputs {
+                    o.set_ceiling(bps);
+                }
+                if let Err(e) = self.backend.set_max_bitrate(bps) {
                     warn!(%e, "Setting the bitrate failed");
                 }
                 mode = Mode::Full;
@@ -292,12 +303,19 @@ impl Pipeline {
         let Some(output) = self.outputs.get_mut(index) else {
             return;
         };
-        let changed = match output.link_estimate() {
+        let mut changed = match output.link_estimate() {
             Some(estimate) => self.rate.follow(estimate),
             None => self.rate.update(output.take_delays()),
         };
+        if let Some(loss) = output.take_loss()
+            && let Some(bps) = self.rate.loss(loss)
+        {
+            debug!(loss, "Losses lower the bitrate");
+            changed = Some(bps);
+        }
         if let Some(bps) = changed {
             debug!(mbps = bps / 1_000_000, "Bitrate ceiling");
+            output.set_ceiling(bps);
             if let Err(e) = self.backend.set_max_bitrate(bps) {
                 warn!(%e, "Changing the bitrate failed");
             }

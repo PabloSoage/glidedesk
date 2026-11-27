@@ -7,6 +7,7 @@
 
 pub mod crypto;
 pub mod fec;
+pub mod link;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,7 +16,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// - 2: [`ClientMsg::InvalidateFrames`] and the recovery flag on video packets.
 /// - 3: apps: [`ServerMsg::Apps`], [`ClientMsg::OpenApp`], [`ServerMsg::AppExited`].
-pub const VERSION: u32 = 3;
+/// - 4: [`ClientMsg::LinkReport`]: the server adapts parity, pacing and bitrate to losses.
+pub const VERSION: u32 = 4;
 /// Oldest client version a server accepts (it then uses only what that version knows).
 pub const MIN_VERSION: u32 = 1;
 /// Default TCP and UDP port.
@@ -87,6 +89,9 @@ pub enum ClientMsg {
     /// desktop. A running one is reused; when it exits the server sends
     /// [`ServerMsg::AppExited`].
     OpenApp(String),
+    /// (Version 4.) About once a second: UDP packets received and lost since the last
+    /// report, counted from their sequence numbers ([`link::LossCounter`]).
+    LinkReport { received: u32, lost: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

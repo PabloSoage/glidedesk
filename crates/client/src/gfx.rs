@@ -33,6 +33,10 @@ pub trait VideoSink: Send {
     fn audio(&mut self, _pcm: &[u8]) {}
     /// Text copied in the session (native protocol).
     fn clipboard(&mut self, _text: &str) {}
+    /// The link is poor or bad (a short line to show the user, see
+    /// [`glidedesk_proto::link::LinkStats::warning`]), or good again (`None`). Native
+    /// protocol; called only when it changes.
+    fn link_warning(&mut self, _warning: Option<&str>) {}
     /// Access units handed over and not decoded yet. The native client acknowledges frames
     /// only as they are decoded, so a slow decoder makes the server send fewer instead of a
     /// queue (and the delay) growing.

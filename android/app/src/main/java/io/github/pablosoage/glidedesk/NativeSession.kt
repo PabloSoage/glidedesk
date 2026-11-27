@@ -17,6 +17,9 @@ class NativeSession private constructor(private var handle: Long) {
 
     val error: String get() = nativeError(handle) ?: ""
 
+    /** A short line about a poor link (low-latency mode), or null when it is good. */
+    val warning: String? get() = if (handle == 0L) null else nativeWarning(handle)
+
     fun setSurface(surface: Surface?) = nativeSetSurface(handle, surface)
     fun mouseMove(x: Int, y: Int) = nativeMouseMove(handle, x, y)
     /** 0 left, 1 middle, 2 right. */
@@ -61,6 +64,7 @@ class NativeSession private constructor(private var handle: Long) {
         @JvmStatic private external fun nativeResize(handle: Long, width: Int, height: Int)
         @JvmStatic private external fun nativeState(handle: Long): Int
         @JvmStatic private external fun nativeError(handle: Long): String?
+        @JvmStatic private external fun nativeWarning(handle: Long): String?
         @JvmStatic private external fun nativeClose(handle: Long)
     }
 }

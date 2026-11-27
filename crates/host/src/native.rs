@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use glidedesk_proto::crypto::{Direction, PacketKey};
-use glidedesk_proto::{ClientMsg, Codec as WireCodec, Cursor, InputEvent, ServerMsg, fec};
+use glidedesk_proto::{ClientMsg, Codec as WireCodec, Cursor, InputEvent, ServerMsg, fec, link};
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -24,12 +24,9 @@ use crate::input::InputForwarder;
 use crate::pipeline::{self, Mode, Output, Prepared};
 use crate::rate::DelayMeter;
 
-/// Parity added to every video block, in percent of its data shards.
-const FEC_PERCENT: u32 = 20;
-/// Packets of a frame sent at full speed before pacing starts (a typical P-frame fits).
-const PACE_BURST: usize = 64;
-/// Sending rate for the rest of a large frame.
-const PACE_BITS_PER_SEC: f64 = 300e6;
+// Parity per video block and the pacing of large frames follow the link: see
+// `glidedesk_proto::link` (clients from version 4 report their losses; older ones get the
+// starting parity and pacing to the bitrate ceiling).
 
 /// The current client, as the pipeline and the UDP task see it.
 struct Link {
@@ -66,6 +63,12 @@ struct Shared {
     lost: Mutex<Option<u64>>,
     /// Send-to-acknowledge delays, for the rate control.
     meter: Mutex<DelayMeter>,
+    /// Parity from the client's loss reports.
+    fec: Mutex<link::FecControl>,
+    /// Share lost in the newest report not yet taken by the rate control.
+    loss: Mutex<Option<f32>>,
+    /// Bitrate ceiling, for pacing.
+    ceiling: AtomicU32,
 }
 
 impl Shared {
@@ -170,20 +173,26 @@ impl Output for NativeOutput {
             link.sent.push_back((link.frame_id, main.index));
         }
         let start = std::time::Instant::now();
+        let parity = self.shared.fec.lock().unwrap().percent();
+        let (pace_bps, burst) = link::pacing(
+            self.shared.ceiling.load(Ordering::Relaxed),
+            fec::SHARD,
+        );
         let packets = fec::packetize_frame(
             link.frame_id,
             main.keyframe,
             main.recovery && link.invalidation,
             &main.data,
-            FEC_PERCENT,
+            parity,
         );
         for (i, p) in packets.iter().enumerate() {
             Shared::seal_and_send(link, &self.shared.udp, peer, p);
-            // Pacing: past the first burst, keep to PACE_BITS_PER_SEC so a large frame (an
-            // IDR is hundreds of packets) does not overflow a Wi-Fi access point's queue.
-            if i >= PACE_BURST && i % 16 == 0 {
+            // Pacing: past the first burst, keep to a few times the bitrate ceiling so a
+            // large frame (an IDR is hundreds of packets) does not overflow the queue of a
+            // Wi-Fi access point or a mobile link.
+            if i >= burst && i % 8 == 0 {
                 let due = std::time::Duration::from_secs_f64(
-                    ((i - PACE_BURST) * fec::SHARD * 8) as f64 / PACE_BITS_PER_SEC,
+                    ((i - burst) * fec::SHARD * 8) as f64 / pace_bps,
                 );
                 if let Some(wait) = due.checked_sub(start.elapsed()) {
                     std::thread::sleep(wait);
@@ -214,6 +223,14 @@ impl Output for NativeOutput {
 
     fn take_lost(&mut self) -> Option<u64> {
         self.shared.lost.lock().unwrap().take()
+    }
+
+    fn take_loss(&mut self) -> Option<f32> {
+        self.shared.loss.lock().unwrap().take()
+    }
+
+    fn set_ceiling(&mut self, bps: u32) {
+        self.shared.ceiling.store(bps, Ordering::Relaxed);
     }
 }
 
@@ -282,6 +299,9 @@ pub async fn new(
         meter: Mutex::default(),
         keyframe_requested: AtomicBool::new(false),
         lost: Mutex::new(None),
+        fec: Mutex::default(),
+        loss: Mutex::new(None),
+        ceiling: AtomicU32::new(crate::rate::START_BPS),
     });
     Ok((
         NativeOutput {
@@ -506,6 +526,9 @@ where
     }
     shared.acked_id.store(0, Ordering::SeqCst);
     shared.meter.lock().unwrap().clear();
+    // A new client, maybe on another link: its losses are learned from the start.
+    *shared.fec.lock().unwrap() = link::FecControl::default();
+    *shared.loss.lock().unwrap() = None;
     glidedesk_proto::write_msg(
         &mut wr,
         &ServerMsg::Welcome {
@@ -638,6 +661,13 @@ where
                     }
                 };
                 let _ = ctl_tx.send(reply);
+            }
+            ClientMsg::LinkReport { received, lost } => {
+                let sample = link::LossSample { received, lost };
+                if let Some(percent) = shared.fec.lock().unwrap().report(sample) {
+                    debug!(percent, loss = sample.fraction(), "Video parity");
+                }
+                *shared.loss.lock().unwrap() = Some(sample.fraction());
             }
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
         }
