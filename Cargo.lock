@@ -2025,6 +2025,7 @@ dependencies = [
  "aes 0.8.4",
  "anyhow",
  "arboard",
+ "ash",
  "async-trait",
  "clap",
  "cudarc",

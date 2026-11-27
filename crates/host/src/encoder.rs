@@ -72,6 +72,9 @@ pub enum Choice {
     Qsv,
     Amf,
     Software,
+    /// Vulkan Video (experimental; built with the `vulkan-video` feature).
+    #[cfg(feature = "vulkan-video")]
+    Vulkan,
 }
 
 /// What one EGFX frame needs from the encoder.
@@ -622,6 +625,11 @@ pub fn select(
         Choice::Qsv => ffmpeg(Kind::Qsv),
         Choice::Amf => ffmpeg(Kind::Amf),
         Choice::Software => ffmpeg(Kind::Software),
+        #[cfg(feature = "vulkan-video")]
+        Choice::Vulkan => Ok((
+            Box::new(crate::vkenc::Vulkan::new(gpu, fps, bitrate)?),
+            None,
+        )),
         Choice::Auto => {
             #[cfg(target_os = "windows")]
             {

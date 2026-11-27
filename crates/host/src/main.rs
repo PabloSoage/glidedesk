@@ -39,6 +39,8 @@ mod serve;
 mod sound;
 #[cfg(feature = "gnome")]
 mod vaimport;
+#[cfg(feature = "vulkan-video")]
+mod vkenc;
 #[cfg(feature = "web")]
 mod web;
 #[cfg(target_os = "windows")]
