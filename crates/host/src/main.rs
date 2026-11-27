@@ -45,7 +45,11 @@ mod winclip;
 #[cfg(target_os = "windows")]
 mod wincuda;
 #[cfg(target_os = "windows")]
+mod winservice;
+#[cfg(target_os = "windows")]
 mod winsession;
+#[cfg(target_os = "windows")]
+mod winvdisplay;
 #[cfg(feature = "x11")]
 mod x11session;
 
@@ -177,6 +181,12 @@ enum Command {
         #[cfg(target_os = "linux")]
         #[arg(long, conflicts_with = "no_native")]
         handover: bool,
+        /// Serve a virtual monitor that takes the client's size and refresh rate instead of
+        /// the physical monitors (also for a PC without one). Needs the SudoVDA driver;
+        /// without it the monitors are served.
+        #[cfg(target_os = "windows")]
+        #[arg(long)]
+        virtual_display: bool,
     },
     /// Run as the system service (as root): log native clients in with their system
     /// account (PAM) and give each user a headless GNOME session of their own, started
@@ -207,6 +217,13 @@ enum Command {
         /// The systemd template unit of a user's session (`NAME@USER.service`).
         #[arg(long, default_value = "glidedesk-session")]
         session_unit: String,
+    },
+    /// Run as a Windows service (as SYSTEM), so that the lock screen, the sign-in screen and
+    /// UAC prompts are seen and used too.
+    #[cfg(target_os = "windows")]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Run only the GameStream front end (pairing, server info, app list), for testing
     /// Moonlight clients without a session.
@@ -270,6 +287,25 @@ enum Command {
     },
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the service and start it (again, if it was installed). The arguments after
+    /// `--` are those of `serve`, e.g. `service install -- serve --user me --password ...`.
+    Install {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Stop the service and remove it.
+    Uninstall,
+    /// The service itself, started by the service manager.
+    #[command(hide = true)]
+    Run,
+    /// The host in the console session, started by the service.
+    #[command(hide = true)]
+    Helper,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // The workspace enables more than one rustls crypto provider; pick one explicitly.
@@ -278,8 +314,23 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // No colour codes in a log file (the Windows service's).
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    // The service's helper takes its `serve` arguments from the service's settings.
+    #[cfg(target_os = "windows")]
+    let command = match command {
+        Command::Service {
+            action: ServiceAction::Helper,
+        } => {
+            winservice::set_helper();
+            let args = winservice::helper_args()?;
+            Cli::try_parse_from(std::iter::once("glidedesk-host".to_string()).chain(args))?.command
+        }
+        c => c,
+    };
+    match command {
         Command::Serve {
             #[cfg(feature = "x11")]
             x11,
@@ -312,6 +363,8 @@ async fn main() -> Result<()> {
             tls_key,
             #[cfg(target_os = "linux")]
             handover,
+            #[cfg(target_os = "windows")]
+            virtual_display,
         } => {
             #[cfg(target_os = "linux")]
             let handover = handover.then(handover::own_socket);
@@ -401,6 +454,8 @@ async fn main() -> Result<()> {
                         std::net::SocketAddr::new(bind.ip(), gamestream_port - 5),
                     )
                 }),
+                #[cfg(target_os = "windows")]
+                virtual_display,
             })
             .await
         }
@@ -426,6 +481,8 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        #[cfg(target_os = "windows")]
+        Command::Service { action } => service(action),
         Command::GamestreamTest {
             ip,
             state_dir,
@@ -478,6 +535,39 @@ async fn main() -> Result<()> {
             seconds,
             out,
         } => encode_test(width, height, gpu, hevc, bitrate, seconds, out).await,
+    }
+}
+
+/// `service install|uninstall|run`.
+#[cfg(target_os = "windows")]
+fn service(action: ServiceAction) -> Result<()> {
+    match action {
+        ServiceAction::Install { mut args } => {
+            let parsed = Cli::try_parse_from(
+                std::iter::once("glidedesk-host".to_string()).chain(args.iter().cloned()),
+            )?;
+            let Command::Serve { user, password, .. } = parsed.command else {
+                anyhow::bail!("the service runs `serve`: service install -- serve [options]");
+            };
+            anyhow::ensure!(
+                user.is_some(),
+                "give --user: the service runs as SYSTEM, whose name is not one to log in with"
+            );
+            // The service does not see this shell's environment: keep a password that came
+            // from GLIDEDESK_PASSWORD with the arguments.
+            let given = args
+                .iter()
+                .any(|a| a == "--password" || a.starts_with("--password="));
+            if let Some(p) = password
+                && !given
+            {
+                args.extend(["--password".to_string(), p]);
+            }
+            winservice::install(&args)
+        }
+        ServiceAction::Uninstall => winservice::uninstall(),
+        ServiceAction::Run => winservice::run(),
+        ServiceAction::Helper => anyhow::bail!("`service helper` is started by the service"),
     }
 }
 

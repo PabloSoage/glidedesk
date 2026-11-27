@@ -6,6 +6,8 @@
 //!   ScreenCast/RemoteDesktop and PipeWire; the desktop follows the client's size.
 //! - X11 (`x11` feature): an existing X display (Termux's termux-x11, a Linux desktop),
 //!   captured with GetImage/DAMAGE, input through XTEST; its size is the display's.
+//! - Windows: the console desktop through Desktop Duplication, input through SendInput; the
+//!   monitor's size, or a virtual monitor at the client's (`winvdisplay`).
 //!
 //! Threads: the tokio runtime runs both front ends and the input task; the capture threads
 //! produce frames; the pipeline thread encodes the newest frame and hands it to the output
@@ -63,6 +65,10 @@ pub struct ServeOptions {
     pub state_dir: PathBuf,
     /// GameStream (Moonlight) HTTP and HTTPS addresses; `None` turns it off.
     pub gamestream: Option<(SocketAddr, SocketAddr)>,
+    /// Serve a virtual monitor at the client's size (SudoVDA driver) instead of the physical
+    /// ones.
+    #[cfg(target_os = "windows")]
+    pub virtual_display: bool,
 }
 
 /// Output index of RDP in the pipeline (the others follow in the order they are added).
@@ -179,8 +185,17 @@ fn x11(display: Option<&str>, fps: u32) -> Result<Parts> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<Parts> {
-    let s = crate::winsession::start(cuda)?;
+fn windows(
+    opts: &ServeOptions,
+    cuda: Option<Arc<cudarc::driver::CudaContext>>,
+) -> Result<Parts> {
+    let (w, h) = pipeline::clamp_size(opts.width, opts.height);
+    let s = crate::winsession::start(cuda, opts.virtual_display.then_some((w, h, opts.fps)))?;
+    let stop = s.display.clone().map(|d| {
+        Box::pin(async move {
+            let _ = tokio::task::spawn_blocking(move || d.shutdown()).await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    });
     let clipboard = crate::winclip::WinClipboard::start()
         .map_err(|e| warn!(%e, "No clipboard"))
         .ok();
@@ -198,7 +213,7 @@ fn windows(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<Parts> {
             .clone()
             .map(|c| Box::new(c) as Box<dyn ironrdp_server::CliprdrServerFactory>),
         text_clipboard: clipboard.map(|c| Arc::new(c) as Arc<dyn crate::native::TextClipboard>),
-        stop: None,
+        stop,
     })
 }
 
@@ -222,7 +237,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
             x11(display.as_deref(), opts.fps)?
         }
         #[cfg(target_os = "windows")]
-        SessionKind::Windows => windows(cuda)?,
+        SessionKind::Windows => windows(&opts, cuda)?,
     };
     let shared = Arc::new(pipeline::Shared::default());
     *shared.current_size.lock().unwrap() = parts.size;
