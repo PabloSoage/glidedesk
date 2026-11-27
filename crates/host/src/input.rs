@@ -56,15 +56,24 @@ pub struct MutterInput {
     pub live: crate::mutter::LiveRx,
     /// Stream of the session whose first key was spent (see `prime`).
     pub primed: tokio::sync::Mutex<String>,
+    /// With several monitors, where each is: absolute positions go to its stream.
+    pub placements: crate::gnome::Placements,
 }
 
 #[cfg(feature = "gnome")]
 impl MutterInput {
-    pub fn new(live: crate::mutter::LiveRx) -> Self {
+    pub fn new(live: crate::mutter::LiveRx, placements: crate::gnome::Placements) -> Self {
         Self {
             live,
             primed: Default::default(),
+            placements,
         }
+    }
+
+    /// The stream a desktop position is on and the position on it (`own`: monitor 0's).
+    fn place(&self, own: &str, x: f64, y: f64) -> (String, f64, f64) {
+        let (stream, x, y) = crate::gnome::locate(&self.placements.lock().unwrap(), x, y);
+        (stream.unwrap_or_else(|| own.to_owned()), x, y)
     }
 
     /// The current session; on a session not used yet, its first key event first.
@@ -101,14 +110,19 @@ impl InputBackend for MutterInput {
         match *ev {
             Input::Key(code, down) => r.notify_keyboard_keycode(code, down).await?,
             Input::Keysym(sym, down) => r.notify_keyboard_keysym(sym, down).await?,
-            Input::Motion(x, y) => r.notify_pointer_motion_absolute(&stream_path, x, y).await?,
+            Input::Motion(x, y) => {
+                let (stream, x, y) = self.place(&stream_path, x, y);
+                r.notify_pointer_motion_absolute(&stream, x, y).await?
+            }
             Input::Button(b, down) => r.notify_pointer_button(b, down).await?,
             Input::Scroll { axis, steps } => r.notify_pointer_axis_discrete(axis, steps).await?,
             Input::TouchDown { slot, x, y } => {
-                r.notify_touch_down(&stream_path, slot, x, y).await?
+                let (stream, x, y) = self.place(&stream_path, x, y);
+                r.notify_touch_down(&stream, slot, x, y).await?
             }
             Input::TouchMotion { slot, x, y } => {
-                r.notify_touch_motion(&stream_path, slot, x, y).await?
+                let (stream, x, y) = self.place(&stream_path, x, y);
+                r.notify_touch_motion(&stream, slot, x, y).await?
             }
             Input::TouchUp { slot } => r.notify_touch_up(slot).await?,
         }

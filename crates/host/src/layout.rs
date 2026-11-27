@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use glidedesk_proto::Monitor;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::encoder;
@@ -28,6 +29,8 @@ use crate::pipeline::{self, MonitorOutputs, NoOutput, Output, Pipeline};
 pub const MAX_MONITORS: usize = 4;
 
 /// The capture of a further monitor, for its pipeline.
+// Only the GNOME session shows several monitors so far.
+#[cfg_attr(not(feature = "gnome"), allow(dead_code))]
 pub struct MonitorStream {
     pub monitor: u8,
     pub source: Box<dyn Source>,
@@ -43,6 +46,9 @@ pub trait Displays: Send + Sync {
     /// where the session put every monitor (the layout clients are told; monitors that
     /// could not be created are left out). A layout of one removes the others.
     async fn apply(&self, layout: &[Monitor]) -> Result<(Vec<MonitorStream>, Vec<Monitor>)>;
+    /// Changes when the monitors after the first went away (GNOME: Mutter closed the
+    /// session, a new one started); the layout is then set up again.
+    fn lost(&self) -> watch::Receiver<u64>;
 }
 
 /// What a client asked for, as the session will try it: monitor 0 (the one with id 0, else
@@ -124,10 +130,32 @@ pub struct Manager {
 impl Manager {
     pub async fn run(self) {
         let mut requests = self.shared.layout_request.subscribe();
+        let mut lost = self.displays.as_ref().map(|d| d.lost());
         let mut running: Vec<Running> = Vec::new();
         loop {
-            if requests.changed().await.is_err() {
-                break;
+            let again = tokio::select! {
+                r = requests.changed() => {
+                    if r.is_err() {
+                        break;
+                    }
+                    false
+                }
+                l = async {
+                    match lost.as_mut() {
+                        Some(l) => l.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if l.is_err() {
+                        lost = None;
+                        continue;
+                    }
+                    true
+                }
+            };
+            // The session lost the further monitors: set them up again, if there were any.
+            if again && running.is_empty() {
+                continue;
             }
             let asked = requests.borrow_and_update().clone();
             let max = if self.displays.is_some() {

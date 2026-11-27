@@ -132,7 +132,20 @@ async fn gnome(
     let (live_tx, live) = watch::channel(Arc::new(mutter::Live {
         remote: session.remote.clone(),
         stream_path: session.stream_path.clone(),
+        screen_cast: session.screen_cast.clone(),
     }));
+    // Further monitors: their streams in the same session, input placed on them.
+    let placements = crate::gnome::Placements::default();
+    let (lost, _) = watch::channel(0);
+    let displays = crate::gnome::GnomeDisplays::new(
+        conn.clone(),
+        live.clone(),
+        cursor_mode,
+        &sinks,
+        cuda.clone(),
+        Arc::clone(&placements),
+        lost.clone(),
+    );
     tokio::spawn(crate::gnome::supervise(
         conn.clone(),
         cursor_mode,
@@ -140,6 +153,7 @@ async fn gnome(
         Arc::clone(&followed),
         sinks,
         cuda,
+        lost,
     ));
     let (audio, surround) = match crate::audio::start() {
         Ok((stereo, surround)) => (Some(stereo), Some(surround)),
@@ -155,13 +169,13 @@ async fn gnome(
         source: Box::new(crate::gnome::FollowedSource(followed)),
         frames: rx,
         cursor: cursor_rx,
-        input: Box::new(crate::input::MutterInput::new(live)),
+        input: Box::new(crate::input::MutterInput::new(live, placements)),
         audio,
         surround,
         clipboard: Some(Box::new(clipboard)),
         text_clipboard: Some(Arc::new(hub)),
         size: (w, h),
-        displays: None,
+        displays: Some(Arc::new(displays)),
         stop: Some(Box::pin(async move {
             let remote = current.borrow().remote.clone();
             remote.stop().await.ok();
