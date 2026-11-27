@@ -94,6 +94,8 @@ pub struct Encoder {
     /// Pictures before this one were invalidated already, or are older than the last
     /// recovery: reports of their loss are stale.
     recovered_from: u64,
+    /// QP offsets for the next pictures (`EncoderConfig::qp_map`), one per block.
+    qp_map: Vec<i8>,
 }
 
 /// Pictures kept in the DPB when invalidation is on (each P-frame still references only
@@ -146,6 +148,7 @@ impl Encoder {
             last_index: 0,
             recovery_pending: false,
             recovered_from: 0,
+            qp_map: Vec::new(),
         };
         if cfg.invalidation {
             let invalidate = this.cap(nv::NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION);
@@ -229,6 +232,10 @@ impl Encoder {
         config.frameIntervalP = 1;
         let rc = &mut config.rcParams;
         rc.set_zeroReorderDelay(1);
+        if c.qp_map {
+            // Offsets on top of the QP the rate control picks (quality by region).
+            rc.qpMapMode = nv::NV_ENC_QP_MAP_DELTA;
+        }
         if let Some(qp) = self.const_qp {
             // Quality pass over a still image: a fixed QP regardless of the bit budget.
             rc.rateControlMode = nv::NV_ENC_PARAMS_RC_CONSTQP;
@@ -291,6 +298,11 @@ impl Encoder {
                     h.idrPeriod = nv::NVENC_INFINITE_GOPLENGTH;
                     h.set_repeatSPSPPS(1);
                     h.set_chromaFormatIDC(if c.yuv444 { 3 } else { 1 });
+                    if c.qp_map {
+                        // The QP map has one value per CTB: make its size certain (the only
+                        // one NVENC supports anyway).
+                        h.maxCUSize = nv::NV_ENC_HEVC_CUSIZE_32x32;
+                    }
                     if self.invalidation {
                         h.maxNumRefFramesInDPB = INVALIDATION_DPB;
                         h.numRefL0 = nv::NV_ENC_NUM_REF_FRAMES_1;
@@ -395,6 +407,22 @@ impl Encoder {
 
     pub fn size(&self) -> (u32, u32) {
         (self.cfg.width, self.cfg.height)
+    }
+
+    /// Block size of the QP offset map (16 for H.264 macroblocks, 32 for HEVC CTBs), or
+    /// `None` when the encoder takes no map.
+    pub fn qp_block(&self) -> Option<u32> {
+        self.cfg.qp_map.then_some(match self.cfg.codec {
+            Codec::H264 => 16,
+            Codec::Hevc => 32,
+        })
+    }
+
+    /// QP offsets for the next pictures, in raster order of [`Encoder::qp_block`] blocks
+    /// (see [`crate::region::qp_map`]). A map of the wrong size is replaced by zeros.
+    pub fn set_qp_map(&mut self, map: &[i8]) {
+        self.qp_map.clear();
+        self.qp_map.extend_from_slice(map);
     }
 
     /// The encoder takes planar 4:4:4 and writes HEVC 4:4:4 (asked for and supported).
@@ -627,6 +655,16 @@ impl Encoder {
             inputTimeStamp: index,
             ..Default::default()
         };
+        if let Some(block) = self.qp_block() {
+            // NVENC reads one value per block: never hand it a short array.
+            let (bw, bh) = crate::region::blocks(self.cfg.width, self.cfg.height, block);
+            if self.qp_map.len() != bw * bh {
+                self.qp_map.clear();
+                self.qp_map.resize(bw * bh, 0);
+            }
+            pic.qpDeltaMap = self.qp_map.as_mut_ptr();
+            pic.qpDeltaMapSize = self.qp_map.len() as u32;
+        }
         if self.force_idr {
             // C enums are signed with MSVC, unsigned with GCC.
             #[allow(clippy::unnecessary_cast)]

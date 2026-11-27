@@ -176,6 +176,7 @@ Useful options of `serve` (`--help` lists them all):
 | `--refresh HZ` | 120 | refresh rate for RDP clients (native clients use their own screen's) |
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
 | `--avc444` | off | full-chroma AVC444 for RDP clients (experimental: `mstsc` shows it blurred) |
+| `--region-quality` | off | NVENC: small updates (typing, menus) at a lower QP than the rest, from GNOME's damage rectangles |
 | `--yuv444` | off | HEVC 4:4:4 for native clients started with `--yuv444` (NVENC on a GPU that encodes it; others get 4:2:0) |
 | `--x11 :0` | | serve an existing X11 display instead of a GNOME session (see Termux below) |
 | `--gamestream` | off | also answer Moonlight clients (see below) |

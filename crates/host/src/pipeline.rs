@@ -127,6 +127,8 @@ pub struct Options {
     pub avc444: bool,
     /// Send HEVC 4:4:4 to native clients that ask for it, where the encoder can.
     pub yuv444: bool,
+    /// Quality by region (H-002b): lower QP on small damaged areas (NVENC).
+    pub region_quality: bool,
     /// H-002: luma-only frames while things move, chroma once still.
     pub hybrid: bool,
     /// Re-encode the still image after motion until its quality settles.
@@ -458,6 +460,7 @@ impl Pipeline {
                 aux: avc444 && mode != Mode::LumaOnly,
                 const_qp: self.refine_qp,
                 yuv444,
+                region_quality: self.opts.region_quality,
             },
         )?;
         let encode_us = t.elapsed().as_micros();

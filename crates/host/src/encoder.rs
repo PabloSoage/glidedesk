@@ -41,6 +41,8 @@ pub struct EncoderConfig {
     pub invalidation: bool,
     /// HEVC 4:4:4 (Range Extensions) from a planar YUV444 input (NVENC only).
     pub yuv444: bool,
+    /// Take a QP offset map per picture ([`crate::region`], NVENC only).
+    pub qp_map: bool,
 }
 
 #[derive(Default)]
@@ -81,6 +83,9 @@ pub struct Request {
     pub const_qp: Option<u32>,
     /// HEVC 4:4:4 instead of 4:2:0, where [`Backend::supports_yuv444`].
     pub yuv444: bool,
+    /// Quality by region from the frame's damage ([`crate::region`]); NVENC only, the same
+    /// for the whole session. Not applied to quality passes.
+    pub region_quality: bool,
 }
 
 pub trait Backend: Send {
@@ -119,6 +124,7 @@ fn config(codec: Codec, w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) ->
         refs: if avc444 { 2 } else { 1 },
         invalidation: !avc444,
         yuv444: false,
+        qp_map: false,
     }
 }
 
@@ -134,6 +140,8 @@ pub struct Nvenc {
     upload: crate::gpu::Pool,
     /// The encoder, what it was opened for (codec, AVC444) and its size.
     encoder: Option<(Encoder, EncoderKey, (u32, u32))>,
+    /// The QP offsets of the picture being encoded (quality by region).
+    qp_map: Vec<i8>,
     fps: u32,
     bitrate: u32,
 }
@@ -147,6 +155,7 @@ impl Nvenc {
             upload: crate::gpu::Pool::new(Arc::clone(&ctx)),
             ctx,
             encoder: None,
+            qp_map: Vec::new(),
             fps,
             bitrate,
         })
@@ -221,6 +230,7 @@ impl Backend for Nvenc {
                 self.bitrate,
             );
             cfg.yuv444 = yuv444;
+            cfg.qp_map = req.region_quality;
             // The old session goes first: the driver crashes (in a thread of its own) when a
             // session is destroyed after another one was opened on the same context.
             self.encoder = None;
@@ -229,6 +239,12 @@ impl Backend for Nvenc {
         }
         let (encoder, _, _) = self.encoder.as_mut().expect("created above");
         encoder.set_const_qp(req.const_qp)?;
+        if let Some(block) = encoder.qp_block() {
+            // A quality pass re-encodes a still image: its damage is old news.
+            let damage = frame.damage.as_deref().filter(|_| req.const_qp.is_none());
+            crate::region::qp_map(size.0, size.1, block, damage, &mut self.qp_map);
+            encoder.set_qp_map(&self.qp_map);
+        }
         if encoder.yuv444() {
             // One full-chroma picture; never an AVC444 frame (see `yuv444` above).
             let picture = self.converter.convert_yuv444(&src)?;
@@ -549,6 +565,7 @@ mod tests {
                         aux: false,
                         const_qp: None,
                         yuv444: false,
+                        region_quality: false,
                     };
                     let (main, _) = backend.encode(&frame, &req).expect("encoding");
                     assert!(
