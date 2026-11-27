@@ -69,6 +69,9 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.material.icons.extended)
+    // The phone server's privileged helper as a Shizuku user service.
+    implementation(libs.shizuku.api)
+    implementation(libs.shizuku.provider)
 }
 
 // --- Rust core (crates/android) through cargo-ndk, as in Rustify ---

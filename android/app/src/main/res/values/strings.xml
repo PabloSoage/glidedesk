@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="server_label">glidedesk server</string>
+    <string name="server_notification_channel">Screen server</string>
+    <string name="server_notification_title">Sharing this screen</string>
+    <string name="server_notification_text">glidedesk clients can see and drive this phone.</string>
+    <string name="server_stop">Stop</string>
+    <string name="accessibility_label">glidedesk server input</string>
+    <string name="accessibility_description">Lets a glidedesk client drive this phone while you share its screen with screen capture: taps and swipes, Back, Home and recent apps, and typing into text fields. Not needed with Shizuku or the ADB helper.</string>
+</resources>
