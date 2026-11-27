@@ -14,6 +14,9 @@ interface ScreenSource {
     /** A display of its own at the video size: positions need no scaling. */
     val ownDisplay: Boolean
 
+    /** Called once when the server starts, before any client. */
+    fun prepare(width: Int, height: Int, dpi: Int) {}
+
     /** Draws the screen into [surface] at [width] × [height] (again after a restart). */
     fun start(surface: Surface, width: Int, height: Int, dpi: Int)
 
@@ -52,18 +55,25 @@ class ProjectionSource(private val projection: MediaProjection) : ScreenSource {
     override val ownDisplay = false
     private var display: VirtualDisplay? = null
 
-    override fun start(surface: Surface, width: Int, height: Int, dpi: Int) {
-        // One virtual display per projection (Android 14 refuses a second): later encoders
-        // get it resized onto their surface.
-        val d = display
-        if (d == null) {
+    /**
+     * One virtual display per projection (Android 14 refuses a second), made at once (a
+     * projection that waits too long for its first display expires) without a surface:
+     * each encoder gets it resized onto its own.
+     */
+    override fun prepare(width: Int, height: Int, dpi: Int) {
+        if (display == null) {
             display = projection.createVirtualDisplay(
                 "glidedesk", width, height, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                surface, null, null,
+                null, null, null,
             )
-        } else {
-            d.resize(width, height, dpi)
-            d.surface = surface
+        }
+    }
+
+    override fun start(surface: Surface, width: Int, height: Int, dpi: Int) {
+        prepare(width, height, dpi)
+        display?.let {
+            it.resize(width, height, dpi)
+            it.surface = surface
         }
     }
 

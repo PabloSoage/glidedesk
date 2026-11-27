@@ -116,6 +116,7 @@ class ScreenServerService : Service() {
                 ShellSource(shell, settings.ownDisplay)
             }
             readScreen()
+            source.prepare(screenW, screenH, screenDpi)
             val srv = NativeServer.start(
                 settings.port, settings.user, settings.password, File(filesDir, "server").path,
                 VideoEncoder.hasHevc(), source.ownDisplay, settings.maxSize,
