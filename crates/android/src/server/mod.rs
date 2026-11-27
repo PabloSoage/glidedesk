@@ -9,8 +9,8 @@
 //! keyframe, a bitrate, and the input to inject, already as Android key codes and positions
 //! in video pixels.
 //!
-//! One client at a time; a new login takes over. No sound, clipboard or apps yet: the
-//! client is told there is no audio, and clipboard and file messages are ignored.
+//! One client at a time; a new login takes over. IPv4 only. No sound, clipboard or apps
+//! yet: the client is told there is no audio, and clipboard and file messages are ignored.
 
 pub mod auth;
 pub mod keys;
@@ -199,6 +199,8 @@ struct Shared {
     size: Mutex<Option<(u32, u32)>>,
     display: Mutex<(u32, u32)>,
     max_size: AtomicU32,
+    /// The user's limit, which each new client starts from again.
+    max_size_set: u32,
     events: Mutex<VecDeque<Event>>,
     ready: Condvar,
     status: Mutex<String>,
@@ -422,6 +424,7 @@ impl Server {
             size: Mutex::new(None),
             display: Mutex::new(config.display),
             max_size: AtomicU32::new(config.max_size.max(video::ALIGN)),
+            max_size_set: config.max_size.max(video::ALIGN),
             events: Mutex::default(),
             ready: Condvar::new(),
             status: Mutex::new(WAITING.to_owned()),
@@ -481,8 +484,11 @@ impl Server {
 
     /// The encoder refused the size of the last `Start`: try the next smaller one.
     pub fn encoder_failed(&self) {
-        let size = *self.shared.size.lock().unwrap();
-        match size.and_then(video::smaller) {
+        let Some(size) = *self.shared.size.lock().unwrap() else {
+            // The client left meanwhile: the next one starts afresh.
+            return;
+        };
+        match video::smaller(size) {
             Some(long) => {
                 warn!(?size, long, "The encoder refused the size; trying a smaller one");
                 self.shared.max_size.store(long, Ordering::Relaxed);
@@ -503,38 +509,53 @@ impl Server {
         let au = self.shared.params.lock().unwrap().frame(data, flags);
         let Some(au) = au else { return };
         let keyframe = flags & video::FLAG_KEY_FRAME != 0;
-        let mut guard = self.shared.link.lock().unwrap();
-        let Some(link) = guard.as_mut() else { return };
-        let Some(peer) = link.peer else { return };
-        if link.told != (width, height) {
-            link.told = (width, height);
-            let _ = link.control.send(ServerMsg::Size {
-                width: width.min(u32::from(u16::MAX)) as u16,
-                height: height.min(u32::from(u16::MAX)) as u16,
-            });
-        }
-        link.frame_id = link.frame_id.wrapping_add(1);
         let start = Instant::now();
-        let bps = {
-            let mut rate = self.shared.rate.lock().unwrap();
-            rate.sent(link.frame_id, start);
-            rate.bps()
+        // Sealed under the lock, sent after it: the pacing below sleeps, and the input,
+        // the UDP hello and the main thread (rotation) take the same lock.
+        let (peer, sealed, bps) = {
+            let mut guard = self.shared.link.lock().unwrap();
+            let Some(link) = guard.as_mut() else { return };
+            let Some(peer) = link.peer else { return };
+            if link.told != (width, height) {
+                link.told = (width, height);
+                let _ = link.control.send(ServerMsg::Size {
+                    width: width.min(u32::from(u16::MAX)) as u16,
+                    height: height.min(u32::from(u16::MAX)) as u16,
+                });
+            }
+            link.frame_id = link.frame_id.wrapping_add(1);
+            let bps = {
+                let mut rate = self.shared.rate.lock().unwrap();
+                rate.sent(link.frame_id, start);
+                rate.bps()
+            };
+            let parity = self.shared.fec.lock().unwrap().percent();
+            let packets = fec::packetize_frame(link.frame_id, keyframe, false, &au, parity);
+            let sealed: Vec<Vec<u8>> = packets
+                .iter()
+                .map(|p| {
+                    link.seq += 1;
+                    link.key.seal(Direction::ToClient, link.seq, p)
+                })
+                .collect();
+            link.last_frame = Some(start);
+            (peer, sealed, bps)
         };
-        let parity = self.shared.fec.lock().unwrap().percent();
         // Pacing as the host's: past a first burst, a few times the bitrate, so a keyframe
         // does not overflow the queue of a Wi-Fi access point.
         let (pace_bps, burst) = link::pacing(bps, fec::SHARD);
-        let packets = fec::packetize_frame(link.frame_id, keyframe, false, &au, parity);
-        for (i, p) in packets.iter().enumerate() {
-            link.seal_and_send(&self.shared.udp, peer, p);
+        for (i, packet) in sealed.iter().enumerate() {
+            if let Err(e) = self.shared.udp.send_to(packet, peer) {
+                debug!(%e, "UDP send failed");
+            }
             if i >= burst && i % 8 == 0 {
-                let due = Duration::from_secs_f64(((i - burst) * fec::SHARD * 8) as f64 / pace_bps);
+                let due =
+                    Duration::from_secs_f64(((i - burst) * fec::SHARD * 8) as f64 / pace_bps);
                 if let Some(wait) = due.checked_sub(start.elapsed()) {
                     std::thread::sleep(wait);
                 }
             }
         }
-        link.last_frame = Some(Instant::now());
     }
 }
 
@@ -709,6 +730,10 @@ where
         .find(|c| *c == Codec::H264 || shared.hevc)
         .context("no codec in common")?;
     let client = (u32::from(width), u32::from(height));
+    // A smaller size forced by an encoder failure lasts for one client.
+    shared
+        .max_size
+        .store(shared.max_size_set, Ordering::Relaxed);
     let size = shared.video_size(client);
     let fps = refresh.clamp(30, 120);
     info!(%peer, user, w = size.0, h = size.1, refresh, ?codec, version, "Native client logged in");

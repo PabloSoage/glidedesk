@@ -51,7 +51,11 @@ class VideoEncoder(private val server: NativeServer) {
             val i = try {
                 c.dequeueOutputBuffer(info, 100_000)
             } catch (e: IllegalStateException) {
-                Log.w(TAG, "Encoder stopped", e)
+                // A codec error while running (not a stop): the core restarts it smaller.
+                if (running) {
+                    Log.w(TAG, "Encoder failed", e)
+                    server.encoderFailed()
+                }
                 break
             }
             if (i < 0) continue
