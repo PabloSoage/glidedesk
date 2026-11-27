@@ -183,6 +183,24 @@ Useful options of `serve` (`--help` lists them all):
 
 The TLS certificate is self-signed, created in `~/.config/glidedesk/` on first start.
 
+### Vulkan Video encoder (experimental)
+
+A build with `--features vulkan-video` adds `--encoder vulkan`: H.264 (and HEVC where the
+driver offers it) through Vulkan Video (`VK_KHR_video_encode_queue`), on AMD, Intel and
+NVIDIA alike. It is never picked by `auto`. `--gpu N` chooses the N-th Vulkan device that can
+encode (the log lists them). Frames are converted to NV12 on the CPU and copied to the GPU, as
+with VA-API; full-chroma AVC444 is not offered. Drivers that expose it:
+
+- NVIDIA 550 or later (Linux and Windows).
+- AMD with Mesa's radv: H.264/HEVC encode since Mesa 24.1, built with the `h264enc` and
+  `h265enc` video codecs; some releases and GPUs still hide it behind
+  `RADV_PERFTEST=video_encode`.
+- Intel with Mesa's anv (and Intel's Windows driver): availability depends on the Mesa release
+  and the GPU generation.
+
+`vulkaninfo | grep video_encode` shows whether a driver offers it. To check one:
+`cargo test --release -p glidedesk-host --features vulkan-video vulkan_encodes_frames -- --ignored --nocapture`.
+
 ### Apps instead of the whole desktop
 
 List apps in `~/.config/glidedesk/apps.conf` (Windows: `%APPDATA%\glidedesk\apps.conf`), one

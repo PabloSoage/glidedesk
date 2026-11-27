@@ -14,6 +14,8 @@ gnome = ["dep:zbus", "dep:pipewire", "dep:futures-util"]
 x11 = ["dep:x11rb"]
 # Browsers over WebRTC (page, signalling and media on one port).
 web = ["dep:str0m", "dep:serde", "dep:serde_json"]
+# Vulkan Video encoder (`--encoder vulkan`, experimental).
+vulkan-video = ["dep:ash"]
 
 [dependencies]
 anyhow = "1"
@@ -61,6 +63,8 @@ serde_json = { version = "1", optional = true }
 # Sound for browsers and Moonlight (libopus).
 opus = "0.4"
 rusty_enet = "0.4"
+# Vulkan Video encode (the version wgpu already uses in the client).
+ash = { version = "0.38", optional = true }
 
 # Virtual gamepads for Moonlight's controllers.
 [target.'cfg(target_os = "linux")'.dependencies]

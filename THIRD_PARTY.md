@@ -7,6 +7,7 @@
 | [pipewire-rs](https://gitlab.freedesktop.org/pipewire/pipewire-rs) | dependency | MIT |
 | [zbus](https://github.com/dbus2/zbus) | dependency | MIT |
 | [cudarc](https://github.com/coreylowman/cudarc) | dependency | MIT or Apache-2.0 |
+| [ash](https://github.com/ash-rs/ash) (Vulkan bindings) | host dependency (`vulkan-video` feature) | MIT or Apache-2.0 |
 | [FFmpeg](https://ffmpeg.org) (libavcodec, libavutil) | host encoders (system library); desktop client decoders, linked statically into the Windows build (vcpkg, decoders only, no GPL parts) | LGPL-2.1-or-later |
 | [str0m](https://github.com/algesten/str0m) (WebRTC) | host dependency (web front end) | MIT |
 | [opus](https://github.com/SpaceManiac/opus-rs) bindings, libopus | host dependency (web front end sound) | MIT or Apache-2.0; libopus BSD-3-Clause |
@@ -42,3 +43,9 @@ and commit, and marked in the file header.
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).
+
+The Vulkan Video encoder (`crates/host/src/vkenc.rs`) follows the call sequence of FFmpeg
+`libavcodec/vulkan_encode.c`, `vulkan_encode_h264.c`, `vulkan_encode_h265.c` (LGPL-2.1-or-later,
+commit `7fdb4c2`) and the Khronos
+[Vulkan-Video-Samples](https://github.com/KhronosGroup/Vulkan-Video-Samples) encoder
+(Apache-2.0, commit `9239ae2`); no code copied.
