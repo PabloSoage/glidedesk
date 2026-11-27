@@ -8,8 +8,14 @@
 //! The cursor is not drawn into the frames: Mutter sends it as metadata (position, and the
 //! image when it changes), which goes out on its own channel so the client can draw it
 //! locally, as Windows RDP does.
+//!
+//! DMA-BUFs go to the GPU of the encoder: CUDA for NVENC ([`crate::gpu`]), VA surfaces for
+//! VA-API ([`crate::vaimport`], linear buffers). When the VA-API import fails, the stream is
+//! renegotiated without modifiers and frames come through system memory as before.
 
-use std::sync::{Arc, mpsc};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +32,16 @@ pub use crate::frame::{
     CursorEvent, CursorShape, Frame, FrameData, FrameSender, Rect, latest_frame,
 };
 use crate::gpu::{DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DmabufImporter, PixelOrder, Pool};
+use crate::vaimport::VaImporter;
+
+/// Render node of the VA-API encoder, when there is one: DMA-BUFs are imported onto it.
+static VAAPI_IMPORT: OnceLock<String> = OnceLock::new();
+
+/// Imports DMA-BUFs as VA surfaces on `render_node` (the VA-API encoder's) in captures
+/// started from now on. Call once, before the first capture.
+pub fn import_to_vaapi(render_node: String) {
+    let _ = VAAPI_IMPORT.set(render_node);
+}
 
 /// Largest cursor image requested from Mutter (the RDP large pointer limit).
 const MAX_CURSOR: usize = 384;
@@ -117,6 +133,10 @@ struct StreamState {
     hidden_since: Option<Instant>,
     /// DMA-BUF import, when a GPU was given and the modifiers could be queried.
     gpu: Option<(DmabufImporter, Pool)>,
+    /// DMA-BUF import as VA surfaces, for the VA-API encoder.
+    va: Option<VaImporter>,
+    /// The modifiers offered to Mutter (none once the VA-API import gave up).
+    modifiers: Rc<RefCell<Vec<u64>>>,
     /// The negotiated format carries a modifier: buffers are DMA-BUFs.
     dmabuf: bool,
     copy_errors: u64,
@@ -328,7 +348,14 @@ fn run(
 ) -> Result<()> {
     pw::init();
     // GLIDEDESK_NO_DMABUF=1 forces the system-memory path (for comparisons).
-    let gpu = gpu.filter(|_| std::env::var_os("GLIDEDESK_NO_DMABUF").is_none());
+    let no_dmabuf = std::env::var_os("GLIDEDESK_NO_DMABUF").is_some();
+    let gpu = gpu.filter(|_| !no_dmabuf);
+    let va = match VAAPI_IMPORT.get().filter(|_| gpu.is_none() && !no_dmabuf) {
+        Some(node) => VaImporter::new(node)
+            .inspect_err(|e| warn!(%e, "No VA-API import, capturing through system memory"))
+            .ok(),
+        None => None,
+    };
     let gpu = match gpu
         .map(|ctx| DmabufImporter::new(Arc::clone(&ctx)).map(|imp| (imp, Pool::new(ctx))))
     {
@@ -339,7 +366,7 @@ fn run(
         }
         None => None,
     };
-    let modifiers = gpu
+    let mut modifiers = gpu
         .as_ref()
         .map(|(imp, _)| {
             let mut m = imp.modifiers(DRM_FORMAT_XRGB8888);
@@ -347,7 +374,12 @@ fn run(
             m
         })
         .unwrap_or_default();
+    if va.is_some() {
+        // Every VA driver imports linear buffers; tiled ones would need the driver's list.
+        modifiers = vec![crate::vaimport::DRM_FORMAT_MOD_LINEAR];
+    }
     info!(count = modifiers.len(), "DMA-BUF modifiers offered");
+    let modifiers = Rc::new(RefCell::new(modifiers));
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
@@ -367,6 +399,8 @@ fn run(
         dropped: 0,
         hidden_since: None,
         gpu,
+        va,
+        modifiers: Rc::clone(&modifiers),
         dmabuf: false,
         copy_errors: 0,
         stats_frames: 0,
@@ -399,7 +433,7 @@ fn run(
                             p.key == spa::param::format::FormatProperties::VideoModifier.as_raw()
                         })
                     });
-                st.dmabuf = has_modifier && st.gpu.is_some();
+                st.dmabuf = has_modifier && (st.gpu.is_some() || st.va.is_some());
                 if let Some((imp, _)) = st.gpu.as_mut() {
                     imp.clear();
                 }
@@ -484,7 +518,49 @@ fn run(
                 return;
             }
             let copy_start = Instant::now();
-            let data = if dmabuf && d.type_() == spa::buffer::DataType::DmaBuf {
+            let data = if dmabuf
+                && d.type_() == spa::buffer::DataType::DmaBuf
+                && let Some(va) = st.va.as_mut()
+            {
+                let fd = d.as_raw().fd as i32;
+                match va.convert(
+                    fd,
+                    offset,
+                    stride as u32,
+                    fourcc,
+                    modifier,
+                    size.width,
+                    size.height,
+                ) {
+                    Ok(Some(f)) => FrameData::Va(f),
+                    Ok(None) => {
+                        st.dropped += 1;
+                        return;
+                    }
+                    Err(e) => {
+                        st.copy_errors += 1;
+                        if st.copy_errors.is_power_of_two() {
+                            warn!(
+                                error = format!("{e:#}"),
+                                errors = st.copy_errors,
+                                "VA-API import failed"
+                            );
+                        }
+                        if va.broken() {
+                            warn!("VA-API import does not work: capturing through system memory");
+                            st.va = None;
+                            st.modifiers.borrow_mut().clear();
+                            let pods = format_pods(size.width, size.height, &[]);
+                            let mut params: Vec<&Pod> =
+                                pods.iter().filter_map(|p| Pod::from_bytes(p)).collect();
+                            if let Err(e) = stream.update_params(&mut params) {
+                                warn!(%e, "Renegotiating the capture failed");
+                            }
+                        }
+                        return;
+                    }
+                }
+            } else if dmabuf && d.type_() == spa::buffer::DataType::DmaBuf {
                 let fd = d.as_raw().fd as i32;
                 let Some((imp, pool)) = st.gpu.as_mut() else {
                     return;
@@ -563,7 +639,7 @@ fn run(
         })
         .register()?;
 
-    let pods = format_pods(width, height, &modifiers);
+    let pods = format_pods(width, height, &modifiers.borrow());
     let mut params: Vec<&Pod> = pods.iter().filter_map(|p| Pod::from_bytes(p)).collect();
     stream.connect(
         spa::utils::Direction::Input,
@@ -578,7 +654,7 @@ fn run(
     let _cmd = commands.attach(mainloop.loop_(), move |cmd| match cmd {
         Command::Resize(w, h) => {
             info!(w, h, "Renegotiating capture size");
-            let pods = format_pods(w, h, &modifiers);
+            let pods = format_pods(w, h, &modifiers.borrow());
             let mut params: Vec<&Pod> = pods.iter().filter_map(|p| Pod::from_bytes(p)).collect();
             if let Err(e) = st.update_params(&mut params) {
                 warn!(%e, "update_params failed");

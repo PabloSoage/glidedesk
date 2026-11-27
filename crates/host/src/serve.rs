@@ -227,6 +227,11 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     )?;
     let hevc = backend.supports_hevc();
     info!(encoder = backend.name(), hevc, "Video encoder");
+    // VA-API: the GNOME capture hands over VA surfaces converted on the GPU.
+    #[cfg(feature = "gnome")]
+    if let Some(node) = backend.vaapi_import() {
+        crate::capture::import_to_vaapi(node);
+    }
 
     let parts = match &opts.session {
         #[cfg(feature = "gnome")]

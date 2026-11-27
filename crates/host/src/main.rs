@@ -37,6 +37,8 @@ mod rdp;
 mod region;
 mod serve;
 mod sound;
+#[cfg(feature = "gnome")]
+mod vaimport;
 #[cfg(feature = "web")]
 mod web;
 #[cfg(target_os = "windows")]
@@ -662,6 +664,7 @@ async fn encode_test(
                     enc.encode_host(data, *stride as usize)?
                 }
                 capture::FrameData::Gpu(buf) => enc.encode_device(buf)?,
+                capture::FrameData::Va(_) => anyhow::bail!("VA surfaces need the VA-API encoder"),
             };
             let us = t.elapsed().as_micros();
             total_us += us;

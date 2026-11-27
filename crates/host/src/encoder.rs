@@ -2,7 +2,9 @@
 //!
 //! - NVENC: frames stay on the NVIDIA GPU (DMA-BUF import, CUDA colour conversion).
 //! - FFmpeg: VA-API (AMD, Intel and other Mesa or Intel-media drivers) or x264 in
-//!   software, fed by the CPU colour conversion; the capture goes through system memory.
+//!   software, fed by the CPU colour conversion; the capture goes through system memory,
+//!   except VA-API with GNOME, which takes VA surfaces converted on the GPU
+//!   ([`crate::vaimport`]).
 //!
 //! Each backend turns a captured frame into the H.264 pictures of one EGFX frame: the main
 //! view (AVC420, or the first stream of AVC444v2) and optionally the auxiliary view; or into
@@ -111,6 +113,11 @@ pub trait Backend: Send {
     fn invalidate_from(&mut self, _index: u64) -> bool {
         false
     }
+    /// The render node the capture should import DMA-BUFs onto as VA surfaces (VA-API
+    /// encoders), if any.
+    fn vaapi_import(&self) -> Option<String> {
+        None
+    }
 }
 
 fn config(codec: Codec, w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) -> EncoderConfig {
@@ -211,6 +218,8 @@ impl Backend for Nvenc {
                 tracing::debug!(upload_ms = t.elapsed().as_secs_f64() * 1e3, "Upload");
                 b
             }
+            #[cfg(feature = "gnome")]
+            FrameData::Va(_) => bail!("NVENC takes CUDA or system-memory frames"),
         };
         let size = color::coded_size(w, h);
         let yuv444 =
@@ -273,7 +282,9 @@ pub struct Ffmpeg {
     device: String,
     main: Option<Nv12Frame>,
     aux: Option<Nv12Frame>,
-    encoder: Option<(FfEncoder, (Codec, bool))>,
+    /// The encoder and what it was opened for: codec, AVC444, and the frames context of the
+    /// capture's VA surfaces (its address; 0 for frames from system memory).
+    encoder: Option<(FfEncoder, (Codec, bool, usize))>,
     fps: u32,
     bitrate: u32,
     hevc: bool,
@@ -366,6 +377,10 @@ impl Backend for Ffmpeg {
         self.hevc
     }
 
+    fn vaapi_import(&self) -> Option<String> {
+        (self.kind == Kind::Vaapi).then(|| self.device.clone())
+    }
+
     fn request_keyframe(&mut self) {
         match self.encoder.as_mut() {
             Some((e, _)) if e.idr_on_request() => e.request_keyframe(),
@@ -393,6 +408,10 @@ impl Backend for Ffmpeg {
     }
 
     fn encode(&mut self, frame: &Frame, req: &Request) -> Result<(EncodedFrame, EncodedFrame)> {
+        #[cfg(feature = "gnome")]
+        if let FrameData::Va(va) = &frame.data {
+            return self.encode_va(frame.width, frame.height, va, req);
+        }
         let FrameData::Cpu { data, stride } = &frame.data else {
             bail!("the FFmpeg backend takes frames in system memory");
         };
@@ -409,9 +428,10 @@ impl Backend for Ffmpeg {
         if req.aux && self.aux.is_none() {
             self.aux = Some(Nv12Frame::new(cw, ch));
         }
-        let key = (req.codec, req.avc444);
+        let key = (req.codec, req.avc444, 0);
         if self.encoder.as_ref().is_none_or(|(_, k)| *k != key) {
             let cfg = config(req.codec, cw, ch, req.avc444, self.fps, self.bitrate);
+            self.encoder = None;
             self.encoder = Some((FfEncoder::new(self.kind, &self.device, cfg)?, key));
         }
         let main = self.main.as_mut().expect("allocated above");
@@ -435,6 +455,40 @@ impl Backend for Ffmpeg {
             "FFmpeg frame"
         );
         Ok((out_main, out_aux))
+    }
+}
+
+impl Ffmpeg {
+    /// Encodes a VA surface the capture converted on the GPU. The encoder works at the
+    /// capture size (SPS cropping): the surfaces are not padded to multiples of 16.
+    #[cfg(feature = "gnome")]
+    fn encode_va(
+        &mut self,
+        width: u32,
+        height: u32,
+        va: &crate::vaimport::VaFrame,
+        req: &Request,
+    ) -> Result<(EncodedFrame, EncodedFrame)> {
+        if self.kind != Kind::Vaapi || req.avc444 {
+            bail!("VA surfaces go to the VA-API encoder, 4:2:0 only");
+        }
+        let key = (req.codec, false, va.frames_data() as usize);
+        if self.encoder.as_ref().is_none_or(|(_, k)| *k != key) {
+            let cfg = config(req.codec, width, height, false, self.fps, self.bitrate);
+            self.encoder = None;
+            let encoder = FfEncoder::new_on(self.kind, &self.device, cfg, Some(va.frames_ctx()))?;
+            self.encoder = Some((encoder, key));
+            info!(width, height, "VA-API encoder on the capture's surfaces");
+        }
+        let (encoder, _) = self.encoder.as_mut().expect("created above");
+        let t = std::time::Instant::now();
+        let main = if req.main {
+            encoder.encode_va(va)?
+        } else {
+            Default::default()
+        };
+        tracing::debug!(encode_us = t.elapsed().as_micros(), "VA-API frame");
+        Ok((main, Default::default()))
     }
 }
 

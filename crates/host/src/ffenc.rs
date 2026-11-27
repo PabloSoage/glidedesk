@@ -3,7 +3,7 @@
 //! The same low-latency shape as the NVENC encoder: CBR with about one frame of VBV, no
 //! B-frames, an endless GOP with IDRs only on request, full-range BT.709 signalled in the
 //! VUI. Frames come in as NV12 in system memory ([`crate::csc`]); for VA-API they are
-//! uploaded into a VA surface.
+//! uploaded into a VA surface, or arrive as one from the capture ([`crate::vaimport`]).
 //!
 //! Lost pictures cannot be invalidated here: FFmpeg's AMF, QSV and VA-API encoders (6.1,
 //! 8.0 and 9.0) expose no reference invalidation, no caller-driven long-term references and
@@ -82,6 +82,17 @@ fn set(dict: &mut *mut ff::AVDictionary, key: &str, value: &str) {
 impl FfEncoder {
     /// `device`: DRM render node for VA-API (e.g. /dev/dri/renderD128).
     pub fn new(kind: Kind, device: &str, cfg: EncoderConfig) -> Result<Self> {
+        Self::new_on(kind, device, cfg, None)
+    }
+
+    /// With `frames` (VA-API only), the encoder takes surfaces of that frames context
+    /// ([`FfEncoder::encode_va`]) instead of uploading its own.
+    pub fn new_on(
+        kind: Kind,
+        device: &str,
+        cfg: EncoderConfig,
+        frames: Option<*mut ff::AVBufferRef>,
+    ) -> Result<Self> {
         let name = match (kind, cfg.codec) {
             (Kind::Vaapi, Codec::H264) => "h264_vaapi",
             (Kind::Vaapi, Codec::Hevc) => "hevc_vaapi",
@@ -139,25 +150,35 @@ impl FfEncoder {
             let mut opts: *mut ff::AVDictionary = ptr::null_mut();
             match kind {
                 Kind::Vaapi => {
-                    let dev = CString::new(device).unwrap();
-                    check(
-                        ff::av_hwdevice_ctx_create(
-                            &mut this.hw_device,
-                            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                            dev.as_ptr(),
-                            ptr::null_mut(),
-                            0,
-                        ),
-                        "opening the VA-API device",
-                    )?;
-                    this.hw_frames = ff::av_hwframe_ctx_alloc(this.hw_device);
-                    let fc = &mut *((*this.hw_frames).data as *mut ff::AVHWFramesContext);
-                    fc.format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-                    fc.sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
-                    fc.width = cfg.width as i32;
-                    fc.height = cfg.height as i32;
-                    fc.initial_pool_size = 4;
-                    check(ff::av_hwframe_ctx_init(this.hw_frames), "VA-API frame pool")?;
+                    if let Some(frames) = frames {
+                        // The capture's surfaces, on its VA display.
+                        this.hw_frames = ff::av_buffer_ref(frames);
+                        if this.hw_frames.is_null() {
+                            bail!("out of memory");
+                        }
+                        let fc = &*((*this.hw_frames).data as *const ff::AVHWFramesContext);
+                        this.hw_device = ff::av_buffer_ref(fc.device_ref);
+                    } else {
+                        let dev = CString::new(device).unwrap();
+                        check(
+                            ff::av_hwdevice_ctx_create(
+                                &mut this.hw_device,
+                                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                                dev.as_ptr(),
+                                ptr::null_mut(),
+                                0,
+                            ),
+                            "opening the VA-API device",
+                        )?;
+                        this.hw_frames = ff::av_hwframe_ctx_alloc(this.hw_device);
+                        let fc = &mut *((*this.hw_frames).data as *mut ff::AVHWFramesContext);
+                        fc.format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                        fc.sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+                        fc.width = cfg.width as i32;
+                        fc.height = cfg.height as i32;
+                        fc.initial_pool_size = 4;
+                        check(ff::av_hwframe_ctx_init(this.hw_frames), "VA-API frame pool")?;
+                    }
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
                     c.hw_frames_ctx = ff::av_buffer_ref(this.hw_frames);
                     set(&mut opts, "rc_mode", "CBR");
@@ -292,6 +313,53 @@ impl FfEncoder {
                     self.hw_frame
                 }
             };
+            self.submit(input)
+        }
+    }
+
+    /// The frames context (its data, for comparisons) of the VA-API surfaces this encoder
+    /// takes; null for the other encoders.
+    pub fn frames_data(&self) -> *const u8 {
+        if self.hw_frames.is_null() {
+            return ptr::null();
+        }
+        // SAFETY: a valid buffer reference owned by `self`.
+        unsafe { (*self.hw_frames).data }
+    }
+
+    /// Encodes a VA surface from the capture; the encoder must have been opened on its
+    /// frames context ([`FfEncoder::new_on`]).
+    #[cfg(feature = "gnome")]
+    pub fn encode_va(&mut self, frame: &crate::vaimport::VaFrame) -> Result<EncodedFrame> {
+        if self.kind != Kind::Vaapi || self.frames_data() != frame.frames_data() {
+            bail!("the surface is not from this encoder's frames context");
+        }
+        // SAFETY: `frame` is a valid VA-API frame; the new reference is released before the
+        // next frame (or in Drop).
+        unsafe {
+            ff::av_frame_unref(self.hw_frame);
+            check(ff::av_frame_ref(self.hw_frame, frame.as_ptr()), "VA surface")?;
+            (*self.hw_frame).pts = self.pts;
+            (*self.hw_frame).pict_type = if self.force_idr {
+                ff::AVPictureType::AV_PICTURE_TYPE_I
+            } else {
+                ff::AVPictureType::AV_PICTURE_TYPE_NONE
+            };
+            let out = self.submit(self.hw_frame);
+            // The encoder holds its own reference: give the surface back to the pool as
+            // soon as it is done with it.
+            ff::av_frame_unref(self.hw_frame);
+            out
+        }
+    }
+
+    /// Sends `input` and collects the packet.
+    ///
+    /// # Safety
+    /// `input` is a valid frame for this encoder.
+    unsafe fn submit(&mut self, input: *mut ff::AVFrame) -> Result<EncodedFrame> {
+        // SAFETY: see the function's contract; packets are owned by `self`.
+        unsafe {
             self.pts += 1;
             check(ff::avcodec_send_frame(self.ctx, input), "encoding")?;
             let mut out = EncodedFrame::default();
