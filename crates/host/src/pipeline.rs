@@ -4,12 +4,19 @@
 //! passes over a still image), encodes it through the [`encoder::Backend`] and hands the
 //! pictures to the [`Output`] of whichever front end has the client: RDP (EGFX) or the
 //! native protocol. The last client to connect, on either, gets the session.
+//!
+//! With several monitors ([`crate::layout`]) each monitor after the first has a pipeline of
+//! its own (its capture, mailbox, encoder and outputs, on its own thread). Monitor 0's
+//! pipeline runs the rate control of the link; every stream's encoder gets a share of the
+//! ceiling in proportion to its pixels ([`crate::rate::share`]).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use glidedesk_proto::Monitor;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::encoder::{self, Codec, EncodedFrame};
@@ -30,6 +37,18 @@ pub struct Shared {
     /// surface, IDR) on the output in `active`.
     generation: AtomicU64,
     active: AtomicUsize,
+    /// Monitors a client asked for (see [`Shared::request_layout`]); [`crate::layout`]
+    /// sets them up.
+    pub layout_request: watch::Sender<Vec<Monitor>>,
+    /// The monitors set up, monitor 0 first (one, unless a client asked for more); empty
+    /// until a request has been handled.
+    pub layout: watch::Sender<Vec<Monitor>>,
+    /// The link's bitrate ceiling, from monitor 0's rate control.
+    link_bps: AtomicU32,
+    /// Each monitor of the layout and its pixels, for sharing the ceiling; empty with one.
+    pub(crate) areas: Mutex<Vec<(u8, u64)>>,
+    /// Send-to-acknowledge delays of the other monitors' frames, for the rate control.
+    extra_delays: Mutex<Vec<(Duration, usize)>>,
 }
 
 impl Shared {
@@ -44,6 +63,17 @@ impl Shared {
         let size = clamp_size(w, h);
         *self.wanted_size.lock().unwrap() = Some(size);
         size
+    }
+
+    /// Asks for the desktop on these monitors (monitor 0 first is the one of
+    /// [`Shared::request_size`]); none or one: a single monitor.
+    pub fn request_layout(&self, monitors: Vec<Monitor>) {
+        self.layout_request.send_replace(monitors);
+    }
+
+    /// The share of the link's ceiling `total` for the stream of `monitor`.
+    fn share(&self, total: u32, monitor: u8) -> u32 {
+        crate::rate::share(total, &self.areas.lock().unwrap(), monitor)
     }
 }
 
@@ -122,6 +152,36 @@ pub trait Output: Send {
     }
 }
 
+/// A front end that shows more than one monitor: the output for the stream of each further
+/// monitor ([`crate::layout`]).
+pub trait MonitorOutputs: Send + Sync {
+    fn output(&self, monitor: u8) -> Box<dyn Output>;
+}
+
+/// The output of a front end that shows one monitor, in the pipelines of the others.
+pub struct NoOutput;
+
+impl Output for NoOutput {
+    fn prepare(&mut self, _w: u32, _h: u32, _max_in_flight: u32) -> Result<Prepared> {
+        Ok(Prepared::Absent)
+    }
+
+    fn send(&mut self, _mode: Mode, _main: &EncodedFrame, _aux: &EncodedFrame) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn take_acked(&mut self) -> u64 {
+        0
+    }
+
+    fn take_delays(&mut self) -> Vec<(Duration, usize)> {
+        Vec::new()
+    }
+
+    fn reset(&mut self) {}
+}
+
+#[derive(Clone)]
 pub struct Options {
     /// Send AVC444v2 (4:4:4) when the client supports it.
     pub avc444: bool,
@@ -144,6 +204,10 @@ pub struct Options {
 
 pub struct Pipeline {
     shared: std::sync::Arc<Shared>,
+    /// The monitor this pipeline encodes (0: the first, which also runs the rate control).
+    monitor: u8,
+    /// Ends a further monitor's pipeline (when the layout changes).
+    stop: Option<Arc<AtomicBool>>,
     source: Box<dyn Source>,
     frames: FrameReceiver,
     backend: Box<dyn encoder::Backend>,
@@ -169,6 +233,8 @@ pub struct Pipeline {
     /// QP of the quality pass being sent; `None` for normal frames.
     refine_qp: Option<u32>,
     rate: Rate,
+    /// Ceiling last given to the encoder and the output: this stream's share of the link's.
+    applied_bps: u32,
     stats: Stats,
 }
 
@@ -214,6 +280,8 @@ impl Pipeline {
         let max_bitrate = opts.max_bitrate;
         Self {
             shared,
+            monitor: 0,
+            stop: None,
             source,
             frames,
             backend,
@@ -230,15 +298,50 @@ impl Pipeline {
             refine_left: 0,
             refine_qp: None,
             rate: Rate::new(max_bitrate),
+            applied_bps: 0,
             stats: Stats::new(),
         }
     }
 
+    /// The pipeline of a further monitor (see [`crate::layout`]): its size is set when its
+    /// capture starts; `stop` ends it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_monitor(
+        shared: std::sync::Arc<Shared>,
+        monitor: u8,
+        stop: Arc<AtomicBool>,
+        source: Box<dyn Source>,
+        frames: FrameReceiver,
+        backend: Box<dyn encoder::Backend>,
+        outputs: Vec<Box<dyn Output>>,
+        opts: Options,
+    ) -> Self {
+        let mut p = Self::new(shared, source, frames, backend, outputs, opts);
+        p.monitor = monitor;
+        p.stop = Some(stop);
+        p
+    }
+
+    fn stopped(&self) -> bool {
+        self.shared.stop.load(Ordering::Relaxed)
+            || self.stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
+    }
+
     pub fn run(mut self) -> Result<()> {
-        self.backend.set_max_bitrate(self.rate.bps())?;
-        while !self.shared.stop.load(Ordering::Relaxed) {
+        if self.monitor == 0 {
+            self.shared.link_bps.store(self.rate.bps(), Ordering::Relaxed);
+        }
+        self.applied_bps = self.shared.share(self.link_bps(), self.monitor);
+        self.backend.set_max_bitrate(self.applied_bps)?;
+        while !self.stopped() {
             self.adapt_rate();
-            let refresh = self.shared.wanted_refresh.lock().unwrap().take();
+            // The refresh rate and the size of monitor 0 follow the client; the others are
+            // set by their layout.
+            let refresh = if self.monitor == 0 {
+                self.shared.wanted_refresh.lock().unwrap().take()
+            } else {
+                None
+            };
             if let Some(hz) = refresh
                 && self.source.set_refresh(hz)
             {
@@ -246,7 +349,12 @@ impl Pipeline {
                 let (w, h) = *self.shared.current_size.lock().unwrap();
                 self.source.resize(w, h);
             }
-            if let Some((w, h)) = self.shared.wanted_size.lock().unwrap().take() {
+            let wanted = if self.monitor == 0 {
+                self.shared.wanted_size.lock().unwrap().take()
+            } else {
+                None
+            };
+            if let Some((w, h)) = wanted {
                 let cur = *self.shared.current_size.lock().unwrap();
                 if self.last_frame.as_ref().map(|f| (f.width, f.height)) != Some((w, h))
                     || cur != (w, h)
@@ -334,8 +442,12 @@ impl Pipeline {
                     o.reset();
                 }
                 // Another client, maybe on another link: learn it from the start.
-                self.rate = Rate::new(self.opts.max_bitrate);
-                let bps = self.rate.bps();
+                if self.monitor == 0 {
+                    self.rate = Rate::new(self.opts.max_bitrate);
+                    self.shared.link_bps.store(self.rate.bps(), Ordering::Relaxed);
+                }
+                let bps = self.shared.share(self.link_bps(), self.monitor);
+                self.applied_bps = bps;
                 for o in &mut self.outputs {
                     o.set_ceiling(bps);
                 }
@@ -354,24 +466,61 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Feeds the active client's acknowledgements to the rate control.
+    /// The link's ceiling: this pipeline's own rate control for monitor 0, the one monitor
+    /// 0 publishes for the others.
+    fn link_bps(&self) -> u32 {
+        if self.monitor == 0 {
+            self.rate.bps()
+        } else {
+            self.shared.link_bps.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Feeds the active client's acknowledgements to the rate control (monitor 0; the
+    /// other monitors hand theirs over), and gives the encoder and the output this stream's
+    /// share of the ceiling.
     fn adapt_rate(&mut self) {
         let index = self.shared.active.load(Ordering::SeqCst);
         let Some(output) = self.outputs.get_mut(index) else {
             return;
         };
-        let mut changed = match output.link_estimate() {
-            Some(estimate) => self.rate.follow(estimate),
-            None => self.rate.update(output.take_delays()),
-        };
-        if let Some(loss) = output.take_loss()
-            && let Some(bps) = self.rate.loss(loss)
-        {
-            debug!(loss, "Losses lower the bitrate");
-            changed = Some(bps);
+        if self.monitor == 0 {
+            let mut changed = match output.link_estimate() {
+                Some(estimate) => self.rate.follow(estimate),
+                None => {
+                    let mut delays = output.take_delays();
+                    delays.append(&mut self.shared.extra_delays.lock().unwrap());
+                    self.rate.update(delays)
+                }
+            };
+            if let Some(loss) = output.take_loss()
+                && let Some(bps) = self.rate.loss(loss)
+            {
+                debug!(loss, "Losses lower the bitrate");
+                changed = Some(bps);
+            }
+            if let Some(bps) = changed {
+                debug!(mbps = bps / 1_000_000, "Bitrate ceiling");
+                self.shared.link_bps.store(bps, Ordering::Relaxed);
+            }
+        } else {
+            let delays = output.take_delays();
+            if !delays.is_empty() {
+                let mut extra = self.shared.extra_delays.lock().unwrap();
+                // Nobody takes them while monitor 0's output has no client.
+                if extra.len() < 4096 {
+                    extra.extend(delays);
+                }
+            }
         }
-        if let Some(bps) = changed {
-            debug!(mbps = bps / 1_000_000, "Bitrate ceiling");
+        let total = if self.monitor == 0 {
+            self.rate.bps()
+        } else {
+            self.shared.link_bps.load(Ordering::Relaxed)
+        };
+        let bps = self.shared.share(total, self.monitor);
+        if bps != self.applied_bps {
+            self.applied_bps = bps;
             output.set_ceiling(bps);
             if let Err(e) = self.backend.set_max_bitrate(bps) {
                 warn!(%e, "Changing the bitrate failed");
@@ -527,7 +676,8 @@ impl Pipeline {
                     .floor()
                     .map(|d| format!("{:.1}", d.as_secs_f64() * 1000.0)),
                 refines = s.refines,
-                ceiling_mbps = self.rate.bps() / 1_000_000,
+                ceiling_mbps = self.applied_bps / 1_000_000,
+                monitor = self.monitor,
                 ?codec,
                 "Stream"
             );

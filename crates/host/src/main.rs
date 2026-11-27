@@ -25,6 +25,7 @@ mod gpu;
 #[cfg(target_os = "linux")]
 mod handover;
 mod input;
+mod layout;
 #[cfg(feature = "gnome")]
 mod mutter;
 mod native;
