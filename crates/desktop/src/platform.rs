@@ -367,7 +367,7 @@ mod win {
         // SAFETY: SHCNE_ASSOCCHANGED takes no items.
         unsafe {
             windows_sys::Win32::UI::Shell::SHChangeNotify(
-                windows_sys::Win32::UI::Shell::SHCNE_ASSOCCHANGED,
+                windows_sys::Win32::UI::Shell::SHCNE_ASSOCCHANGED as i32,
                 windows_sys::Win32::UI::Shell::SHCNF_IDLIST,
                 std::ptr::null(),
                 std::ptr::null(),

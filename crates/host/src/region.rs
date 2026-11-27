@@ -32,22 +32,29 @@ pub fn qp_map(width: u32, height: u32, block: u32, damage: Option<&[Rect]>, map:
     map.clear();
     map.resize(bw * bh, 0);
     let Some(rects) = damage else { return };
+    // The rectangles clipped to the picture: (x0, y0, x1, y1), empty ones dropped.
+    let clipped: Vec<(u32, u32, u32, u32)> = rects
+        .iter()
+        .map(|r| {
+            let x1 = r.x.saturating_add(r.w).min(width);
+            let y1 = r.y.saturating_add(r.h).min(height);
+            (r.x, r.y, x1, y1)
+        })
+        .filter(|&(x0, y0, x1, y1)| x0 < x1 && y0 < y1)
+        .collect();
+    let size = |&(x0, y0, x1, y1): &(u32, u32, u32, u32)| f64::from(x1 - x0) * f64::from(y1 - y0);
     let area = f64::from(width) * f64::from(height);
-    let damaged: f64 = rects.iter().map(|r| f64::from(r.w) * f64::from(r.h)).sum();
+    let damaged: f64 = clipped.iter().map(size).sum();
     if area == 0.0 || damaged > area * MAX_SHARE {
         return;
     }
-    for r in rects {
-        if f64::from(r.w) * f64::from(r.h) > area * MAX_RECT_SHARE || r.w == 0 || r.h == 0 {
+    for r in &clipped {
+        if size(r) > area * MAX_RECT_SHARE {
             continue;
         }
-        let x1 = r.x.saturating_add(r.w).min(width);
-        let y1 = r.y.saturating_add(r.h).min(height);
-        if r.x >= x1 || r.y >= y1 {
-            continue;
-        }
-        let (bx0, bx1) = ((r.x / block) as usize, x1.div_ceil(block) as usize);
-        let (by0, by1) = ((r.y / block) as usize, y1.div_ceil(block) as usize);
+        let &(x0, y0, x1, y1) = r;
+        let (bx0, bx1) = ((x0 / block) as usize, x1.div_ceil(block) as usize);
+        let (by0, by1) = ((y0 / block) as usize, y1.div_ceil(block) as usize);
         for by in by0..by1 {
             map[by * bw + bx0..by * bw + bx1].fill(BOOST);
         }

@@ -628,6 +628,8 @@ pub fn another(
         main: None,
         aux: None,
         encoder: None,
+        #[cfg(target_os = "windows")]
+        d3d: None,
         fps,
         bitrate,
     }))

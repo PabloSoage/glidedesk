@@ -333,16 +333,12 @@ pub fn start(
     }
     let r = *cap.bounds.lock().unwrap();
     let size = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
-    info!(
-        width = size.0,
-        height = size.1,
-        "Capturing the {}",
-        if display.is_some() {
-            "virtual display"
-        } else {
-            "primary monitor"
-        }
-    );
+    let what = if display.is_some() {
+        "virtual display"
+    } else {
+        "primary monitor"
+    };
+    info!(width = size.0, height = size.1, "Capturing the {what}");
 
     let (tx, rx) = crate::frame::latest_frame();
     let (cursor_tx, cursor_rx) = watch::channel(None);

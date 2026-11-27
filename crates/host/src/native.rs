@@ -304,6 +304,15 @@ impl Output for NativeOutput {
     fn set_ceiling(&mut self, bps: u32) {
         self.video.ceiling.store(bps, Ordering::Relaxed);
     }
+
+    fn yuv444(&self) -> bool {
+        self.shared
+            .link
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|l| l.yuv444)
+    }
 }
 
 /// The native front end's outputs for the monitors after the first (protocol version 6).
@@ -326,15 +335,6 @@ impl pipeline::MonitorOutputs for NativeMonitors {
             busy_since: None,
             synced: None,
         })
-    }
-
-    fn yuv444(&self) -> bool {
-        self.shared
-            .link
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|l| l.yuv444)
     }
 }
 

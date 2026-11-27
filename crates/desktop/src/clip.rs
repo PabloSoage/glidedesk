@@ -100,7 +100,8 @@ impl Clipboard {
     /// Files copied in the session, fetched to these paths.
     pub fn remote_files(&self, paths: Vec<PathBuf>) {
         let mut s = self.last.lock().unwrap();
-        let Some(cb) = self.owner.lock().unwrap().as_mut() else {
+        let mut owner = self.owner.lock().unwrap();
+        let Some(cb) = owner.as_mut() else {
             return;
         };
         match cb.set().file_list(&paths) {
