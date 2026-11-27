@@ -171,6 +171,7 @@ Useful options of `serve` (`--help` lists them all):
 |---|---|---|
 | `--encoder auto\|nvenc\|vaapi\|software` | `auto` | NVENC if there is an NVIDIA GPU, else VA-API, else x264; an encoder that cannot do HEVC (or hangs on it) serves H.264 |
 | `--max-bitrate BPS` | none | a ceiling for metered or slow links (e.g. `8000000` for mobile data); without it the link decides |
+| `--no-fps-adapt` | off | keep the full frame rate on slow links; by default a low ceiling for the picture size also lowers the frame rate (down to 15 fps) so frames stay sharp |
 | `--refresh HZ` | 120 | refresh rate for RDP clients (native clients use their own screen's) |
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
 | `--avc444` | off | full-chroma AVC444 for RDP clients (experimental: `mstsc` shows it blurred) |
@@ -344,6 +345,71 @@ the RDP port). It is an ordinary program for now: it cannot see or drive the loc
 UAC prompts, the desktop keeps the monitor's size (with several monitors, the primary one is
 shared), and the PC needs a monitor or a dummy plug. Inside a Remote Desktop session it works
 only while that session is shown: a minimized `mstsc` window stops its drawing.
+
+## Over the Internet
+
+The bitrate follows the link by itself (see above), and when the link is too slow for the
+picture size the frame rate drops too (to 15 fps at the least) rather than every frame
+blurring; `--max-bitrate` caps it for metered links. For the lowest latency over the
+Internet use the glidedesk clients: their video goes over UDP with error correction, where
+RDP's TCP stalls on every lost packet.
+
+### Through WireGuard (recommended)
+
+A [WireGuard](https://www.wireguard.com/) tunnel needs one UDP port open and keeps the
+server's own ports off the Internet. On the server (`/etc/wireguard/wg0.conf`, keys from
+`wg genkey | tee private.key | wg pubkey > public.key` on each side):
+
+```ini
+[Interface]
+Address = 10.66.0.1/24
+ListenPort = 51820
+PrivateKey = <server private key>
+
+[Peer]
+PublicKey = <client public key>
+AllowedIPs = 10.66.0.2/32
+```
+
+On the client (the WireGuard app on Windows, Android, macOS and iOS, or `wg-quick` on Linux):
+
+```ini
+[Interface]
+Address = 10.66.0.2/32
+PrivateKey = <client private key>
+
+[Peer]
+PublicKey = <server public key>
+Endpoint = <your public address or DNS name>:51820
+AllowedIPs = 10.66.0.1/32
+PersistentKeepalive = 25
+```
+
+Start it on the server with `sudo systemctl enable --now wg-quick@wg0`, forward **51820/udp**
+on the router to the server, and connect every client to `10.66.0.1` as on a LAN: native
+protocol, RDP, the browser and Moonlight all work through it. The native protocol's datagrams
+(about 1.2 kB) fit WireGuard's default MTU, so nothing is fragmented. Tailscale and other
+WireGuard-based VPNs work the same way.
+
+### Forwarding ports
+
+Without a VPN, forward on the router the ports of the clients you use, to the server:
+
+| Clients | Ports |
+|---|---|
+| glidedesk (native) | 3391/tcp and 3391/udp: the same port number for both (login and control over TCP, video and sound over UDP) |
+| RDP (`mstsc`, FreeRDP) | 3389/tcp; also 3389/udp for RDP's UDP transport |
+| Moonlight (`--gamestream`) | 47984, 47989 and 48010/tcp; 47998, 47999 and 48000/udp |
+
+The browser client is not reachable through port forwarding: its media goes to the address
+the server sees on its own side of the router, so use a VPN for it (or a server with a public
+address). Anything forwarded is open to the whole Internet behind just a password (wrong
+passwords are slowed down per address), so prefer WireGuard.
+
+glidedesk does not open router ports itself with UPnP or NAT-PMP: a remote desktop should
+not become reachable from the Internet without you deciding it, many routers have UPnP off
+(or are behind the provider's carrier-grade NAT, where it cannot help), and a forwarding rule
+or a VPN you set up yourself stays the same across restarts.
 
 ## Building from source
 

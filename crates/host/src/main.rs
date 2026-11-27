@@ -111,6 +111,11 @@ enum Command {
         /// and only their ceiling adapts to the measured delay.
         #[arg(long, env = "GLIDEDESK_MAX_BITRATE")]
         max_bitrate: Option<u32>,
+        /// Keep the full frame rate when the bitrate ceiling drops. By default a low ceiling
+        /// for the picture size (a slow WAN link) also lowers the frame rate, down to 15 fps,
+        /// so each frame keeps enough bits to stay sharp.
+        #[arg(long)]
+        no_fps_adapt: bool,
         #[arg(long, default_value_t = 60)]
         fps: u32,
         /// Size before the client says what it wants.
@@ -250,6 +255,7 @@ async fn main() -> Result<()> {
             encoder,
             render_node,
             max_bitrate,
+            no_fps_adapt,
             fps,
             width,
             height,
@@ -315,6 +321,7 @@ async fn main() -> Result<()> {
                     refine: !no_refine,
                     max_in_flight,
                     max_bitrate,
+                    fps_adapt: !no_fps_adapt,
                 },
                 bind,
                 native_bind: (!no_native).then_some(native_bind),
