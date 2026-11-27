@@ -112,6 +112,11 @@ impl Runner {
         let Some(command) = app.command else {
             return Ok(());
         };
+        // The service's helper runs as SYSTEM: what it started would too, on the user's desktop.
+        #[cfg(windows)]
+        if crate::winservice::is_helper() {
+            bail!("apps cannot be started while the host runs as a service");
+        }
         if self
             .running
             .lock()

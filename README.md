@@ -340,10 +340,42 @@ glidedesk-host serve --bind 0.0.0.0:3392    # 3389 belongs to Windows' own Remot
 ```
 
 The user name is the Windows one. Allow the program in the firewall (3391 TCP and UDP, and
-the RDP port). It is an ordinary program for now: it cannot see or drive the lock screen or
-UAC prompts, the desktop keeps the monitor's size (with several monitors, the primary one is
-shared), and the PC needs a monitor or a dummy plug. Inside a Remote Desktop session it works
-only while that session is shown: a minimized `mstsc` window stops its drawing.
+the RDP port). Run like this it is an ordinary program: it cannot see or drive the lock screen
+or UAC prompts (run it as a service for that, below). The desktop keeps the monitor's size
+(with several monitors, the primary one is shared), and the PC needs a monitor or a dummy
+plug. Inside a Remote Desktop session it works only while that session is shown: a minimized
+`mstsc` window stops its drawing.
+
+### As a service: lock screen, sign-in and UAC
+
+Installed as a service, the host starts with Windows and runs as SYSTEM in the console
+session, so the lock screen, the sign-in screen and UAC prompts are shown and can be used,
+also before anyone has signed in. From an administrator PowerShell:
+
+```powershell
+.\glidedesk-host-windows-x86_64.exe service install -- serve --user <you> --password '...' --bind 0.0.0.0:3392
+.\glidedesk-host-windows-x86_64.exe service uninstall
+```
+
+Everything after `--` is the `serve` command line; the service does not see your shell's
+environment, so give options as arguments (a `GLIDEDESK_PASSWORD` set in the shell is saved
+with them). `--user` is needed: the service's own account name is no use for logging in.
+Installing again updates the arguments and restarts the service. They are kept in
+`%ProgramData%\glidedesk\service.args`, and both the service and the host log to
+`%ProgramData%\glidedesk\host.log`; both files are readable only by administrators. When the
+console session changes (signing out, switching users) the host is restarted there, which
+drops the connection for a moment. The firewall does not ask for a service: allow the program
+yourself, e.g. `New-NetFirewallRule -DisplayName glidedesk -Direction Inbound -Program
+<path to the .exe> -Action Allow`. As a service the host cannot start the apps of
+`apps.conf` (they would run as SYSTEM), and its state folder is SYSTEM's
+(`C:\Windows\System32\config\systemprofile\AppData\Roaming\glidedesk`): clients see a new
+certificate and Moonlight pairs again.
+
+The host asks for realtime GPU priority, so that a game keeping the GPU busy does not delay
+the stream; as a service (or as administrator) it gets it. `GLIDEDESK_GPU_PRIORITY=high` stops
+at high priority (Sunshine does so on NVIDIA GPUs with hardware-accelerated GPU scheduling,
+where realtime has frozen the encoder); for the service it has to be a system environment
+variable, which services see after Windows restarts.
 
 ## Building from source
 

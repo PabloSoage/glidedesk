@@ -34,6 +34,8 @@ and commit, and marked in the file header.
 | `crates/host/src/gamestream/input.rs` (input message layouts) | moonlight-common-c `src/Input.h`, `src/InputStream.c`; Sunshine `src/input.cpp` | `b4ee1ce`; `224c6be` |
 | `crates/host/src/gamestream/gamepad.rs` (controller message, button bits, rumble message) | moonlight-common-c `src/Input.h`, `src/Limelight.h`, `src/ControlStream.c`; Sunshine `src/input.cpp`, `src/stream.cpp` | `b4ee1ce`; `224c6be` |
 | `crates/host/src/gamestream/dualsense.rs` (virtual DualSense over UHID: report descriptor, feature and input reports, rumble) | [inputtino](https://github.com/games-on-whales/inputtino) `src/uhid/joypad_ps5.cpp`, `src/uhid/include/uhid/ps5.hpp` (MIT) | `d28ec79` |
+| `crates/host/src/winservice.rs` (service starting the host in the console session with its SYSTEM token, job object, restart on console session changes) | Sunshine `tools/sunshinesvc.cpp` | `224c6be` |
+| `crates/host/src/winsession.rs` (following the input desktop before duplication and SendInput; SeIncreaseBasePriorityPrivilege, realtime GPU priority and `SetGPUThreadPriority`) | Sunshine `src/platform/windows/misc.cpp` (`syncThreadDesktop`), `src/platform/windows/display_base.cpp` | `224c6be` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).

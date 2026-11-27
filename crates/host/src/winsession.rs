@@ -3,8 +3,9 @@
 //!
 //! The primary monitor is served at its own size (no virtual display yet). Duplication is
 //! lost on a mode change, a full-screen exclusive application or a desktop switch (UAC,
-//! lock screen); the capture thread duplicates the output again until it works. A user
-//! program cannot capture or drive the secure desktop: that needs the service (ADR-0006).
+//! lock screen); the capture thread moves to the input desktop and duplicates the output
+//! again until it works. A user program cannot capture or drive the secure desktop: the
+//! service can (`winservice`).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutputDuplication,
 };
+use windows::Win32::Security::SE_INC_BASE_PRIORITY_NAME;
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, GetUserObjectInformationW,
     OpenInputDesktop, SetThreadDesktop, UOI_NAME,
@@ -436,8 +438,10 @@ impl Capture {
 }
 
 /// Moves the calling thread to the desktop that has the input now (it changes with the lock
-/// screen and UAC prompts); duplication and SendInput only work there. Returns its name.
-fn follow_input_desktop() -> Option<String> {
+/// screen and UAC prompts); duplication, SendInput and mode changes only work there. Returns
+/// its name. Only SYSTEM can open the secure desktop (`Winlogon`): run as the service, the host
+/// follows it there (Sunshine `src/platform/windows/misc.cpp`, `syncThreadDesktop`).
+pub(crate) fn follow_input_desktop() -> Option<String> {
     // SAFETY: the desktop handle is closed after the thread switched to it (the thread keeps
     // its own reference); the name buffer outlives the call.
     unsafe {
@@ -637,11 +641,31 @@ unsafe extern "system" {
 
 /// Asks the GPU scheduler to run this process's work (capture copies, colour conversion,
 /// encoding) ahead of the desktop's: a game that keeps the GPU busy would otherwise delay
-/// every frame (Sunshine does the same). Realtime where the process may, else high.
+/// every frame. Realtime where the process may, else high. Realtime needs
+/// SeIncreaseBasePriorityPrivilege, which administrators and SYSTEM hold but must enable
+/// first (Sunshine `src/platform/windows/display_base.cpp` does both); the service's helper
+/// runs as SYSTEM, so it gets realtime.
+///
+/// `GLIDEDESK_GPU_PRIORITY=high` stops at high (Sunshine does so on NVIDIA with hardware
+/// scheduling, where realtime has frozen the encoder), `normal` leaves it alone.
 fn raise_gpu_priority() {
+    if let Err(e) = crate::winservice::enable_own_privilege(SE_INC_BASE_PRIORITY_NAME) {
+        debug!(
+            error = format!("{e:#}"),
+            "SeIncreaseBasePriorityPrivilege not enabled"
+        );
+    }
+    let classes: &[(i32, &str)] = match std::env::var("GLIDEDESK_GPU_PRIORITY").as_deref() {
+        Ok("normal") => return,
+        Ok("high") => &[(GPU_PRIORITY_HIGH, "high")],
+        _ => &[
+            (GPU_PRIORITY_REALTIME, "realtime"),
+            (GPU_PRIORITY_HIGH, "high"),
+        ],
+    };
     // GetCurrentProcess's pseudo handle.
     let me = -1isize as *mut std::ffi::c_void;
-    for (class, name) in [(GPU_PRIORITY_REALTIME, "realtime"), (GPU_PRIORITY_HIGH, "high")] {
+    for &(class, name) in classes {
         // SAFETY: the pseudo handle of this process and a valid priority class.
         let status = unsafe { D3DKMTSetProcessSchedulingPriorityClass(me, class) };
         if status >= 0 {
