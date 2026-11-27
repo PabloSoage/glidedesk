@@ -1,7 +1,11 @@
 #!/bin/sh
 # Development helper: run a command next to a private headless GNOME Shell.
 #
-#   scripts/dev-session.sh [--app "cmd"] -- glidedesk-host capture-test
+#   scripts/dev-session.sh [--kiosk] [--app "cmd"] -- glidedesk-host capture-test
+#
+# --kiosk runs GNOME Kiosk instead of GNOME Shell: no desktop, every window full screen, for a
+# host that serves single apps (apps.conf) rather than a desktop. Kiosk is Mutter too, so
+# capture, input and clipboard work the same. GLIDEDESK_KIOSK_ARGS replaces its flags.
 #
 # Starts its own D-Bus session bus (dbus-run-session), so it does not touch any
 # desktop session the user already has. GNOME Shell is stopped by PID on exit.
@@ -10,6 +14,8 @@ if [ -z "${GLIDEDESK_IN_BUS:-}" ]; then
   GLIDEDESK_IN_BUS=1 exec dbus-run-session -- "$0" "$@"
 fi
 app=""
+kiosk=""
+if [ "${1:-}" = "--kiosk" ]; then kiosk=1; shift; fi
 if [ "${1:-}" = "--app" ]; then app="$2"; shift 2; fi
 [ "${1:-}" = "--" ] && shift
 
@@ -39,7 +45,12 @@ export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-GNOME}" XDG_SESSION_TYPE=wayl
 # that framebuffer) would carry it although the client draws its own pointer.
 # GLIDEDESK_SHELL_ARGS: extra gnome-shell flags for tests (e.g. --unsafe-mode for Shell.Eval).
 # shellcheck disable=SC2086
-CLUTTER_PAINT="${CLUTTER_PAINT:-disable-clipped-redraws}" gnome-shell --headless --no-x11 $mode ${GLIDEDESK_SHELL_ARGS:-} >"$log" 2>&1 &
+if [ -n "$kiosk" ]; then
+  command -v gnome-kiosk >/dev/null || { echo "--kiosk needs gnome-kiosk installed" >&2; exit 1; }
+  CLUTTER_PAINT="${CLUTTER_PAINT:-disable-clipped-redraws}" gnome-kiosk ${GLIDEDESK_KIOSK_ARGS:---headless --no-x11} >"$log" 2>&1 &
+else
+  CLUTTER_PAINT="${CLUTTER_PAINT:-disable-clipped-redraws}" gnome-shell --headless --no-x11 $mode ${GLIDEDESK_SHELL_ARGS:-} >"$log" 2>&1 &
+fi
 shell=$!
 trap 'kill -9 $shell $helpers 2>/dev/null || true' EXIT INT TERM
 
@@ -47,7 +58,7 @@ trap 'kill -9 $shell $helpers 2>/dev/null || true' EXIT INT TERM
 i=0
 until gdbus introspect --session --dest org.gnome.Mutter.RemoteDesktop \
       --object-path /org/gnome/Mutter/RemoteDesktop >/dev/null 2>&1; do
-  i=$((i + 1)); [ $i -gt 100 ] && { echo "gnome-shell did not start, see $log" >&2; exit 1; }
+  i=$((i + 1)); [ $i -gt 100 ] && { echo "the compositor did not start, see $log" >&2; exit 1; }
   sleep 0.1
 done
 export WAYLAND_DISPLAY

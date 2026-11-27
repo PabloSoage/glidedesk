@@ -193,9 +193,12 @@ Terminal = gnome-terminal
 A client that asks for one (`glidedesk <server> --app Firefox`, the **App** field of the
 connection window, or `app = "Firefox"` in a `.glidedesk` profile) gets it started in the
 session, and the session ends when the app does. An app that is already running is reused. On
-Windows the app's window is maximized; on GNOME it opens as a normal window for now. Native
-protocol only (RDP clients get the desktop). Apps that start another process and exit at once
-(launchers) keep the session open.
+Windows the app's window is maximized. On GNOME it opens as a normal window on the desktop; for
+a host that serves only apps, start the session with GNOME Kiosk instead (every window full
+screen, no desktop): `glidedesk-session.sh --kiosk -- glidedesk-host serve` (package
+`gnome-kiosk`). The native protocol, the web page and Moonlight can choose an app; RDP clients
+get the desktop (IronRDP does not pass on the client's alternate shell). Apps that start another
+process and exit at once (launchers) keep the session open.
 
 ### Moonlight
 
