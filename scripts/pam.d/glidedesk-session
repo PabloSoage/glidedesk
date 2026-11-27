@@ -1,0 +1,7 @@
+# PAM service of glidedesk-session@.service (systemd's PAMName=): opens a logind session
+# for the user through pam_systemd, which common-session includes. Debian, Ubuntu:
+#   sudo cp scripts/pam.d/glidedesk-session /etc/pam.d/glidedesk-session
+# Fedora and Arch name the shared stacks differently: `system-auth` (Fedora) or
+# `system-login` (Arch) there.
+account  include  common-account
+session  include  common-session

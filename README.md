@@ -121,6 +121,7 @@ fingerprint). The details of every server and client follow below.
 | Desktop follows the window | FreeRDP: yes. `mstsc`: not yet | yes | yes |
 | Sound | yes | yes (desktop and Termux clients) | yes (Opus) |
 | Clipboard | text and files | text (desktop client) | not yet |
+| Local drives and printers | not yet (see below) | no | no |
 | Pointer | drawn by the client | drawn by the client | drawn by the browser |
 
 Use RDP or the browser when you cannot install anything; use the glidedesk client for the
@@ -171,6 +172,7 @@ Useful options of `serve` (`--help` lists them all):
 |---|---|---|
 | `--encoder auto\|nvenc\|vaapi\|software` | `auto` | NVENC if there is an NVIDIA GPU, else VA-API, else x264; an encoder that cannot do HEVC (or hangs on it) serves H.264 |
 | `--max-bitrate BPS` | none | a ceiling for metered or slow links (e.g. `8000000` for mobile data); without it the link decides |
+| `--no-fps-adapt` | off | keep the full frame rate on slow links; by default a low ceiling for the picture size also lowers the frame rate (down to 15 fps) so frames stay sharp |
 | `--refresh HZ` | 120 | refresh rate for RDP clients (native clients use their own screen's) |
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
 | `--avc444` | off | full-chroma AVC444 for RDP clients (experimental: `mstsc` shows it blurred) |
@@ -239,6 +241,36 @@ If the "Stop screen sharing" button in GNOME's top bar is pressed, the server st
 session by itself within about a second; clients stay connected. Windows that were full
 screen or maximized come back as normal windows (Mutter moves them off the closed monitor).
 
+### As a system service (preview, native protocol only)
+
+Instead of starting the server by hand in a session, `glidedesk-host daemon` can run as a
+systemd service: clients then log in with **their own Linux user name and password**, and
+each user gets a headless GNOME session of their own, started on their first login and kept
+when they disconnect (the next login takes it over). As root:
+
+```sh
+install glidedesk-host /usr/local/bin/
+install scripts/dev-session.sh /usr/local/bin/glidedesk-session.sh   # the release's glidedesk-session.sh
+cp scripts/systemd/glidedesk.service scripts/systemd/glidedesk-session@.service /etc/systemd/system/
+cp scripts/pam.d/glidedesk scripts/pam.d/glidedesk-session /etc/pam.d/   # Fedora, Arch: see the files
+systemctl daemon-reload && systemctl enable --now glidedesk
+```
+
+The daemon listens on 3391 (TCP and UDP) and checks passwords through PAM; system accounts
+(below uid 1000) and root cannot log in. A session runs as
+`glidedesk-session@USER.service` (`systemctl stop glidedesk-session@USER` ends it,
+`journalctl -u glidedesk-session@USER` shows its log). The certificate clients pin is in
+`/var/lib/glidedesk/`. With several GPUs, `--gpus 0,1` (CUDA devices) or
+`--gpus /dev/dri/renderD128,/dev/dri/renderD129` (VA-API) gives each new session the GPU
+with the fewest sessions, and `--pin-gpu USER=INDEX` keeps a user on one of them (add them
+with `systemctl edit glidedesk`). GNOME Shell itself still draws every session on its
+primary GPU; if a session on another GPU shows no picture, add `GLIDEDESK_NO_DMABUF=1` to
+the session unit (`systemctl edit glidedesk-session@`), which copies frames through memory.
+
+Not in this mode yet: RDP (its NLA has to check the password itself, which PAM does not
+allow), the web client and Moonlight; they keep working from a plain `serve` in a user
+session, with `--no-native` since the daemon holds 3391.
+
 ## Clients
 
 ### Windows: Remote Desktop (`mstsc`)
@@ -246,6 +278,16 @@ screen or maximized come back as normal windows (Mutter moves them off the close
 `mstsc /v:<server>`, user name = your Linux user, password = `GLIDEDESK_PASSWORD`. Accept the
 self-signed certificate the first time. Full screen works; resizing the `mstsc` window does
 not change the remote resolution yet (FreeRDP's `/dynamic-resolution` does).
+
+Sound and the clipboard (text and files) work over RDP. The client's drives and
+printers are not offered in the session yet: the IronRDP version glidedesk is built on never
+tells the client that the user has logged on (`PAKID_CORE_USER_LOGGEDON`), which FreeRDP (and,
+as the protocol describes, `mstsc`) waits for before announcing them, and it keeps the kind of
+each announced device to itself. Newer IronRDP has both; the plan for drives is then a folder
+in the session (a FUSE mount, as xrdp does). Printing will stay limited even so: `mstsc`
+prints through Easy Print (XPS over a channel of its own, which IronRDP does not implement)
+or wants data in the printer driver's own language, so only clients that take PDF or
+PostScript, such as FreeRDP printing through CUPS, could get print jobs.
 
 ### Windows and Linux: `glidedesk`
 
@@ -347,6 +389,71 @@ the RDP port). It is an ordinary program for now: it cannot see or drive the loc
 UAC prompts, the desktop keeps the monitor's size (with several monitors, the primary one is
 shared), and the PC needs a monitor or a dummy plug. Inside a Remote Desktop session it works
 only while that session is shown: a minimized `mstsc` window stops its drawing.
+
+## Over the Internet
+
+The bitrate follows the link by itself (see above), and when the link is too slow for the
+picture size the frame rate drops too (to 15 fps at the least) rather than every frame
+blurring; `--max-bitrate` caps it for metered links. For the lowest latency over the
+Internet use the glidedesk clients: their video goes over UDP with error correction, where
+RDP's TCP stalls on every lost packet.
+
+### Through WireGuard (recommended)
+
+A [WireGuard](https://www.wireguard.com/) tunnel needs one UDP port open and keeps the
+server's own ports off the Internet. On the server (`/etc/wireguard/wg0.conf`, keys from
+`wg genkey | tee private.key | wg pubkey > public.key` on each side):
+
+```ini
+[Interface]
+Address = 10.66.0.1/24
+ListenPort = 51820
+PrivateKey = <server private key>
+
+[Peer]
+PublicKey = <client public key>
+AllowedIPs = 10.66.0.2/32
+```
+
+On the client (the WireGuard app on Windows, Android, macOS and iOS, or `wg-quick` on Linux):
+
+```ini
+[Interface]
+Address = 10.66.0.2/32
+PrivateKey = <client private key>
+
+[Peer]
+PublicKey = <server public key>
+Endpoint = <your public address or DNS name>:51820
+AllowedIPs = 10.66.0.1/32
+PersistentKeepalive = 25
+```
+
+Start it on the server with `sudo systemctl enable --now wg-quick@wg0`, forward **51820/udp**
+on the router to the server, and connect every client to `10.66.0.1` as on a LAN: native
+protocol, RDP, the browser and Moonlight all work through it. The native protocol's datagrams
+(about 1.2 kB) fit WireGuard's default MTU, so nothing is fragmented. Tailscale and other
+WireGuard-based VPNs work the same way.
+
+### Forwarding ports
+
+Without a VPN, forward on the router the ports of the clients you use, to the server:
+
+| Clients | Ports |
+|---|---|
+| glidedesk (native) | 3391/tcp and 3391/udp: the same port number for both (login and control over TCP, video and sound over UDP) |
+| RDP (`mstsc`, FreeRDP) | 3389/tcp; also 3389/udp for RDP's UDP transport |
+| Moonlight (`--gamestream`) | 47984, 47989 and 48010/tcp; 47998, 47999 and 48000/udp |
+
+The browser client is not reachable through port forwarding: its media goes to the address
+the server sees on its own side of the router, so use a VPN for it (or a server with a public
+address). Anything forwarded is open to the whole Internet behind just a password (wrong
+passwords are slowed down per address), so prefer WireGuard.
+
+glidedesk does not open router ports itself with UPnP or NAT-PMP: a remote desktop should
+not become reachable from the Internet without you deciding it, many routers have UPnP off
+(or are behind the provider's carrier-grade NAT, where it cannot help), and a forwarding rule
+or a VPN you set up yourself stays the same across restarts.
 
 ## Building from source
 

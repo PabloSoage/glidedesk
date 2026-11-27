@@ -42,6 +42,8 @@ pub struct ServeOptions {
     pub bind: SocketAddr,
     /// Native protocol (TCP + UDP); `None` turns it off.
     pub native_bind: Option<SocketAddr>,
+    /// Where native clients come from: that address, or the system daemon.
+    pub native_listen: crate::native::Listen,
     /// Web client (HTTPS + WebRTC); `None` turns it off.
     #[cfg(feature = "web")]
     pub web_bind: Option<SocketAddr>,
@@ -230,8 +232,13 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let mut outputs: Vec<Box<dyn Output>> = vec![Box::new(rdp_output)];
     let native = match opts.native_bind {
         Some(bind) => {
-            let (output, server) =
-                crate::native::new(Arc::clone(&shared), outputs.len(), bind).await?;
+            let (output, server) = crate::native::new(
+                Arc::clone(&shared),
+                outputs.len(),
+                bind,
+                opts.native_listen.clone(),
+            )
+            .await?;
             outputs.push(Box::new(output));
             Some((server, bind))
         }

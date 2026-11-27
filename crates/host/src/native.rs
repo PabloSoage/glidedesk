@@ -4,6 +4,10 @@
 //! UDP on the same port carries the video, in Reed-Solomon protected shards, and the audio,
 //! every datagram sealed with the session key. The pipeline thread sends video straight
 //! from [`NativeOutput`]; a tokio task per connection runs the control channel.
+//!
+//! Under the system daemon ([`Listen::Handover`]) clients arrive already logged in over a
+//! Unix socket instead, and the UDP socket is on the loopback, where the daemon relays the
+//! (still sealed) datagrams.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
@@ -285,21 +289,50 @@ pub struct Front {
     pub apps: Arc<crate::apps::Runner>,
 }
 
+/// How native clients reach the host.
+#[derive(Clone, Debug)]
+pub enum Listen {
+    /// TLS over TCP on the bind address, UDP on the same port.
+    Tcp,
+    /// Clients the system daemon logged in, over this Unix socket ([`crate::handover`]);
+    /// UDP on a loopback port the daemon relays to.
+    #[cfg(target_os = "linux")]
+    Handover(std::path::PathBuf),
+}
+
+enum Listener {
+    Tcp(TcpListener),
+    #[cfg(target_os = "linux")]
+    Handover(std::path::PathBuf),
+}
+
 pub struct Server {
     shared: Arc<Shared>,
-    tcp: TcpListener,
+    listener: Listener,
 }
 
 /// The native front end as output `index` of the pipeline: the output, and the server to
-/// run. Binds the TCP and UDP ports right away.
+/// run. Binds the TCP and UDP ports right away (with [`Listen::Handover`], only UDP, on
+/// the loopback).
 pub async fn new(
     session: Arc<pipeline::Shared>,
     index: usize,
     bind: SocketAddr,
+    listen: Listen,
 ) -> Result<(NativeOutput, Server)> {
-    let tcp = TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("binding TCP {bind}"))?;
+    let (listener, bind) = match listen {
+        Listen::Tcp => {
+            let tcp = TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("binding TCP {bind}"))?;
+            (Listener::Tcp(tcp), bind)
+        }
+        #[cfg(target_os = "linux")]
+        Listen::Handover(path) => (
+            Listener::Handover(path),
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        ),
+    };
     let udp = {
         let s = socket2::Socket::new(
             socket2::Domain::for_address(bind),
@@ -333,7 +366,7 @@ pub async fn new(
             busy_since: None,
             synced: None,
         },
-        Server { shared, tcp },
+        Server { shared, listener },
     ))
 }
 
@@ -353,8 +386,6 @@ pub(crate) fn tls_config(dir: &Path) -> Result<Arc<rustls::ServerConfig>> {
 
 impl Server {
     pub async fn run(self, front: Front) -> Result<()> {
-        crate::rdp::ensure_identity(&front.state_dir)?;
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config(&front.state_dir)?);
         let front = Arc::new(front);
         {
             let shared = Arc::clone(&self.shared);
@@ -366,9 +397,16 @@ impl Server {
             let shared = Arc::clone(&self.shared);
             tokio::spawn(audio_task(shared, audio));
         }
+        let tcp = match self.listener {
+            Listener::Tcp(tcp) => tcp,
+            #[cfg(target_os = "linux")]
+            Listener::Handover(path) => return run_handover(&path, self.shared, front).await,
+        };
+        crate::rdp::ensure_identity(&front.state_dir)?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config(&front.state_dir)?);
         info!(bind = %front.bind, "Listening for native clients");
         loop {
-            let (tcp, peer) = self.tcp.accept().await?;
+            let (tcp, peer) = tcp.accept().await?;
             let _ = tcp.set_nodelay(true);
             let (acceptor, shared, front) = (
                 acceptor.clone(),
@@ -379,12 +417,36 @@ impl Server {
                 info!(%peer, "Native client connecting");
                 let r = async {
                     let tls = acceptor.accept(tcp).await.context("TLS handshake")?;
-                    connection(tls, peer, &shared, &front).await
+                    connection(tls, peer, &shared, &front, false).await
                 }
                 .await;
                 info!(%peer, error = ?r.err().map(|e| format!("{e:#}")), "Native client disconnected");
             });
         }
+    }
+}
+
+/// Takes the clients the system daemon hands over on the Unix socket at `path`.
+#[cfg(target_os = "linux")]
+async fn run_handover(path: &Path, shared: Arc<Shared>, front: Arc<Front>) -> Result<()> {
+    let listener = crate::handover::listen(path)?;
+    let udp_port = shared.udp.local_addr()?.port();
+    info!(socket = %path.display(), udp_port, "Waiting for clients from the system daemon");
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let (shared, front) = (Arc::clone(&shared), Arc::clone(&front));
+        tokio::spawn(async move {
+            let peer = match crate::handover::accept(&mut stream, udp_port).await {
+                Ok(peer) => peer,
+                Err(e) => {
+                    warn!(error = format!("{e:#}"), "Handover refused");
+                    return;
+                }
+            };
+            info!(%peer, "Native client handed over by the daemon");
+            let r = connection(stream, peer, &shared, &front, true).await;
+            info!(%peer, error = ?r.err().map(|e| format!("{e:#}")), "Native client disconnected");
+        });
     }
 }
 
@@ -455,11 +517,14 @@ fn cursor_msg(ev: &CursorEvent) -> ServerMsg {
     }
 }
 
+/// One client. `logged_in`: the system daemon already checked its password (a handed-over
+/// client), so it is not checked again.
 async fn connection<S>(
     stream: S,
     peer: SocketAddr,
     shared: &Arc<Shared>,
     front: &Front,
+    logged_in: bool,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -479,7 +544,7 @@ where
         bail!("expected Hello");
     };
     let ip = peer.ip();
-    if let Some(wait) = front.auth_limiter.check(ip) {
+    if !logged_in && let Some(wait) = front.auth_limiter.check(ip) {
         let reason = format!(
             "too many failed attempts; try again in {:.0}s",
             wait.as_secs_f64().max(1.0)
@@ -487,8 +552,8 @@ where
         glidedesk_proto::write_msg(&mut wr, &ServerMsg::Denied(reason.clone())).await?;
         bail!("denied for {peer}: {reason}");
     }
-    let valid_creds =
-        crate::auth::verify_credentials(&front.username, &front.password, &user, &password);
+    let valid_creds = logged_in
+        || crate::auth::verify_credentials(&front.username, &front.password, &user, &password);
     let deny = if !(glidedesk_proto::MIN_VERSION..=glidedesk_proto::VERSION).contains(&version) {
         Some(format!(
             "protocol version {version}, server speaks {} to {}",

@@ -128,6 +128,9 @@ pub struct Options {
     pub max_in_flight: u32,
     /// Highest bitrate the rate control may reach (`--max-bitrate`); none: the link decides.
     pub max_bitrate: Option<u32>,
+    /// Lower the frame rate when the ceiling is too low for the picture size
+    /// ([`crate::rate::frame_interval`]).
+    pub fps_adapt: bool,
 }
 
 pub struct Pipeline {
@@ -141,6 +144,10 @@ pub struct Pipeline {
     last_frame: Option<Frame>,
     /// The newest frame could not be sent (back pressure) and is waiting for a slot.
     pending: bool,
+    /// The newest frame came sooner than the frame-rate cap allows and waits until then.
+    held_until: Option<Instant>,
+    /// When the last picture went out, for the frame-rate cap.
+    last_sent: Option<Instant>,
     /// When the last new frame arrived from the compositor.
     last_new_frame: Instant,
     /// Frames went out luma-only (AVC444 LC=1) while things moved; the chroma of the
@@ -206,6 +213,8 @@ impl Pipeline {
             generation: 0,
             last_frame: None,
             pending: false,
+            held_until: None,
+            last_sent: None,
             last_new_frame: Instant::now(),
             chroma_owed: false,
             need_full: true,
@@ -242,6 +251,10 @@ impl Pipeline {
             let new_client = generation != self.generation;
             let wait = if self.pending {
                 2
+            } else if let Some(due) = self.held_until {
+                due.saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .clamp(1, 50) as u64
             } else if self.refine_left > 0 {
                 REFINE_INTERVAL.as_millis() as u64
             } else {
@@ -267,6 +280,23 @@ impl Pipeline {
                 } else {
                     0
                 };
+                // Too soon for the frame-rate cap: it waits (a newer frame replaces it).
+                if !new_client
+                    && !self.pending
+                    && let Some(due) = self.next_frame_due()
+                    && due > Instant::now()
+                {
+                    self.held_until = Some(due);
+                    continue;
+                }
+            } else if let Some(due) = self.held_until {
+                if Instant::now() < due && !new_client {
+                    continue;
+                }
+                // The held frame is due: same choice as when it came in.
+                if self.opts.hybrid && self.last_new_frame.elapsed() < MOTION_GAP {
+                    mode = Mode::LumaOnly;
+                }
             } else if self.pending {
                 // Retrying a frame held back by back pressure: same choice as when it came in.
                 if self.opts.hybrid && self.last_new_frame.elapsed() < MOTION_GAP {
@@ -304,6 +334,7 @@ impl Pipeline {
                 }
                 mode = Mode::Full;
             }
+            self.held_until = None;
             if let Err(e) = self.send(&frame, mode) {
                 warn!(%e, "Sending a frame failed");
             }
@@ -336,6 +367,16 @@ impl Pipeline {
                 warn!(%e, "Changing the bitrate failed");
             }
         }
+    }
+
+    /// When the next new frame may go out under the frame-rate cap, if there is one.
+    fn next_frame_due(&self) -> Option<Instant> {
+        if !self.opts.fps_adapt {
+            return None;
+        }
+        let (w, h) = *self.shared.current_size.lock().unwrap();
+        let interval = crate::rate::frame_interval(self.rate.bps(), w, h)?;
+        Some(self.last_sent? + interval)
     }
 
     fn active_wants_refresh(&self) -> bool {
@@ -421,6 +462,9 @@ impl Pipeline {
         self.need_full = false;
         self.chroma_owed = avc444 && mode == Mode::LumaOnly;
         self.pending = false;
+        if self.refine_qp.is_none() {
+            self.last_sent = Some(t_send);
+        }
 
         let bytes = main.data.len() + aux.data.len();
         let s = &mut self.stats;

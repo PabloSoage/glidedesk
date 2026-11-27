@@ -1,0 +1,29 @@
+# glidedesk as a system service: native clients log in with their own Linux account and
+# each user gets a headless GNOME session of their own (glidedesk-session@.service).
+# See "As a system service" in the README:
+#   sudo install glidedesk-host /usr/local/bin/
+#   sudo install scripts/dev-session.sh /usr/local/bin/glidedesk-session.sh
+#   sudo cp scripts/systemd/glidedesk.service scripts/systemd/glidedesk-session@.service /etc/systemd/system/
+#   sudo cp scripts/pam.d/glidedesk scripts/pam.d/glidedesk-session /etc/pam.d/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now glidedesk
+# Options (e.g. --gpus 0,1) go on ExecStart, through `sudo systemctl edit glidedesk`.
+
+[Unit]
+Description=glidedesk remote desktop
+After=network-online.target systemd-user-sessions.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/glidedesk-host daemon
+Environment=RUST_LOG=info
+# /run/glidedesk/sessions: the GPU of each session; kept across restarts of the daemon,
+# as the sessions themselves are.
+RuntimeDirectory=glidedesk
+RuntimeDirectoryPreserve=yes
+# /var/lib/glidedesk: the TLS identity clients pin.
+StateDirectory=glidedesk
+StateDirectoryMode=0700
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

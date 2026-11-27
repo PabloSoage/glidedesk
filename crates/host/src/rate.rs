@@ -9,6 +9,10 @@
 //!   queuing somewhere (Wi-Fi, a mobile link, a slow uplink): the ceiling drops at once.
 //! - While the delay stays near the floor and frames actually use the ceiling, it climbs
 //!   back step by step, up to the user's limit (`--max-bitrate`) if any.
+//!
+//! When the ceiling is low for the picture size (a slow WAN link, mobile data), the frame
+//! rate gives way too ([`frame_interval`]): fewer frames, each with enough bits to stay
+//! legible, rather than many blurred ones.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -218,6 +222,25 @@ impl Rate {
     }
 }
 
+/// Bits per pixel a moving frame should get at least before the frame rate gives way:
+/// about 100 kbit for a 1080p frame, a usable picture for text and video.
+const MIN_BITS_PER_PIXEL: f64 = 0.05;
+/// The frame rate is never capped below this (motion stays readable).
+const MIN_CAPPED_FPS: f64 = 15.0;
+/// Caps at or above this are no cap: no session produces more frames.
+const NO_CAP_FPS: f64 = 240.0;
+
+/// Least time between frames so that, at a ceiling of `bps`, each `width`×`height` frame
+/// can get [`MIN_BITS_PER_PIXEL`]; `None` when the ceiling is high enough for any rate.
+pub fn frame_interval(bps: u32, width: u32, height: u32) -> Option<Duration> {
+    let pixels = f64::from(width) * f64::from(height);
+    if pixels < 1.0 {
+        return None;
+    }
+    let fps = (f64::from(bps) / (pixels * MIN_BITS_PER_PIXEL)).max(MIN_CAPPED_FPS);
+    (fps < NO_CAP_FPS).then(|| Duration::from_secs_f64(1.0 / fps))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +322,27 @@ mod tests {
         assert_eq!(r.loss_at(0.2, t + CUT_HOLD / 2), None);
         // 6 % lost: the mildest cut, to 85 %.
         assert_eq!(r.loss_at(0.06, t + CUT_HOLD), Some(25_500_000));
+    }
+
+    fn fps(interval: Option<Duration>) -> Option<u32> {
+        interval.map(|d| (1.0 / d.as_secs_f64()).round() as u32)
+    }
+
+    #[test]
+    fn frame_rate_gives_way_only_on_low_ceilings() {
+        // LAN-like ceilings: no cap at any size.
+        assert_eq!(frame_interval(START_BPS, 1920, 1080), None);
+        assert_eq!(frame_interval(TOP_BPS, 3840, 2160), None);
+        // 1080p: 10 Mbit/s still allows ~97 fps, 4 Mbit/s ~39.
+        assert_eq!(fps(frame_interval(10_000_000, 1920, 1080)), Some(96));
+        assert_eq!(fps(frame_interval(4_000_000, 1920, 1080)), Some(39));
+        // 4K needs four times the bits for the same rate.
+        assert_eq!(fps(frame_interval(20_000_000, 3840, 2160)), Some(48));
+        // Never below the floor, even at the lowest ceiling.
+        assert_eq!(fps(frame_interval(MIN_BPS, 1920, 1080)), Some(15));
+        // A small window on the same link is not capped.
+        assert_eq!(frame_interval(10_000_000, 640, 360), None);
+        assert_eq!(frame_interval(1_000_000, 0, 0), None);
     }
 
     #[test]

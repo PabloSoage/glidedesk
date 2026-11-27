@@ -1,0 +1,22 @@
+# One user's headless GNOME session under the glidedesk daemon, which starts it as
+# glidedesk-session@USER.service the first time USER logs in. It stays when the client
+# leaves (the next login takes it over); to end it:
+#   sudo systemctl stop glidedesk-session@USER
+
+[Unit]
+Description=glidedesk session of %i
+After=systemd-user-sessions.service
+
+[Service]
+User=%i
+# A logind session of its own through /etc/pam.d/glidedesk-session (pam_systemd): the
+# user's runtime directory, systemd user manager and PipeWire.
+PAMName=glidedesk-session
+Environment=XDG_SESSION_CLASS=user
+# The GPU the daemon chose: GLIDEDESK_GPU, or GLIDEDESK_ENCODER and GLIDEDESK_RENDER_NODE.
+EnvironmentFile=-/run/glidedesk/sessions/%i.env
+WorkingDirectory=~
+# The release's glidedesk-session.sh is scripts/dev-session.sh: a private session bus and
+# a headless GNOME Shell, with the host next to it.
+ExecStart=/usr/local/bin/glidedesk-session.sh -- /usr/local/bin/glidedesk-host serve --handover
+Restart=no
