@@ -13,8 +13,8 @@ mod android {
     use glidedesk_client::gfx::{SharedSink, VideoCodec, VideoSink};
     use glidedesk_client::session::{ConnectOptions, Input, run};
     use jni::JNIEnv;
-    use jni::objects::{JClass, JObject, JString};
-    use jni::sys::{jboolean, jint, jlong, jstring};
+    use jni::objects::{JClass, JObject, JObjectArray, JString};
+    use jni::sys::{jboolean, jint, jlong, jobjectArray, jstring};
     use ndk::media::media_codec::{
         DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
     };
@@ -124,6 +124,11 @@ mod android {
         error: Option<String>,
         /// The link is poor (native protocol): a line to show over the desktop.
         warning: Option<String>,
+        /// Copied in the session and not yet put on the phone's clipboard.
+        clip_text: Option<String>,
+        clip_files: Option<Vec<String>>,
+        /// The apps the server can open (native protocol).
+        apps: Vec<String>,
     }
 
     struct Session {
@@ -150,6 +155,16 @@ mod android {
         fn link_warning(&mut self, warning: Option<&str>) {
             self.status.lock().unwrap().warning = warning.map(str::to_owned);
         }
+        fn clipboard(&mut self, text: &str) {
+            self.status.lock().unwrap().clip_text = Some(text.to_owned());
+        }
+        fn files(&mut self, paths: Vec<std::path::PathBuf>) {
+            self.status.lock().unwrap().clip_files =
+                Some(paths.iter().map(|p| p.to_string_lossy().into_owned()).collect());
+        }
+        fn apps(&mut self, names: &[String]) {
+            self.status.lock().unwrap().apps = names.to_vec();
+        }
     }
 
     fn session<'a>(handle: jlong) -> Option<&'a Session> {
@@ -173,7 +188,9 @@ mod android {
         height: jint,
         native: jboolean,
         refresh: jint,
+        app: JString,
     ) -> jlong {
+        let app = Some(string(&mut env, &app)).filter(|a| !a.trim().is_empty());
         let opts = ConnectOptions {
             host: string(&mut env, &host),
             port: port as u16,
@@ -219,8 +236,7 @@ mod android {
                     codecs: vec![VideoCodec::Hevc, VideoCodec::H264],
                     refresh: refresh.clamp(30, 240) as u32,
                     trust: Default::default(),
-                    // Choosing an app in the Android UI is still to do.
-                    app: None,
+                    app,
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await
@@ -419,6 +435,98 @@ mod android {
         env.new_string(msg)
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Text copied in the session since the last call, or null.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_io_github_pablosoage_glidedesk_NativeSession_nativeTakeClipboard(
+        env: JNIEnv,
+        _c: JClass,
+        h: jlong,
+    ) -> jstring {
+        let Some(text) = session(h).and_then(|s| s.status.lock().unwrap().clip_text.take()) else {
+            return std::ptr::null_mut();
+        };
+        env.new_string(text)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    fn string_array(env: &mut JNIEnv, items: &[String]) -> jobjectArray {
+        let Ok(array) = env.new_object_array(items.len() as i32, "java/lang/String", JObject::null())
+        else {
+            return std::ptr::null_mut();
+        };
+        for (i, item) in items.iter().enumerate() {
+            let Ok(s) = env.new_string(item) else {
+                return std::ptr::null_mut();
+            };
+            if env.set_object_array_element(&array, i as i32, &s).is_err() {
+                return std::ptr::null_mut();
+            }
+        }
+        array.into_raw()
+    }
+
+    /// Files copied in the session and fetched since the last call (paths in the app's
+    /// cache), or null.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_io_github_pablosoage_glidedesk_NativeSession_nativeTakeFiles(
+        mut env: JNIEnv,
+        _c: JClass,
+        h: jlong,
+    ) -> jobjectArray {
+        let Some(files) = session(h).and_then(|s| s.status.lock().unwrap().clip_files.take()) else {
+            return std::ptr::null_mut();
+        };
+        string_array(&mut env, &files)
+    }
+
+    /// The apps the server offers (empty until logged in, or with older servers).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_io_github_pablosoage_glidedesk_NativeSession_nativeApps(
+        mut env: JNIEnv,
+        _c: JClass,
+        h: jlong,
+    ) -> jobjectArray {
+        let apps = session(h)
+            .map(|s| s.status.lock().unwrap().apps.clone())
+            .unwrap_or_default();
+        string_array(&mut env, &apps)
+    }
+
+    /// Text copied on the phone.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_io_github_pablosoage_glidedesk_NativeSession_nativeClipboard(
+        mut env: JNIEnv,
+        _c: JClass,
+        h: jlong,
+        text: JString,
+    ) {
+        let text = string(&mut env, &text);
+        send(h, Input::Clipboard(text));
+    }
+
+    /// Files copied on the phone, copied into the app's cache first (paths).
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_io_github_pablosoage_glidedesk_NativeSession_nativeFiles(
+        mut env: JNIEnv,
+        _c: JClass,
+        h: jlong,
+        paths: JObjectArray,
+    ) {
+        let n = env.get_array_length(&paths).unwrap_or(0);
+        let mut list = Vec::new();
+        for i in 0..n {
+            let Ok(obj) = env.get_object_array_element(&paths, i) else {
+                continue;
+            };
+            let s = JString::from(obj);
+            list.push(std::path::PathBuf::from(string(&mut env, &s)));
+        }
+        if !list.is_empty() {
+            send(h, Input::Files(list));
+        }
     }
 
     #[unsafe(no_mangle)]

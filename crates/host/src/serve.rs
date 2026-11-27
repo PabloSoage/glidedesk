@@ -314,6 +314,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
     #[cfg(feature = "web")]
     let web_limiter = Arc::clone(&auth_limiter);
+    let web_apps = Arc::clone(&apps);
     #[cfg(feature = "web")]
     let web = async {
         match web {
@@ -331,6 +332,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
                         input: input.clone(),
                         clipboard: parts.text_clipboard.clone(),
                         auth_limiter: web_limiter,
+                        apps: Arc::clone(&web_apps),
                     })
                     .await
             }

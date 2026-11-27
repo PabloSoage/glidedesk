@@ -7,6 +7,7 @@
 
 pub mod crypto;
 pub mod fec;
+pub mod files;
 pub mod link;
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// - 2: [`ClientMsg::InvalidateFrames`] and the recovery flag on video packets.
 /// - 3: apps: [`ServerMsg::Apps`], [`ClientMsg::OpenApp`], [`ServerMsg::AppExited`].
-/// - 4: [`ClientMsg::LinkReport`]: the server adapts parity, pacing and bitrate to losses.
+/// - 4: [`ClientMsg::LinkReport`]: the server adapts parity, pacing and bitrate to losses;
+///   files on the clipboard ([`files`]: `Files`, `FileRead`, `FileData` both ways).
 pub const VERSION: u32 = 4;
 /// Oldest client version a server accepts (it then uses only what that version knows).
 pub const MIN_VERSION: u32 = 1;
@@ -92,6 +94,42 @@ pub enum ClientMsg {
     /// (Version 4.) About once a second: UDP packets received and lost since the last
     /// report, counted from their sequence numbers ([`link::LossCounter`]).
     LinkReport { received: u32, lost: u32 },
+    /// (Version 4.) The client copied files ([`files`]); a new `id` for each copy.
+    Files { id: u32, entries: Vec<FileEntry> },
+    /// (Version 4.) Read a range of the server's copied files.
+    FileRead(FileRead),
+    /// (Version 4.) The answer to a [`ServerMsg::FileRead`].
+    FileData(FileData),
+}
+
+/// One copied file or folder ([`files`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// Relative to the copied items, `/`-separated (the first part is the copied item).
+    pub path: String,
+    /// Bytes (0 for a folder).
+    pub size: u64,
+    pub dir: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRead {
+    /// The `id` of the file list.
+    pub id: u32,
+    pub index: u32,
+    pub offset: u64,
+    pub len: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileData {
+    pub id: u32,
+    pub index: u32,
+    pub offset: u64,
+    /// Fewer bytes than asked for only at the end of the file.
+    pub data: Vec<u8>,
+    /// The read failed (the list was replaced, the file is gone).
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +179,12 @@ pub enum ServerMsg {
         name: String,
         reason: Option<String>,
     },
+    /// (Version 4.) Files were copied in the session ([`files`]).
+    Files { id: u32, entries: Vec<FileEntry> },
+    /// (Version 4.) Read a range of the client's copied files.
+    FileRead(FileRead),
+    /// (Version 4.) The answer to a [`ClientMsg::FileRead`].
+    FileData(FileData),
 }
 
 #[derive(Debug, thiserror::Error)]

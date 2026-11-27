@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Files copied in the session, fetched into the cache by the Rust core
+     (TMPDIR = cacheDir, see MainActivity), shared on the clipboard as content URIs. -->
+<paths>
+    <cache-path name="clipboard" path="glidedesk-clipboard/" />
+</paths>

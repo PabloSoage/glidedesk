@@ -487,6 +487,11 @@ impl ApplicationHandler<Event> for App {
                     c.remote(text);
                 }
             }
+            Event::Files(paths) => {
+                if let Some(c) = &self.clipboard {
+                    c.remote_files(paths);
+                }
+            }
             Event::LinkWarning(warning) => {
                 // In the title bar: visible in a window, and in the task bar when full
                 // screen. The log has it too (the session logs every change).

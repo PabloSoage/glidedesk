@@ -58,6 +58,8 @@ enum Msg {
     Data(Option<String>),
     /// A native client copied this text.
     NativeText(String),
+    /// A native client copied files, already fetched to these paths.
+    NativeFiles(Vec<std::path::PathBuf>),
 }
 
 type Events = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ServerEvent>>>>;
@@ -67,6 +69,8 @@ pub struct WinClipboard {
     events: Events,
     to_thread: mpsc::Sender<Msg>,
     from_session: broadcast::Sender<String>,
+    /// Files copied in Windows (their paths), for native clients.
+    files_from_session: broadcast::Sender<Vec<std::path::PathBuf>>,
 }
 
 impl WinClipboard {
@@ -74,16 +78,19 @@ impl WinClipboard {
         let events: Events = Arc::default();
         let (to_thread, rx) = mpsc::channel();
         let (from_session, _) = broadcast::channel(4);
+        let (files_from_session, _) = broadcast::channel(4);
         let (ev, to_native) = (Arc::clone(&events), from_session.clone());
+        let files_to_native = files_from_session.clone();
         let clipboard = arboard::Clipboard::new()?;
         std::thread::Builder::new()
             .name("clipboard".into())
-            .spawn(move || run(clipboard, &rx, &ev, &to_native))?;
+            .spawn(move || run(clipboard, &rx, &ev, &to_native, &files_to_native))?;
         info!("Clipboard enabled");
         Ok(Self {
             events,
             to_thread,
             from_session,
+            files_from_session,
         })
     }
 }
@@ -104,6 +111,7 @@ fn run(
     rx: &mpsc::Receiver<Msg>,
     events: &Events,
     to_native: &broadcast::Sender<String>,
+    files_to_native: &broadcast::Sender<Vec<std::path::PathBuf>>,
 ) {
     let mut seen = sequence();
     let set = |clipboard: &mut arboard::Clipboard, text: String| {
@@ -178,6 +186,13 @@ fn run(
             Ok(Msg::Data(Some(text))) => seen = set(&mut clipboard, text),
             Ok(Msg::Data(None)) => debug!("The client sent no clipboard text"),
             Ok(Msg::NativeText(text)) => seen = set(&mut clipboard, text),
+            Ok(Msg::NativeFiles(paths)) => {
+                download = None;
+                if let Err(e) = clipboard.set().file_list(&paths) {
+                    warn!(%e, "Could not put the files on the Windows clipboard");
+                }
+                seen = sequence();
+            }
             Ok(Msg::DataRequest(format)) => {
                 let text = (format == ClipboardFormatId::CF_UNICODETEXT)
                     .then(|| clipboard.get_text().ok())
@@ -202,6 +217,9 @@ fn run(
         if let Ok(paths) = clipboard.get().file_list()
             && !paths.is_empty()
         {
+            if files_to_native.receiver_count() > 0 {
+                let _ = files_to_native.send(paths.clone());
+            }
             match Offer::new(&paths) {
                 Ok(o) => {
                     debug!(files = o.paths.len(), "Windows clipboard has files");
@@ -293,6 +311,14 @@ impl crate::native::TextClipboard for WinClipboard {
 
     fn subscribe(&self) -> broadcast::Receiver<String> {
         self.from_session.subscribe()
+    }
+
+    fn set_files(&self, paths: Vec<std::path::PathBuf>) {
+        let _ = self.to_thread.send(Msg::NativeFiles(paths));
+    }
+
+    fn subscribe_files(&self) -> Option<broadcast::Receiver<Vec<std::path::PathBuf>>> {
+        Some(self.files_from_session.subscribe())
     }
 }
 

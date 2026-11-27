@@ -62,6 +62,8 @@ pub enum Input {
     Disconnect,
     /// Text copied on the client (native protocol; RDP clients use CLIPRDR).
     Clipboard(String),
+    /// Files copied on the client (native protocol, servers from version 4).
+    Files(Vec<std::path::PathBuf>),
 }
 
 /// NLA with NTLM does not need network access beyond the RDP connection.
@@ -293,7 +295,9 @@ fn operations(ev: Input) -> Vec<Operation> {
         } else {
             Operation::UnicodeKeyReleased(ch)
         }],
-        Input::Resize { .. } | Input::Disconnect | Input::Clipboard(_) => Vec::new(),
+        Input::Resize { .. } | Input::Disconnect | Input::Clipboard(_) | Input::Files(_) => {
+            Vec::new()
+        }
     }
 }
 

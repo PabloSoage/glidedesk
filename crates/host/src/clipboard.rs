@@ -76,6 +76,8 @@ enum FromClient {
     Data(Option<String>),
     /// A native client copied this text.
     NativeText(String),
+    /// A native client copied files, already fetched to these paths.
+    NativeFiles(Vec<std::path::PathBuf>),
 }
 
 /// The native front end's side of the clipboard.
@@ -84,6 +86,8 @@ pub struct ClipboardHub {
     to_bridge: mpsc::UnboundedSender<FromClient>,
     /// Text copied in GNOME.
     pub from_session: tokio::sync::broadcast::Sender<String>,
+    /// Files copied in GNOME (their paths).
+    pub files_from_session: tokio::sync::broadcast::Sender<Vec<std::path::PathBuf>>,
 }
 
 impl ClipboardHub {
@@ -99,6 +103,7 @@ pub struct ClipboardFactory {
     events: Events,
     to_bridge: mpsc::UnboundedSender<FromClient>,
     from_session: tokio::sync::broadcast::Sender<String>,
+    files_from_session: tokio::sync::broadcast::Sender<Vec<std::path::PathBuf>>,
 }
 
 impl ClipboardFactory {
@@ -108,13 +113,15 @@ impl ClipboardFactory {
         let events: Events = Arc::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (from_session, _) = tokio::sync::broadcast::channel(4);
+        let (files_from_session, _) = tokio::sync::broadcast::channel(4);
         let (ev, to_native) = (Arc::clone(&events), from_session.clone());
+        let files_to_native = files_from_session.clone();
         tokio::spawn(async move {
             loop {
                 let remote = live.borrow_and_update().remote.clone();
                 tokio::select! {
                     // The session's signals ended: wait for the next session.
-                    () = bridge(remote, &mut rx, &ev, &to_native) => if live.changed().await.is_err() { return },
+                    () = bridge(remote, &mut rx, &ev, &to_native, &files_to_native) => if live.changed().await.is_err() { return },
                     changed = live.changed() => if changed.is_err() { return },
                 }
             }
@@ -123,6 +130,7 @@ impl ClipboardFactory {
             events,
             to_bridge: tx,
             from_session,
+            files_from_session,
         }
     }
 
@@ -131,6 +139,7 @@ impl ClipboardFactory {
         ClipboardHub {
             to_bridge: self.to_bridge.clone(),
             from_session: self.from_session.clone(),
+            files_from_session: self.files_from_session.clone(),
         }
     }
 }
@@ -259,6 +268,7 @@ async fn bridge(
     from_client: &mut mpsc::UnboundedReceiver<FromClient>,
     events: &Events,
     to_native: &tokio::sync::broadcast::Sender<String>,
+    files_to_native: &tokio::sync::broadcast::Sender<Vec<std::path::PathBuf>>,
 ) {
     if let Err(e) = remote.enable_clipboard(HashMap::new()).await {
         warn!(%e, "EnableClipboard failed; no clipboard");
@@ -305,6 +315,9 @@ async fn bridge(
                     && let Some(list) = read_selection(&remote, mime).await
                 {
                     let paths = filecopy::parse_uri_list(&list);
+                    if !paths.is_empty() && files_to_native.receiver_count() > 0 {
+                        let _ = files_to_native.send(paths.clone());
+                    }
                     if !paths.is_empty() {
                         match tokio::task::spawn_blocking(move || Offer::new(&paths)).await {
                             Ok(Ok(o)) => {
@@ -335,11 +348,11 @@ async fn bridge(
             }
             Some(sig) = transfers.next() => {
                 let Ok(args) = sig.args() else { continue };
-                if let (true, Some(format)) = (FILE_MIMES.contains(&args.mime_type.as_str()), client_files) {
+                if FILE_MIMES.contains(&args.mime_type.as_str()) && (fetched.is_some() || client_files.is_some()) {
                     if let Some(paths) = &fetched {
                         let ok = write_selection(&remote, args.serial, &file_list_text(&args.mime_type, paths)).await;
                         let _ = remote.selection_write_done(args.serial, ok).await;
-                    } else {
+                    } else if let Some(format) = client_files {
                         if waiting_files.is_empty() && download.is_none() {
                             send(events, ClipboardMessage::SendInitiatePaste(format));
                         }
@@ -390,8 +403,24 @@ async fn bridge(
                     };
                     send(events, ClipboardMessage::SendFormatData(response.into_owned()));
                 }
+                FromClient::NativeFiles(paths) => {
+                    // A native client's files are fetched before they are offered: pastes
+                    // are answered at once.
+                    native_text = None;
+                    (client_files, download) = (None, None);
+                    for (serial, _) in waiting_files.drain(..) {
+                        let _ = remote.selection_write_done(serial, false).await;
+                    }
+                    fetched = Some(paths);
+                    let mimes: Vec<&str> = FILE_MIMES.to_vec();
+                    let opts = HashMap::from([("mime-types", Value::from(mimes))]);
+                    if let Err(e) = remote.set_selection(opts).await {
+                        warn!(%e, "SetSelection failed");
+                    }
+                }
                 FromClient::NativeText(text) => {
                     native_text = Some(text);
+                    fetched = None;
                     let mimes: Vec<&str> = TEXT_MIMES.to_vec();
                     let opts = HashMap::from([("mime-types", Value::from(mimes))]);
                     if let Err(e) = remote.set_selection(opts).await {
@@ -553,5 +582,15 @@ impl crate::native::TextClipboard for ClipboardHub {
 
     fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.from_session.subscribe()
+    }
+
+    fn set_files(&self, paths: Vec<std::path::PathBuf>) {
+        let _ = self.to_bridge.send(FromClient::NativeFiles(paths));
+    }
+
+    fn subscribe_files(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<Vec<std::path::PathBuf>>> {
+        Some(self.files_from_session.subscribe())
     }
 }

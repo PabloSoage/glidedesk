@@ -37,6 +37,11 @@ pub trait VideoSink: Send {
     /// [`glidedesk_proto::link::LinkStats::warning`]), or good again (`None`). Native
     /// protocol; called only when it changes.
     fn link_warning(&mut self, _warning: Option<&str>) {}
+    /// Files copied in the session, fetched to these local paths (native protocol): put
+    /// them on the local clipboard.
+    fn files(&mut self, _paths: Vec<std::path::PathBuf>) {}
+    /// The apps the server can open instead of the desktop (native protocol, version 3).
+    fn apps(&mut self, _names: &[String]) {}
     /// Access units handed over and not decoded yet. The native client acknowledges frames
     /// only as they are decoded, so a slow decoder makes the server send fewer instead of a
     /// queue (and the delay) growing.

@@ -59,12 +59,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // The Rust core fetches the session's copied files under the temporary folder: the
+        // app's cache, which ClipboardBridge shares through FileProvider.
+        android.system.Os.setenv("TMPDIR", cacheDir.absolutePath, true)
         val refresh = fastestMode()
         val prefs = getSharedPreferences("connection", Context.MODE_PRIVATE)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(Modifier.fillMaxSize()) {
                     var session by remember { mutableStateOf<NativeSession?>(null) }
+                    var sessionHost by remember { mutableStateOf("") }
                     var scale by remember { mutableStateOf(2f) }
                     var message by remember { mutableStateOf("") }
                     // Debug builds only: `am start -e host H -e user U -e password P [-e scale S]`
@@ -87,18 +91,22 @@ class MainActivity : ComponentActivity() {
                     }
                     val s = session
                     if (s == null) {
-                        ConnectScreen(prefs, message) { host, port, user, password, sc, lowLatency ->
+                        ConnectScreen(prefs, message) { host, port, user, password, sc, lowLatency, app ->
                             scale = sc
+                            sessionHost = host
                             val m = resources.displayMetrics
                             session = NativeSession.connect(
                                 host, port, user, password,
                                 (m.widthPixels / sc).toInt(), (m.heightPixels / sc).toInt(), lowLatency,
-                                refresh,
+                                refresh, if (lowLatency) app else "",
                             )
                             message = if (session == null) "Could not start the session" else ""
                         }
                     } else {
-                        SessionScreen(s, scale) { reason ->
+                        SessionScreen(s, scale, onApps = { apps ->
+                            // Offered next time on the connection screen.
+                            prefs.edit().putString("apps:$sessionHost", apps.joinToString("\n")).apply()
+                        }) { reason ->
                             s.close()
                             session = null
                             message = reason
@@ -110,11 +118,15 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(
+    androidx.compose.foundation.layout.ExperimentalLayoutApi::class,
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+)
 @Composable
 private fun ConnectScreen(
     prefs: android.content.SharedPreferences,
     message: String,
-    onConnect: (String, Int, String, String, Float, Boolean) -> Unit,
+    onConnect: (String, Int, String, String, Float, Boolean, String) -> Unit,
 ) {
     var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
     var port by remember { mutableStateOf(prefs.getInt("port", 3391).toString()) }
@@ -122,6 +134,9 @@ private fun ConnectScreen(
     var password by remember { mutableStateOf("") }
     var scale by remember { mutableStateOf(prefs.getFloat("scale", 2f).toString()) }
     var lowLatency by remember { mutableStateOf(prefs.getBoolean("native", true)) }
+    var app by remember { mutableStateOf(prefs.getString("app", "") ?: "") }
+    // The apps this host offered last time (low-latency mode).
+    val knownApps = (prefs.getString("apps:${host.trim()}", "") ?: "").split('\n').filter { it.isNotBlank() }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
@@ -157,13 +172,33 @@ private fun ConnectScreen(
                 Modifier.padding(start = 8.dp),
             )
         }
+        if (lowLatency) {
+            OutlinedTextField(
+                app, { app = it }, Modifier.fillMaxWidth(), singleLine = true,
+                label = { Text("App (empty: the whole desktop)") },
+            )
+            if (knownApps.isNotEmpty()) {
+                androidx.compose.foundation.layout.FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    // The first one the server lists is the desktop itself.
+                    knownApps.forEachIndexed { i, name ->
+                        androidx.compose.material3.FilterChip(
+                            selected = if (i == 0) app.isBlank() else app == name,
+                            onClick = { app = if (i == 0) "" else name },
+                            label = { Text(name) },
+                        )
+                    }
+                }
+            }
+        }
         Button(
             onClick = {
                 val p = port.toIntOrNull() ?: if (lowLatency) 3391 else 3389
                 val sc = scale.toFloatOrNull()?.coerceIn(1f, 4f) ?: 2f
                 prefs.edit().putString("host", host).putInt("port", p).putString("user", user)
-                    .putFloat("scale", sc).putBoolean("native", lowLatency).apply()
-                onConnect(host.trim(), p, user.trim(), password, sc, lowLatency)
+                    .putFloat("scale", sc).putBoolean("native", lowLatency).putString("app", app.trim()).apply()
+                onConnect(host.trim(), p, user.trim(), password, sc, lowLatency, app.trim())
             },
             enabled = host.isNotBlank() && user.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
@@ -173,14 +208,34 @@ private fun ConnectScreen(
 }
 
 @Composable
-private fun SessionScreen(session: NativeSession, scale: Float, onEnd: (String) -> Unit) {
+private fun SessionScreen(
+    session: NativeSession,
+    scale: Float,
+    onApps: (List<String>) -> Unit,
+    onEnd: (String) -> Unit,
+) {
     var state by remember { mutableStateOf(NativeSession.State.CONNECTING) }
     var view by remember { mutableStateOf<SessionView?>(null) }
     var warning by remember { mutableStateOf<String?>(null) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val clipboard = remember(session) { ClipboardBridge(context, session) }
+    androidx.compose.runtime.DisposableEffect(clipboard) {
+        clipboard.start()
+        onDispose { clipboard.stop() }
+    }
     LaunchedEffect(session) {
+        var appsSeen = false
         while (true) {
             state = session.state
             warning = session.warning
+            clipboard.poll()
+            if (!appsSeen) {
+                val apps = session.apps
+                if (apps.isNotEmpty()) {
+                    appsSeen = true
+                    onApps(apps)
+                }
+            }
             when (state) {
                 NativeSession.State.FAILED -> { onEnd(session.error.ifEmpty { "Connection failed" }); return@LaunchedEffect }
                 NativeSession.State.ENDED -> { onEnd("Session ended"); return@LaunchedEffect }

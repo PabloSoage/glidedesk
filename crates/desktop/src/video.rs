@@ -34,6 +34,8 @@ pub enum Event {
     Clipboard(String),
     /// The link is poor (a short line), or good again.
     LinkWarning(Option<String>),
+    /// Files copied in the session, fetched to these paths.
+    Files(Vec<std::path::PathBuf>),
     Ended(String),
     /// Window menu entries (Windows).
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -95,6 +97,10 @@ impl VideoSink for Sink {
 
     fn link_warning(&mut self, warning: Option<&str>) {
         (self.notify)(Event::LinkWarning(warning.map(str::to_owned)));
+    }
+
+    fn files(&mut self, paths: Vec<std::path::PathBuf>) {
+        (self.notify)(Event::Files(paths));
     }
 }
 

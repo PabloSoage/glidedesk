@@ -75,6 +75,8 @@ struct Shared {
     wake_addr: SocketAddr,
     peer: Mutex<Option<Peer>>,
     next_id: AtomicU64,
+    /// The app the current browser opened instead of the desktop, if any.
+    app: Mutex<Option<String>>,
     keyframe: AtomicBool,
     /// Newest congestion-control estimate (bits/s), 0 when none yet.
     estimate: AtomicU32,
@@ -308,6 +310,8 @@ pub struct Front {
     pub input: InputForwarder,
     pub clipboard: Option<Arc<dyn crate::native::TextClipboard>>,
     pub auth_limiter: Arc<crate::auth::RateLimiter>,
+    /// Apps the browser can open instead of the desktop.
+    pub apps: Arc<crate::apps::Runner>,
 }
 
 pub struct Server {
@@ -355,6 +359,7 @@ pub async fn new(
         wake_addr,
         peer: Mutex::new(None),
         next_id: AtomicU64::new(1),
+        app: Mutex::new(None),
         keyframe: AtomicBool::new(false),
         estimate: AtomicU32::new(0),
         sent: AtomicU64::new(0),
@@ -539,6 +544,7 @@ async fn notes_task(
     let mut pos = (0u16, 0u16);
     let mut cursor = front.cursor.clone();
     let mut clip = front.clipboard.as_ref().map(|c| c.subscribe());
+    let mut app_exits = front.apps.subscribe();
     let send_bytes = |shared: &Shared, msg: &[u8]| {
         let mut guard = shared.peer.lock().unwrap();
         let Some(p) = guard.as_mut() else { return };
@@ -598,6 +604,17 @@ async fn notes_task(
                 let ev = cursor.borrow_and_update().clone();
                 send_cursor(&shared, ev.as_ref());
             }
+            e = app_exits.recv() => match e {
+                Ok(e) if shared.app.lock().unwrap().as_deref() == Some(e.name.as_str()) => {
+                    // [3, UTF-8]: the app the browser opened ended (the reason, if it failed).
+                    let mut msg = vec![3];
+                    msg.extend_from_slice(e.reason.unwrap_or_default().as_bytes());
+                    send_bytes(&shared, &msg);
+                    *shared.app.lock().unwrap() = None;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => app_exits = front.apps.subscribe(),
+            },
             t = async { match clip.as_mut() { Some(c) => c.recv().await, None => std::future::pending().await } } => match t {
                 Ok(text) => {
                     // [2, UTF-8]: text copied in the session.
@@ -698,6 +715,10 @@ struct OfferMsg {
     /// The browser's screen refresh rate, measured by the page.
     #[serde(default)]
     refresh: Option<u32>,
+    /// Open this app (a name from `apps.conf`) instead of the desktop; the page ends the
+    /// session when it exits.
+    #[serde(default)]
+    app: Option<String>,
 }
 
 /// One request per connection: `GET /` or `POST /offer`.
@@ -809,6 +830,14 @@ fn offer(
         bail!("wrong user name or password");
     }
     front.auth_limiter.record_success(ip);
+    let app = m.app.clone().filter(|a| !a.trim().is_empty());
+    if let Some(name) = &app {
+        front
+            .apps
+            .open(name)
+            .with_context(|| format!("opening {name}"))?;
+    }
+    *shared.app.lock().unwrap() = app;
     let offer = SdpOffer::from_sdp_string(&m.sdp).context("parsing the SDP offer")?;
     let now = Instant::now();
     let mut rtc = Rtc::builder()
@@ -854,5 +883,7 @@ fn offer(
         info!("A new browser takes over from the previous one");
     }
     info!(%peer, user = m.user, w = m.width, h = m.height, refresh = m.refresh, "Browser logged in");
-    Ok(serde_json::json!({ "sdp": answer.to_sdp_string() }).to_string())
+    // The apps, for the page to offer next time.
+    let apps: Vec<String> = front.apps.list().into_iter().map(|a| a.name).collect();
+    Ok(serde_json::json!({ "sdp": answer.to_sdp_string(), "apps": apps }).to_string())
 }

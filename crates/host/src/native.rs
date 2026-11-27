@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use glidedesk_proto::crypto::{Direction, PacketKey};
-use glidedesk_proto::{ClientMsg, Codec as WireCodec, Cursor, InputEvent, ServerMsg, fec, link};
+use glidedesk_proto::{
+    ClientMsg, Codec as WireCodec, Cursor, InputEvent, ServerMsg, fec, files, link,
+};
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -234,13 +236,35 @@ impl Output for NativeOutput {
     }
 }
 
-/// Text clipboard of the session, as the native front end uses it.
+/// Clipboard of the session, as the native front end uses it: text, and files (protocol
+/// version 4) where the session supports them.
 pub trait TextClipboard: Send + Sync {
     /// The client copied `text`.
     fn set(&self, text: String);
     /// Text copied in the session.
     fn subscribe(&self) -> broadcast::Receiver<String>;
+    /// The client copied files, now fetched to these local paths: the session's next paste
+    /// gets them.
+    fn set_files(&self, _paths: Vec<std::path::PathBuf>) {}
+    /// Files copied in the session, as local paths.
+    fn subscribe_files(&self) -> Option<broadcast::Receiver<Vec<std::path::PathBuf>>> {
+        None
+    }
 }
+
+/// Where the client's copied files are fetched to (one fresh folder per copy).
+fn files_cache() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".cache")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("glidedesk")
+        .join("clipboard")
+}
+
+/// Copies larger than this are not fetched (the copy is not offered for pasting).
+const FILES_LIMIT: u64 = 4 << 30;
 
 // ---------------------------------------------------------------------------------------
 // Server
@@ -550,13 +574,39 @@ where
     let mut cursor = front.cursor.clone();
     cursor.mark_changed();
     let mut clip = front.clipboard.as_ref().map(|c| c.subscribe());
+    // Files copied in the session, offered to clients from version 4 (older ones would not
+    // understand the message).
+    let mut session_files = front
+        .clipboard
+        .as_ref()
+        .filter(|_| version >= 4)
+        .and_then(|c| c.subscribe_files());
+    let offered: Arc<Mutex<Option<(u32, Arc<files::Offer>)>>> = Arc::default();
+    let offering = Arc::clone(&offered);
     let opened: Arc<Mutex<Option<String>>> = Arc::default();
     let mut app_exits = front.apps.subscribe();
     let watched = Arc::clone(&opened);
     let writer = tokio::spawn(async move {
+        let mut next_id = 0u32;
         loop {
             let msg = tokio::select! {
                 m = ctl_rx.recv() => match m { Some(m) => m, None => break },
+                f = async { match session_files.as_mut() { Some(f) => f.recv().await, None => std::future::pending().await } } => match f {
+                    Ok(paths) => {
+                        let offer = match tokio::task::spawn_blocking(move || files::Offer::new(&paths)).await {
+                            Ok(Ok(o)) => o,
+                            Ok(Err(e)) => { warn!(%e, "Cannot offer the copied files"); continue }
+                            Err(_) => continue,
+                        };
+                        next_id = next_id.wrapping_add(1);
+                        let entries = offer.entries.clone();
+                        debug!(files = entries.len(), bytes = offer.bytes(), "Offering the session's files");
+                        *offering.lock().unwrap() = Some((next_id, Arc::new(offer)));
+                        ServerMsg::Files { id: next_id, entries }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => { session_files = None; continue }
+                },
                 e = app_exits.recv() => match e {
                     Ok(e) if watched.lock().unwrap().as_deref() == Some(e.name.as_str()) => {
                         ServerMsg::AppExited { name: e.name, reason: e.reason }
@@ -587,6 +637,8 @@ where
 
     let mut input = front.input.clone();
     let mut pos = (0u16, 0u16);
+    // The client's copied files being fetched.
+    let mut download: Option<files::Download> = None;
     let result = loop {
         let msg: ClientMsg = match glidedesk_proto::read_msg(&mut rd).await {
             Ok(m) => m,
@@ -669,6 +721,71 @@ where
                 }
                 *shared.loss.lock().unwrap() = Some(sample.fraction());
             }
+            ClientMsg::Files { id, entries } => {
+                download = None;
+                let Some(clipboard) = &front.clipboard else {
+                    continue;
+                };
+                let bytes: u64 = entries.iter().map(|e| e.size).sum();
+                if bytes > FILES_LIMIT {
+                    warn!(bytes, "The client's copied files are too large to fetch");
+                    continue;
+                }
+                match files::new_folder(&files_cache())
+                    .and_then(|dir| files::Download::new(&dir, id, entries))
+                {
+                    Ok(d) => {
+                        info!(%peer, bytes, "Fetching the client's copied files");
+                        download = Some(d);
+                        step_download(&mut download, &ctl_tx, clipboard.as_ref());
+                    }
+                    Err(e) => warn!(%e, "Cannot take the client's files"),
+                }
+            }
+            ClientMsg::FileData(data) => {
+                let Some(clipboard) = &front.clipboard else {
+                    continue;
+                };
+                let Some(d) = download.as_mut().filter(|d| d.id == data.id) else {
+                    continue;
+                };
+                let r = match &data.error {
+                    Some(e) => Err(std::io::Error::other(e.clone())),
+                    None => d.on_data(data.index, data.offset, &data.data),
+                };
+                if let Err(e) = r {
+                    warn!(%e, "Fetching the client's files failed");
+                    download = None;
+                    continue;
+                }
+                step_download(&mut download, &ctl_tx, clipboard.as_ref());
+            }
+            ClientMsg::FileRead(r) => {
+                let offer = offered
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|(id, _)| *id == r.id)
+                    .map(|(_, o)| Arc::clone(o));
+                let ctl = ctl_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = match offer {
+                        Some(o) => o.read(r.index, r.offset, r.len),
+                        None => Err(std::io::Error::other("the files are no longer copied")),
+                    };
+                    let (data, error) = match result {
+                        Ok(d) => (d, None),
+                        Err(e) => (Vec::new(), Some(e.to_string())),
+                    };
+                    let _ = ctl.send(ServerMsg::FileData(glidedesk_proto::FileData {
+                        id: r.id,
+                        index: r.index,
+                        offset: r.offset,
+                        data,
+                        error,
+                    }));
+                });
+            }
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
         }
     };
@@ -683,6 +800,36 @@ where
     }
     writer.abort();
     result
+}
+
+/// Asks the client for the next range of its files; once they have all arrived, puts them
+/// on the session's clipboard.
+fn step_download(
+    download: &mut Option<files::Download>,
+    ctl: &mpsc::UnboundedSender<ServerMsg>,
+    clipboard: &dyn TextClipboard,
+) {
+    let Some(d) = download.as_mut() else { return };
+    match d.next_request() {
+        Ok(Some((index, offset, len))) => {
+            let _ = ctl.send(ServerMsg::FileRead(glidedesk_proto::FileRead {
+                id: d.id,
+                index,
+                offset,
+                len,
+            }));
+        }
+        Ok(None) if d.done() => {
+            info!(bytes = d.bytes, "The client's files are here");
+            clipboard.set_files(d.top_paths());
+            *download = None;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(%e, "Fetching the client's files failed");
+            *download = None;
+        }
+    }
 }
 
 /// Native input through the same translation as RDP input.

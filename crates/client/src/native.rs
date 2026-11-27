@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use glidedesk_proto::crypto::{Direction, PacketKey, ReplayWindow};
-use glidedesk_proto::{ClientMsg, Codec, InputEvent, ServerMsg, fec, link};
+use glidedesk_proto::{ClientMsg, Codec, InputEvent, ServerMsg, fec, files, link};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -149,7 +149,8 @@ fn input_event(i: Input) -> Option<ClientMsg> {
             height: height.min(u32::from(u16::MAX)) as u16,
         },
         Input::Clipboard(text) => ClientMsg::Clipboard(text),
-        Input::Disconnect => return None,
+        // Files are handled by the session loop (they need an offer kept for reads).
+        Input::Disconnect | Input::Files(_) => return None,
     })
 }
 
@@ -493,6 +494,10 @@ async fn session(
     let mut rtt: Option<Duration> = None;
     let mut filter = link::QualityFilter::default();
     let mut shown: Option<String> = None;
+    // Files: ours as offered to the server, and the server's being fetched.
+    let mut offered: Option<(u32, Arc<files::Offer>)> = None;
+    let mut next_offer = 0u32;
+    let mut download: Option<files::Download> = None;
     let result = loop {
         tokio::select! {
             _ = tick.tick() => {
@@ -550,8 +555,58 @@ async fn session(
                 }
                 Ok(ServerMsg::Clipboard(text)) => sink.lock().unwrap().clipboard(&text),
                 Ok(ServerMsg::Denied(reason)) => break Err(anyhow::anyhow!(reason)),
-                Ok(ServerMsg::Apps(names)) => info!(?names, "Apps on the server"),
+                Ok(ServerMsg::Apps(names)) => {
+                    info!(?names, "Apps on the server");
+                    sink.lock().unwrap().apps(&names);
+                }
                 Ok(ServerMsg::AppStarted(name)) => info!(name, "App open"),
+                Ok(ServerMsg::Files { id, entries }) => {
+                    download = None;
+                    let bytes: u64 = entries.iter().map(|e| e.size).sum();
+                    if bytes > FILES_LIMIT {
+                        warn!(bytes, "The server's copied files are too large to fetch");
+                        continue;
+                    }
+                    match files::new_folder(&files_cache()).and_then(|dir| files::Download::new(&dir, id, entries)) {
+                        Ok(d) => {
+                            info!(bytes, "Fetching the server's copied files");
+                            download = Some(d);
+                            step_download(&mut download, &ctl_tx, sink);
+                        }
+                        Err(e) => warn!(%e, "Cannot take the server's files"),
+                    }
+                }
+                Ok(ServerMsg::FileData(data)) => {
+                    let Some(d) = download.as_mut().filter(|d| d.id == data.id) else { continue };
+                    let r = match &data.error {
+                        Some(e) => Err(std::io::Error::other(e.clone())),
+                        None => d.on_data(data.index, data.offset, &data.data),
+                    };
+                    match r {
+                        Ok(()) => step_download(&mut download, &ctl_tx, sink),
+                        Err(e) => {
+                            warn!(%e, "Fetching the server's files failed");
+                            download = None;
+                        }
+                    }
+                }
+                Ok(ServerMsg::FileRead(r)) => {
+                    let offer = offered.as_ref().filter(|(id, _)| *id == r.id).map(|(_, o)| Arc::clone(o));
+                    let ctl = ctl_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = match offer {
+                            Some(o) => o.read(r.index, r.offset, r.len),
+                            None => Err(std::io::Error::other("the files are no longer copied")),
+                        };
+                        let (data, error) = match result {
+                            Ok(d) => (d, None),
+                            Err(e) => (Vec::new(), Some(e.to_string())),
+                        };
+                        let _ = ctl.send(ClientMsg::FileData(glidedesk_proto::FileData {
+                            id: r.id, index: r.index, offset: r.offset, data, error,
+                        }));
+                    });
+                }
                 Ok(ServerMsg::AppExited { name, reason }) if opts.app.as_deref() == Some(name.as_str()) => {
                     break match reason {
                         None => {
@@ -571,13 +626,33 @@ async fn session(
                     break Err(e.into());
                 }
             }
-            i = input.recv() => match i.and_then(input_event) {
-                Some(m) => {
-                    if let Err(e) = glidedesk_proto::write_msg(&mut wr, &m).await {
+            i = input.recv() => match i {
+                Some(Input::Files(paths)) => {
+                    if version < 4 {
+                        debug!("This server takes no files on the clipboard");
+                        continue;
+                    }
+                    let offer = match tokio::task::spawn_blocking(move || files::Offer::new(&paths)).await {
+                        Ok(Ok(o)) => o,
+                        Ok(Err(e)) => { warn!(%e, "Cannot offer the copied files"); continue }
+                        Err(_) => continue,
+                    };
+                    next_offer = next_offer.wrapping_add(1);
+                    let msg = ClientMsg::Files { id: next_offer, entries: offer.entries.clone() };
+                    debug!(files = offer.entries.len(), bytes = offer.bytes(), "Offering copied files");
+                    offered = Some((next_offer, Arc::new(offer)));
+                    if let Err(e) = glidedesk_proto::write_msg(&mut wr, &msg).await {
                         break Err(e.into());
                     }
                 }
-                None => break Ok(()),
+                other => match other.and_then(input_event) {
+                    Some(m) => {
+                        if let Err(e) = glidedesk_proto::write_msg(&mut wr, &m).await {
+                            break Err(e.into());
+                        }
+                    }
+                    None => break Ok(()),
+                },
             },
         }
     };
@@ -589,6 +664,44 @@ async fn session(
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;
     }
     result.map(|()| fingerprint)
+}
+
+/// Copies larger than this are not fetched.
+const FILES_LIMIT: u64 = 4 << 30;
+
+/// Where the server's copied files are fetched to (one fresh folder per copy).
+fn files_cache() -> std::path::PathBuf {
+    std::env::temp_dir().join("glidedesk-clipboard")
+}
+
+/// Asks the server for the next range of its files; once they have all arrived, hands them
+/// to the platform's clipboard.
+fn step_download(
+    download: &mut Option<files::Download>,
+    ctl: &mpsc::UnboundedSender<ClientMsg>,
+    sink: &SharedSink,
+) {
+    let Some(d) = download.as_mut() else { return };
+    match d.next_request() {
+        Ok(Some((index, offset, len))) => {
+            let _ = ctl.send(ClientMsg::FileRead(glidedesk_proto::FileRead {
+                id: d.id,
+                index,
+                offset,
+                len,
+            }));
+        }
+        Ok(None) if d.done() => {
+            info!(bytes = d.bytes, "The server's files are here");
+            sink.lock().unwrap().files(d.top_paths());
+            *download = None;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(%e, "Fetching the server's files failed");
+            *download = None;
+        }
+    }
 }
 
 /// Acknowledges the received frames the decoder has caught up with. One may still be
