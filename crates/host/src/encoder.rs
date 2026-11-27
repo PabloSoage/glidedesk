@@ -367,9 +367,18 @@ impl Backend for Ffmpeg {
     }
 
     fn request_keyframe(&mut self) {
-        if let Some((e, _)) = self.encoder.as_mut() {
-            e.request_keyframe();
+        match self.encoder.as_mut() {
+            Some((e, _)) if e.idr_on_request() => e.request_keyframe(),
+            // AMF on FFmpeg 6: the next frame opens a new encoder, which starts with an IDR.
+            Some(_) => self.encoder = None,
+            None => {}
         }
+    }
+
+    fn invalidate_from(&mut self, _index: u64) -> bool {
+        // FFmpeg's AMF, QSV and VA-API encoders cannot stop referencing a picture (see
+        // `ffenc`): the pipeline asks for a keyframe instead.
+        false
     }
 
     fn set_max_bitrate(&mut self, bps: u32) -> Result<()> {

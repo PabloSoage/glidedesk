@@ -4,6 +4,15 @@
 //! B-frames, an endless GOP with IDRs only on request, full-range BT.709 signalled in the
 //! VUI. Frames come in as NV12 in system memory ([`crate::csc`]); for VA-API they are
 //! uploaded into a VA surface.
+//!
+//! Lost pictures cannot be invalidated here: FFmpeg's AMF, QSV and VA-API encoders (6.1,
+//! 8.0 and 9.0) expose no reference invalidation, no caller-driven long-term references and
+//! no reference list control. AMF's LTR marking (`MARK_CURRENT_WITH_LTR_INDEX`,
+//! `FORCE_LTR_REFERENCE_BITFIELD`) is per surface but needs `MAX_LTR_FRAMES`, a static
+//! property FFmpeg never sets; QSV's `mfxExtAVCRefListCtrl` is never attached per frame
+//! (`AVQSVContext::ext_buffers` only applies at init and reset); VA-API builds its reference
+//! lists itself from the previous picture. The only per-frame lever is `pict_type = I`, so a
+//! loss costs a keyframe.
 
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -38,6 +47,9 @@ pub struct FfEncoder {
     cfg: EncoderConfig,
     pts: i64,
     force_idr: bool,
+    /// `pict_type = I` gives an IDR. AMF before FFmpeg 8 has no `forced_idr` and ignores
+    /// `pict_type` altogether: a keyframe then needs a new encoder.
+    idr_on_request: bool,
 }
 
 // The FFmpeg objects are only used from the thread that owns the encoder.
@@ -98,6 +110,7 @@ impl FfEncoder {
                 cfg: cfg.clone(),
                 pts: 0,
                 force_idr: true,
+                idr_on_request: true,
             };
             let c = &mut *this.ctx;
             c.width = cfg.width as i32;
@@ -167,6 +180,19 @@ impl FfEncoder {
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
                     set(&mut opts, "usage", "ultralowlatency");
                     set(&mut opts, "quality", "speed");
+                    // FFmpeg 8 turns `pict_type = I` into an IDR only with `forced_idr`
+                    // (amfenc.c); 6.1 has neither.
+                    this.idr_on_request = !ff::av_opt_find(
+                        c.priv_data,
+                        c"forced_idr".as_ptr(),
+                        ptr::null(),
+                        0,
+                        0,
+                    )
+                    .is_null();
+                    if this.idr_on_request {
+                        set(&mut opts, "forced_idr", "1");
+                    }
                 }
                 Kind::Software => {
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
@@ -208,6 +234,12 @@ impl FfEncoder {
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Whether [`FfEncoder::request_keyframe`] works in place; if not, only a new encoder
+    /// starts with an IDR.
+    pub fn idr_on_request(&self) -> bool {
+        self.idr_on_request
     }
 
     /// Encodes one NV12 frame of the encoder's size.
