@@ -193,7 +193,7 @@ private fun ServerScreen(settings: ServerSettings) {
             }
             ServerSettings.Way.ADB -> {
                 Text(
-                    if (helper.isNotEmpty()) "The helper is running ($helper)." else "Run once per boot, from a computer or from Termux (adb connected to this phone):",
+                    if (helper.isNotEmpty()) "The helper is running ($helper)." else "Run this from a computer or from Termux (adb connected to this phone); again after a reboot or when the app was closed:",
                 )
                 SelectionContainer {
                     Text(ADB_COMMAND, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)

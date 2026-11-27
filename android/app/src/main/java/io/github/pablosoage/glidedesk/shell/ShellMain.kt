@@ -44,7 +44,7 @@ object ShellMain {
             null
         }
         if (app == null) {
-            System.err.println("glidedesk: is the app installed and its server screen open?")
+            System.err.println("glidedesk: is the app installed, and the same version as this helper?")
             exitProcess(1)
         }
         app.linkToDeath({

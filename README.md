@@ -338,7 +338,7 @@ UDP), and trust its certificate the first time (its fingerprint is shown in the 
 | How | Setup | What you get |
 |---|---|---|
 | **Shizuku** (recommended) | install [Shizuku](https://shizuku.rikka.app), start it (wireless debugging, or root), allow glidedesk in it | no prompt; a copy of the screen or a display of its own at the client's size; real touch, mouse wheel and keyboard |
-| **ADB helper** | run the command the app shows, once per boot, from a computer or from Termux connected to the phone's wireless debugging (`pkg install android-tools`, `adb pair`, `adb connect`) | the same as Shizuku |
+| **ADB helper** | run the command the app shows (again after a reboot, or when the app was closed) from a computer or from Termux connected to the phone's wireless debugging (`pkg install android-tools`, `adb pair`, `adb connect`) | the same as Shizuku |
 | **Screen capture** | nothing; for input, turn on *glidedesk server input* in the accessibility settings | Android asks each time; a copy of the screen; taps and swipes, Back, Home, Recents, typing into text fields |
 
 With the helper, the left button is a finger, the right one Back, the middle one Home, the
