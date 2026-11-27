@@ -51,6 +51,8 @@ struct Link {
     invalidation: bool,
     /// Recent frames and their encoder picture index, oldest first.
     sent: std::collections::VecDeque<(u32, u64)>,
+    /// The client asked for HEVC 4:4:4 (version 5) and the session is HEVC.
+    yuv444: bool,
 }
 
 /// Frames remembered for invalidation requests (a loss further back needs a keyframe).
@@ -237,6 +239,15 @@ impl Output for NativeOutput {
 
     fn set_ceiling(&mut self, bps: u32) {
         self.shared.ceiling.store(bps, Ordering::Relaxed);
+    }
+
+    fn yuv444(&self) -> bool {
+        self.shared
+            .link
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|l| l.yuv444)
     }
 }
 
@@ -606,6 +617,7 @@ where
         frame_id: 0,
         invalidation: version >= 2,
         sent: Default::default(),
+        yuv444: false,
     });
     *shared.lost.lock().unwrap() = None;
     if let Some(old) = previous {
@@ -850,6 +862,24 @@ where
                         error,
                     }));
                 });
+            }
+            ClientMsg::Formats { yuv444 } => {
+                let changed = shared
+                    .link
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .filter(|l| l.token == token)
+                    .is_some_and(|l| {
+                        let wanted = yuv444 && l.codec == Codec::Hevc;
+                        std::mem::replace(&mut l.yuv444, wanted) != wanted
+                    });
+                if changed {
+                    info!(%peer, yuv444, "Client picture formats");
+                    // Pictures sent so far were 4:2:0: start over (the pipeline decides
+                    // whether 4:4:4 is possible and opens the encoder for it).
+                    shared.keyframe_requested.store(true, Ordering::SeqCst);
+                }
             }
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
         }

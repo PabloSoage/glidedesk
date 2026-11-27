@@ -55,6 +55,7 @@ use crate::frame::{
 };
 use crate::input::{Input, InputBackend};
 use crate::wincuda::D3dToCuda;
+use crate::wind3d::TexturePool;
 use crate::winvdisplay::{self, Control};
 
 pub struct WinSession {
@@ -373,6 +374,8 @@ struct Capture {
     buffers: Recycler,
     /// The GPU path, when the desktop is on the NVENC GPU.
     gpu: Option<D3dToCuda>,
+    /// The GPU path for AMF and QSV: desktop copies in D3D11 textures (`wind3d`).
+    d3d: Option<TexturePool>,
     cuda: Option<Arc<cudarc::driver::CudaContext>>,
     /// The display to capture, and the generation of it duplicated last.
     follow: Followed,
@@ -402,6 +405,7 @@ impl Capture {
             staging: None,
             buffers: Recycler::default(),
             gpu: None,
+            d3d: None,
             cuda,
             follow,
             seen: 0,
@@ -432,6 +436,12 @@ impl Capture {
                     )
                 })
                 .ok()
+        });
+        // AMF and QSV read the desktop's textures on the encoder thread (on this device:
+        // a new one makes the encoder set up its frames again).
+        self.d3d = (self.gpu.is_none() && crate::wind3d::enabled()).then(|| {
+            crate::wind3d::protect(&self.device);
+            TexturePool::default()
         });
     }
 
@@ -548,7 +558,7 @@ impl Capture {
                 && let Some(res) = resource
             {
                 let tex: ID3D11Texture2D = res.cast()?;
-                if !self.read_gpu(&tex, frames) {
+                if !self.read_gpu(&tex, frames) && !self.read_d3d(&tex, frames) {
                     self.read(&tex, frames)?;
                 }
             }
@@ -589,6 +599,38 @@ impl Capture {
                     "Copying the desktop on the GPU failed; going through system memory"
                 );
                 self.gpu = None;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Hands a GPU copy of the desktop texture to AMF or QSV. False when the frame must go
+    /// through system memory instead (no such encoder, or the path failed).
+    fn read_d3d(&mut self, tex: &ID3D11Texture2D, frames: &FrameSender) -> bool {
+        if !crate::wind3d::enabled() {
+            self.d3d = None;
+        }
+        let Some(pool) = self.d3d.as_mut() else {
+            return false;
+        };
+        match pool.copy(&self.device, &self.context, tex) {
+            Ok(Some(t)) => {
+                frames.send(Frame {
+                    width: t.width,
+                    height: t.height,
+                    data: FrameData::D3d(t),
+                    damage: None,
+                    captured: Instant::now(),
+                    recycle: None,
+                });
+            }
+            // Every texture is with the encoder: this image is skipped, a newer one follows.
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = format!("{e:#}"), "Copying the desktop on the GPU failed");
+                crate::wind3d::give_up();
+                self.d3d = None;
                 return false;
             }
         }

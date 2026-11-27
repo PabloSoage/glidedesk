@@ -3,7 +3,16 @@
 //! The same low-latency shape as the NVENC encoder: CBR with about one frame of VBV, no
 //! B-frames, an endless GOP with IDRs only on request, full-range BT.709 signalled in the
 //! VUI. Frames come in as NV12 in system memory ([`crate::csc`]); for VA-API they are
-//! uploaded into a VA surface.
+//! uploaded into a VA surface, or arrive as one from the capture ([`crate::vaimport`]).
+//!
+//! Lost pictures cannot be invalidated here: FFmpeg's AMF, QSV and VA-API encoders (6.1,
+//! 8.0 and 9.0) expose no reference invalidation, no caller-driven long-term references and
+//! no reference list control. AMF's LTR marking (`MARK_CURRENT_WITH_LTR_INDEX`,
+//! `FORCE_LTR_REFERENCE_BITFIELD`) is per surface but needs `MAX_LTR_FRAMES`, a static
+//! property FFmpeg never sets; QSV's `mfxExtAVCRefListCtrl` is never attached per frame
+//! (`AVQSVContext::ext_buffers` only applies at init and reset); VA-API builds its reference
+//! lists itself from the previous picture. The only per-frame lever is `pict_type = I`, so a
+//! loss costs a keyframe.
 
 use std::ffi::{CStr, CString};
 use std::ptr;
@@ -38,6 +47,9 @@ pub struct FfEncoder {
     cfg: EncoderConfig,
     pts: i64,
     force_idr: bool,
+    /// `pict_type = I` gives an IDR. AMF before FFmpeg 8 has no `forced_idr` and ignores
+    /// `pict_type` altogether: a keyframe then needs a new encoder.
+    idr_on_request: bool,
 }
 
 // The FFmpeg objects are only used from the thread that owns the encoder.
@@ -70,6 +82,18 @@ fn set(dict: &mut *mut ff::AVDictionary, key: &str, value: &str) {
 impl FfEncoder {
     /// `device`: DRM render node for VA-API (e.g. /dev/dri/renderD128).
     pub fn new(kind: Kind, device: &str, cfg: EncoderConfig) -> Result<Self> {
+        Self::new_on(kind, device, cfg, None)
+    }
+
+    /// With `frames`, the encoder takes hardware frames of that context
+    /// ([`FfEncoder::encode_hw`]) instead of frames from system memory: VA surfaces for
+    /// VA-API, D3D11 textures for AMF, QSV surfaces for QSV.
+    pub fn new_on(
+        kind: Kind,
+        device: &str,
+        cfg: EncoderConfig,
+        frames: Option<*mut ff::AVBufferRef>,
+    ) -> Result<Self> {
         let name = match (kind, cfg.codec) {
             (Kind::Vaapi, Codec::H264) => "h264_vaapi",
             (Kind::Vaapi, Codec::Hevc) => "hevc_vaapi",
@@ -98,6 +122,7 @@ impl FfEncoder {
                 cfg: cfg.clone(),
                 pts: 0,
                 force_idr: true,
+                idr_on_request: true,
             };
             let c = &mut *this.ctx;
             c.width = cfg.width as i32;
@@ -126,25 +151,35 @@ impl FfEncoder {
             let mut opts: *mut ff::AVDictionary = ptr::null_mut();
             match kind {
                 Kind::Vaapi => {
-                    let dev = CString::new(device).unwrap();
-                    check(
-                        ff::av_hwdevice_ctx_create(
-                            &mut this.hw_device,
-                            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                            dev.as_ptr(),
-                            ptr::null_mut(),
-                            0,
-                        ),
-                        "opening the VA-API device",
-                    )?;
-                    this.hw_frames = ff::av_hwframe_ctx_alloc(this.hw_device);
-                    let fc = &mut *((*this.hw_frames).data as *mut ff::AVHWFramesContext);
-                    fc.format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-                    fc.sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
-                    fc.width = cfg.width as i32;
-                    fc.height = cfg.height as i32;
-                    fc.initial_pool_size = 4;
-                    check(ff::av_hwframe_ctx_init(this.hw_frames), "VA-API frame pool")?;
+                    if let Some(frames) = frames {
+                        // The capture's surfaces, on its VA display.
+                        this.hw_frames = ff::av_buffer_ref(frames);
+                        if this.hw_frames.is_null() {
+                            bail!("out of memory");
+                        }
+                        let fc = &*((*this.hw_frames).data as *const ff::AVHWFramesContext);
+                        this.hw_device = ff::av_buffer_ref(fc.device_ref);
+                    } else {
+                        let dev = CString::new(device).unwrap();
+                        check(
+                            ff::av_hwdevice_ctx_create(
+                                &mut this.hw_device,
+                                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                                dev.as_ptr(),
+                                ptr::null_mut(),
+                                0,
+                            ),
+                            "opening the VA-API device",
+                        )?;
+                        this.hw_frames = ff::av_hwframe_ctx_alloc(this.hw_device);
+                        let fc = &mut *((*this.hw_frames).data as *mut ff::AVHWFramesContext);
+                        fc.format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                        fc.sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+                        fc.width = cfg.width as i32;
+                        fc.height = cfg.height as i32;
+                        fc.initial_pool_size = 4;
+                        check(ff::av_hwframe_ctx_init(this.hw_frames), "VA-API frame pool")?;
+                    }
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
                     c.hw_frames_ctx = ff::av_buffer_ref(this.hw_frames);
                     set(&mut opts, "rc_mode", "CBR");
@@ -167,6 +202,19 @@ impl FfEncoder {
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
                     set(&mut opts, "usage", "ultralowlatency");
                     set(&mut opts, "quality", "speed");
+                    // FFmpeg 8 turns `pict_type = I` into an IDR only with `forced_idr`
+                    // (amfenc.c); 6.1 has neither.
+                    this.idr_on_request = !ff::av_opt_find(
+                        c.priv_data,
+                        c"forced_idr".as_ptr(),
+                        ptr::null(),
+                        0,
+                        0,
+                    )
+                    .is_null();
+                    if this.idr_on_request {
+                        set(&mut opts, "forced_idr", "1");
+                    }
                 }
                 Kind::Software => {
                     c.pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_NV12;
@@ -189,6 +237,18 @@ impl FfEncoder {
                     );
                 }
             }
+            if let Some(frames) = frames
+                && kind != Kind::Vaapi
+            {
+                // D3D11 (AMF) or QSV frames converted on the GPU (wind3d.rs).
+                this.hw_frames = ff::av_buffer_ref(frames);
+                if this.hw_frames.is_null() {
+                    bail!("out of memory");
+                }
+                let fc = &*((*frames).data as *const ff::AVHWFramesContext);
+                c.pix_fmt = fc.format;
+                c.hw_frames_ctx = ff::av_buffer_ref(frames);
+            }
             let r = ff::avcodec_open2(this.ctx, codec, &mut opts);
             ff::av_dict_free(&mut opts);
             check(r, &format!("opening {name}"))?;
@@ -198,7 +258,7 @@ impl FfEncoder {
             f.width = cfg.width as i32;
             f.height = cfg.height as i32;
             check(ff::av_frame_get_buffer(this.sw_frame, 0), "frame buffer")?;
-            if kind == Kind::Vaapi {
+            if kind == Kind::Vaapi || frames.is_some() {
                 this.hw_frame = ff::av_frame_alloc();
             }
             info!(encoder = name, ?cfg, "FFmpeg encoder ready");
@@ -208,6 +268,12 @@ impl FfEncoder {
 
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Whether [`FfEncoder::request_keyframe`] works in place; if not, only a new encoder
+    /// starts with an IDR.
+    pub fn idr_on_request(&self) -> bool {
+        self.idr_on_request
     }
 
     /// Encodes one NV12 frame of the encoder's size.
@@ -260,6 +326,67 @@ impl FfEncoder {
                     self.hw_frame
                 }
             };
+            self.submit(input)
+        }
+    }
+
+    /// The frames context (its data, for comparisons) of the VA-API surfaces this encoder
+    /// takes; null for the other encoders.
+    pub fn frames_data(&self) -> *const u8 {
+        if self.hw_frames.is_null() {
+            return ptr::null();
+        }
+        // SAFETY: a valid buffer reference owned by `self`.
+        unsafe { (*self.hw_frames).data }
+    }
+
+    /// Encodes a VA surface from the capture; the encoder must have been opened on its
+    /// frames context ([`FfEncoder::new_on`]).
+    #[cfg(feature = "gnome")]
+    pub fn encode_va(&mut self, frame: &crate::vaimport::VaFrame) -> Result<EncodedFrame> {
+        // SAFETY: a VaFrame is a valid hardware frame for its life.
+        unsafe { self.encode_hw(frame.as_ptr()) }
+    }
+
+    /// Encodes a hardware frame of the frames context this encoder was opened on
+    /// ([`FfEncoder::new_on`]).
+    ///
+    /// # Safety
+    /// `frame` is a valid hardware frame (it is checked to be of that context).
+    pub unsafe fn encode_hw(&mut self, frame: *const ff::AVFrame) -> Result<EncodedFrame> {
+        // SAFETY: see the function's contract; the new reference is released right after
+        // the frame is sent.
+        unsafe {
+            let frames = (*frame).hw_frames_ctx;
+            if self.hw_frame.is_null()
+                || frames.is_null()
+                || self.frames_data() != (*frames).data.cast_const()
+            {
+                bail!("the frame is not from this encoder's frames context");
+            }
+            ff::av_frame_unref(self.hw_frame);
+            check(ff::av_frame_ref(self.hw_frame, frame), "hardware frame")?;
+            (*self.hw_frame).pts = self.pts;
+            (*self.hw_frame).pict_type = if self.force_idr {
+                ff::AVPictureType::AV_PICTURE_TYPE_I
+            } else {
+                ff::AVPictureType::AV_PICTURE_TYPE_NONE
+            };
+            let out = self.submit(self.hw_frame);
+            // The encoder holds its own reference: give the surface back to the pool as
+            // soon as it is done with it.
+            ff::av_frame_unref(self.hw_frame);
+            out
+        }
+    }
+
+    /// Sends `input` and collects the packet.
+    ///
+    /// # Safety
+    /// `input` is a valid frame for this encoder.
+    unsafe fn submit(&mut self, input: *mut ff::AVFrame) -> Result<EncodedFrame> {
+        // SAFETY: see the function's contract; packets are owned by `self`.
+        unsafe {
             self.pts += 1;
             check(ff::avcodec_send_frame(self.ctx, input), "encoding")?;
             let mut out = EncodedFrame::default();

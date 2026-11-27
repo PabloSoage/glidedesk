@@ -19,7 +19,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// - 3: apps: [`ServerMsg::Apps`], [`ClientMsg::OpenApp`], [`ServerMsg::AppExited`].
 /// - 4: [`ClientMsg::LinkReport`]: the server adapts parity, pacing and bitrate to losses;
 ///   files on the clipboard ([`files`]: `Files`, `FileRead`, `FileData` both ways).
-pub const VERSION: u32 = 4;
+/// - 5: [`ClientMsg::Formats`] (HEVC 4:4:4), sent by the client right after
+///   [`ServerMsg::Welcome`].
+pub const VERSION: u32 = 5;
 /// Oldest client version a server accepts (it then uses only what that version knows).
 pub const MIN_VERSION: u32 = 1;
 /// Default TCP and UDP port.
@@ -100,6 +102,11 @@ pub enum ClientMsg {
     FileRead(FileRead),
     /// (Version 4.) The answer to a [`ServerMsg::FileRead`].
     FileData(FileData),
+    /// (Version 5, right after [`ServerMsg::Welcome`].) Picture formats the client decodes
+    /// and shows besides 4:2:0. With `yuv444` and HEVC, the server may send 4:4:4 (Range
+    /// Extensions, `chroma_format_idc` 3, full-range BT.709) from its next keyframe on; the
+    /// stream itself says which it is. Only sent when the client wants something.
+    Formats { yuv444: bool },
 }
 
 /// One copied file or folder ([`files`]).
@@ -258,6 +265,7 @@ mod tests {
                 down: true,
             }),
             ClientMsg::FrameAck { frame_id: 7 },
+            ClientMsg::Formats { yuv444: true },
         ];
         let mut buf = Vec::new();
         for m in &msgs {

@@ -34,8 +34,11 @@ mod pipeline;
 mod pulse;
 mod rate;
 mod rdp;
+mod region;
 mod serve;
 mod sound;
+#[cfg(feature = "gnome")]
+mod vaimport;
 #[cfg(feature = "web")]
 mod web;
 #[cfg(target_os = "windows")]
@@ -44,6 +47,8 @@ mod winaudio;
 mod winclip;
 #[cfg(target_os = "windows")]
 mod wincuda;
+#[cfg(target_os = "windows")]
+mod wind3d;
 #[cfg(target_os = "windows")]
 mod winservice;
 #[cfg(target_os = "windows")]
@@ -159,6 +164,14 @@ enum Command {
         /// With AVC444, always send both views (no luma-only frames during motion).
         #[arg(long)]
         no_hybrid: bool,
+        /// Send HEVC 4:4:4 (full chroma: sharp coloured text) to native clients that ask for
+        /// it (`glidedesk --yuv444`). NVENC, on GPUs that encode 4:4:4; others get 4:2:0.
+        #[arg(long)]
+        yuv444: bool,
+        /// Quality by region: small updates (typing, menus: text and UI) are encoded at a
+        /// lower QP than the rest, from the compositor's damage rectangles. NVENC only.
+        #[arg(long)]
+        region_quality: bool,
         /// Do not re-encode a still image to raise its quality after motion.
         #[arg(long)]
         no_refine: bool,
@@ -354,6 +367,8 @@ async fn main() -> Result<()> {
             password,
             avc444,
             no_hybrid,
+            yuv444,
+            region_quality,
             no_refine,
             max_in_flight,
             gamestream,
@@ -426,6 +441,8 @@ async fn main() -> Result<()> {
                 session,
                 pipeline: pipeline::Options {
                     avc444,
+                    yuv444,
+                    region_quality,
                     hybrid: !no_hybrid,
                     refine: !no_refine,
                     max_in_flight,
@@ -629,6 +646,8 @@ async fn encode_test(
                 bitrate,
                 refs: 1,
                 invalidation: false,
+                yuv444: false,
+                qp_map: false,
             },
         )?;
         let mut file = std::fs::File::create(&out)?;
@@ -647,6 +666,7 @@ async fn encode_test(
                     enc.encode_host(data, *stride as usize)?
                 }
                 capture::FrameData::Gpu(buf) => enc.encode_device(buf)?,
+                capture::FrameData::Va(_) => anyhow::bail!("VA surfaces need the VA-API encoder"),
             };
             let us = t.elapsed().as_micros();
             total_us += us;

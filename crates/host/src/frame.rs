@@ -20,6 +20,13 @@ pub enum FrameData {
     Cpu { data: Vec<u8>, stride: u32 },
     /// Already on the encoder's GPU (DMA-BUF path, no CPU copy).
     Gpu(Arc<DeviceBuffer>),
+    /// An NV12 VA surface for the VA-API encoder (DMA-BUF imported and converted on the
+    /// GPU, [`crate::vaimport`]).
+    #[cfg(feature = "gnome")]
+    Va(crate::vaimport::VaFrame),
+    /// A BGRA copy of the desktop in Direct3D 11, for AMF and QSV ([`crate::wind3d`]).
+    #[cfg(target_os = "windows")]
+    D3d(Arc<crate::wind3d::D3dTexture>),
 }
 
 /// One captured frame.

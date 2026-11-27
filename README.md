@@ -176,6 +176,8 @@ Useful options of `serve` (`--help` lists them all):
 | `--refresh HZ` | 120 | refresh rate for RDP clients (native clients use their own screen's) |
 | `--bind`, `--native-bind`, `--web-bind` | `0.0.0.0:3389`, `0.0.0.0:3391`, `0.0.0.0:3390` | addresses; `--no-native` and `--no-web` turn those off |
 | `--avc444` | off | full-chroma AVC444 for RDP clients (experimental: `mstsc` shows it blurred) |
+| `--region-quality` | off | NVENC: small updates (typing, menus) at a lower QP than the rest, from GNOME's damage rectangles |
+| `--yuv444` | off | HEVC 4:4:4 for native clients started with `--yuv444` (NVENC on a GPU that encodes it; others get 4:2:0) |
 | `--x11 :0` | | serve an existing X11 display instead of a GNOME session (see Termux below) |
 | `--gamestream` | off | also answer Moonlight clients (see below) |
 
@@ -317,6 +319,9 @@ software. `--software-decode` forces the CPU (and H.264). With more than one GPU
 `--gpu intel` or `--gpu nvidia` picks the one that decodes and draws (a laptop's integrated GPU,
 say); the picture still shows on whichever screen the window is on. `--codec h264` or
 `--codec hevc` overrides the automatic choice; `--no-clipboard` keeps the clipboard local.
+`--yuv444` asks a server started with `--yuv444` for HEVC 4:4:4 (sharp coloured text); FFmpeg
+decodes it on VA-API or NVDEC where the GPU can, in software otherwise (always on Windows:
+D3D11VA has no HEVC 4:4:4 in FFmpeg).
 
 The first connection to a server shows the SHA-256 fingerprint of its certificate and asks
 whether to trust it, before any password is sent; the answer is remembered

@@ -247,6 +247,7 @@ impl Launcher {
             },
             fingerprint,
             codec: self.codec,
+            yuv444: false,
             no_clipboard: !self.clipboard,
             app: if self.rdp { None } else { self.app() },
         })

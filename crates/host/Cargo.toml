@@ -65,6 +65,8 @@ rusty_enet = "0.4"
 # Virtual gamepads for Moonlight's controllers.
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13"
+# libavfilter's scale_vaapi: the GPU converts imported DMA-BUFs for VA-API (vaimport.rs).
+ffmpeg-sys-next = { version = "8", default-features = false, features = ["avcodec", "avfilter"] }
 
 [target.'cfg(windows)'.dependencies]
 vigem-client = { version = "0.1", features = ["unstable_xtarget_notification"] }

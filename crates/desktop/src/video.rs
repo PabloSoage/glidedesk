@@ -12,17 +12,24 @@ use tracing::{debug, info, warn};
 
 use crate::decode::Decoder;
 
-/// A decoded picture: NV12 (Y plane, interleaved UV plane at half size), full-range BT.709.
+/// A decoded picture, full-range BT.709: the Y plane and the chroma.
 pub struct Picture {
     pub width: u32,
     pub height: u32,
     pub y: Vec<u8>,
-    pub uv: Vec<u8>,
-    /// Bytes per row of each plane.
+    /// Bytes per row of the Y plane.
     pub y_stride: u32,
-    pub uv_stride: u32,
+    pub chroma: Chroma,
     /// When its access unit arrived (for the latency statistics).
     pub received: Instant,
+}
+
+/// The chroma of a [`Picture`].
+pub enum Chroma {
+    /// 4:2:0 as NV12: U and V interleaved, half the width and height.
+    Nv12 { uv: Vec<u8>, stride: u32 },
+    /// 4:4:4: U and V planes as large as the Y plane, `stride` bytes per row each.
+    Planar { u: Vec<u8>, v: Vec<u8>, stride: u32 },
 }
 
 /// What the session hands to the window besides pictures.
@@ -59,6 +66,8 @@ pub struct Sink {
     queued: Arc<AtomicUsize>,
     notify: Notify,
     audio: Option<crate::audio::Player>,
+    /// Ask native servers for HEVC 4:4:4 (`--yuv444`).
+    yuv444: bool,
 }
 
 impl VideoSink for Sink {
@@ -79,6 +88,10 @@ impl VideoSink for Sink {
 
     fn backlog(&self) -> usize {
         self.queued.load(Ordering::Relaxed)
+    }
+
+    fn yuv444(&self) -> bool {
+        self.yuv444
     }
 
     fn cursor(&mut self, cursor: &glidedesk_proto::Cursor) {
@@ -105,12 +118,14 @@ impl VideoSink for Sink {
 }
 
 /// Starts the decoder thread; pictures land in `slot`. `hardware`: use the GPU's decoder
-/// when there is one.
+/// when there is one. `yuv444`: ask for HEVC 4:4:4 (decoded on the GPU where FFmpeg can,
+/// else in software).
 pub fn start(
     slot: Arc<Mutex<Option<Picture>>>,
     notify: Notify,
     audio: Option<crate::audio::Player>,
     hardware: bool,
+    yuv444: bool,
 ) -> Sink {
     let (tx, rx) = mpsc::channel::<Unit>();
     let n = Arc::clone(&notify);
@@ -125,6 +140,7 @@ pub fn start(
         queued,
         notify,
         audio,
+        yuv444,
     }
 }
 
