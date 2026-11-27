@@ -53,6 +53,18 @@ pub trait VideoSink: Send {
     fn yuv444(&self) -> bool {
         false
     }
+    /// The monitors of the remote desktop (native protocol, version 6), after each change;
+    /// pointer positions are in their space. Monitor 0 is the one of [`VideoSink::reset`]
+    /// and [`VideoSink::frame`]; the others have the `_monitor` calls below.
+    fn layout(&mut self, _monitors: &[glidedesk_proto::Monitor]) {}
+    /// [`VideoSink::reset`] for monitor `monitor` (not 0) of the layout.
+    fn reset_monitor(&mut self, _monitor: u8, _width: u32, _height: u32, _codec: VideoCodec) {}
+    /// [`VideoSink::frame`] for monitor `monitor` (not 0).
+    fn frame_monitor(&mut self, _monitor: u8, _data: &[u8]) {}
+    /// [`VideoSink::backlog`] for monitor `monitor` (not 0).
+    fn backlog_monitor(&self, _monitor: u8) -> usize {
+        0
+    }
 }
 
 pub type SharedSink = Arc<Mutex<dyn VideoSink>>;

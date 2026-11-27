@@ -330,6 +330,7 @@ impl App {
                     refresh,
                     trust,
                     app: a.app,
+                    monitors: Vec::new(),
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await

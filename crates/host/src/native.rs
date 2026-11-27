@@ -882,6 +882,23 @@ where
                 }
             }
             ClientMsg::Hello { .. } => warn!("Second Hello ignored"),
+            // One monitor only so far: answer with it.
+            ClientMsg::Monitors(asked) => {
+                debug!(?asked, "Client asked for several monitors");
+                let (w, h) = *shared.session.current_size.lock().unwrap();
+                let _ = ctl_tx.send(ServerMsg::Layout(vec![glidedesk_proto::Monitor {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: w as u16,
+                    height: h as u16,
+                    refresh,
+                    primary: true,
+                }]));
+            }
+            ClientMsg::MonitorVideo { monitor, .. } => {
+                debug!(monitor, "Video message for a monitor not set up");
+            }
         }
     };
     input.keyboard(KeyboardEvent::Synchronize(

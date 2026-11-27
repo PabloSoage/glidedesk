@@ -11,7 +11,14 @@
 //! AUDIO u8 | seq u32 | PCM S16LE 48 kHz stereo
 //! HELLO u8 | token [16]
 //! SYNC  u8 | last_frame_id u32   (server: frames are held back waiting for acknowledgements)
+//! VIDEO2 u8 | monitor u8 | the rest of a VIDEO packet         (version 6)
+//! SYNC2  u8 | monitor u8 | last_frame_id u32                   (version 6)
 //! ```
+//!
+//! VIDEO2 and SYNC2 carry the video of monitors other than monitor 0 (see
+//! [`crate::Monitor`]); each monitor numbers its frames on its own and needs a
+//! [`Reassembler`] of its own. Monitor 0 keeps VIDEO and SYNC, so a session of one monitor
+//! looks the same to every version.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -20,6 +27,10 @@ pub const VIDEO: u8 = 1;
 pub const AUDIO: u8 = 2;
 pub const HELLO: u8 = 3;
 pub const SYNC: u8 = 4;
+/// (Version 6.) Video of a monitor other than 0.
+pub const VIDEO2: u8 = 5;
+/// (Version 6.) [`SYNC`] for a monitor other than 0.
+pub const SYNC2: u8 = 6;
 
 /// Shard payload: with the headers and encryption a packet stays under 1200 bytes, below
 /// the MTU of any usual path (VPNs included).
@@ -40,6 +51,51 @@ pub fn packetize(frame_id: u32, keyframe: bool, data: &[u8], fec_percent: u32) -
 
 /// [`packetize`], marking a recovery frame (see [`crate::ClientMsg::InvalidateFrames`]).
 pub fn packetize_frame(
+    frame_id: u32,
+    keyframe: bool,
+    recovery: bool,
+    data: &[u8],
+    fec_percent: u32,
+) -> Vec<Vec<u8>> {
+    packetize_with(&[VIDEO], frame_id, keyframe, recovery, data, fec_percent)
+}
+
+/// [`packetize_frame`] for the video of `monitor` (version 6): [`VIDEO2`] packets, or plain
+/// [`VIDEO`] ones for monitor 0.
+pub fn packetize_monitor(
+    monitor: u8,
+    frame_id: u32,
+    keyframe: bool,
+    recovery: bool,
+    data: &[u8],
+    fec_percent: u32,
+) -> Vec<Vec<u8>> {
+    if monitor == 0 {
+        return packetize_frame(frame_id, keyframe, recovery, data, fec_percent);
+    }
+    packetize_with(&[VIDEO2, monitor], frame_id, keyframe, recovery, data, fec_percent)
+}
+
+/// The monitor a video packet belongs to ([`VIDEO`] is monitor 0); `None` for other packets.
+pub fn video_monitor(p: &[u8]) -> Option<u8> {
+    match p {
+        [VIDEO, ..] => Some(0),
+        [VIDEO2, monitor, ..] => Some(*monitor),
+        _ => None,
+    }
+}
+
+/// A video packet from its frame id on (the kind, and the monitor of [`VIDEO2`], left out).
+fn video_body(p: &[u8]) -> Option<&[u8]> {
+    match p {
+        [VIDEO, body @ ..] => Some(body),
+        [VIDEO2, _, body @ ..] => Some(body),
+        _ => None,
+    }
+}
+
+fn packetize_with(
+    prefix: &[u8],
     frame_id: u32,
     keyframe: bool,
     recovery: bool,
@@ -81,8 +137,8 @@ pub fn packetize_frame(
             );
         }
         for (si, shard) in shards.iter().enumerate() {
-            let mut p = Vec::with_capacity(VIDEO_HEADER + shard.len());
-            p.push(VIDEO);
+            let mut p = Vec::with_capacity(prefix.len() + VIDEO_HEADER + shard.len());
+            p.extend_from_slice(prefix);
             p.extend_from_slice(&frame_id.to_le_bytes());
             p.push(flags);
             p.push(bi as u8);
@@ -150,27 +206,29 @@ fn after(a: u32, b: u32) -> bool {
 }
 
 impl Reassembler {
-    /// Feeds one video packet (plaintext, starting with [`VIDEO`]).
+    /// Feeds one video packet (plaintext, starting with [`VIDEO`] or [`VIDEO2`]; one
+    /// reassembler takes the packets of one monitor).
     pub fn push(&mut self, p: &[u8]) -> Vec<Event> {
         let mut events = Vec::new();
-        if p.len() < VIDEO_HEADER || p[0] != VIDEO {
+        // The header without its first byte, the kind.
+        let Some(p) = video_body(p).filter(|b| b.len() >= VIDEO_HEADER - 1) else {
             return events;
-        }
-        let frame_id = u32::from_le_bytes(p[1..5].try_into().unwrap());
+        };
+        let frame_id = u32::from_le_bytes(p[0..4].try_into().unwrap());
         if self.last.is_some_and(|l| !after(frame_id, l)) {
             return events; // already delivered or given up
         }
         let (flags, bi, blocks, si, data_shards, parity) = (
-            p[5],
+            p[4],
+            p[5] as usize,
             p[6] as usize,
             p[7] as usize,
             p[8] as usize,
             p[9] as usize,
-            p[10] as usize,
         );
-        let frame_len = u32::from_le_bytes(p[11..15].try_into().unwrap()) as usize;
-        let block_len = u32::from_le_bytes(p[15..19].try_into().unwrap()) as usize;
-        let shard = &p[VIDEO_HEADER..];
+        let frame_len = u32::from_le_bytes(p[10..14].try_into().unwrap()) as usize;
+        let block_len = u32::from_le_bytes(p[14..18].try_into().unwrap()) as usize;
+        let shard = &p[VIDEO_HEADER - 1..];
         if bi >= blocks || si >= data_shards + parity || data_shards == 0 {
             return events;
         }
@@ -316,6 +374,26 @@ pub fn parse_sync(p: &[u8]) -> Option<u32> {
         return None;
     }
     Some(u32::from_le_bytes(p[1..5].try_into().ok()?))
+}
+
+/// [`sync_packet`] for the video of `monitor` (version 6): [`SYNC2`], or [`SYNC`] for
+/// monitor 0.
+pub fn sync_packet_monitor(monitor: u8, last_frame_id: u32) -> Vec<u8> {
+    if monitor == 0 {
+        return sync_packet(last_frame_id);
+    }
+    let mut p = vec![SYNC2, monitor];
+    p.extend_from_slice(&last_frame_id.to_le_bytes());
+    p
+}
+
+/// The monitor and last frame of a [`SYNC`] (monitor 0) or [`SYNC2`] packet.
+pub fn parse_sync_monitor(p: &[u8]) -> Option<(u8, u32)> {
+    match p {
+        [SYNC, ..] => parse_sync(p).map(|last| (0, last)),
+        [SYNC2, monitor, last @ ..] => Some((*monitor, u32::from_le_bytes(last.try_into().ok()?))),
+        _ => None,
+    }
 }
 
 /// Fills in the missing data shards of a block from the ones received (at least
@@ -487,6 +565,25 @@ mod tests {
         // Nothing missing any more.
         assert!(r.sync(3, Duration::ZERO).is_empty());
         assert_eq!(parse_sync(&sync_packet(7)), Some(7));
+    }
+
+    #[test]
+    fn monitors_have_their_own_packets() {
+        let data = frame(30_000, 5);
+        let second = packetize_monitor(2, 1, true, false, &data, 20);
+        assert!(second.iter().all(|p| p[0] == VIDEO2 && video_monitor(p) == Some(2)));
+        // Monitor 0 looks like a single-monitor session.
+        let first = packetize_monitor(0, 1, true, false, &data, 20);
+        assert_eq!(first, packetize(1, true, &data, 20));
+        assert!(first.iter().all(|p| video_monitor(p) == Some(0)));
+        let mut r = Reassembler::default();
+        let got: Vec<_> = second.iter().flat_map(|p| frames_of(r.push(p))).collect();
+        assert_eq!(got, vec![(1, data)]);
+        assert_eq!(video_monitor(&audio_packet(1, &[0; 4])), None);
+        assert_eq!(parse_sync_monitor(&sync_packet_monitor(3, 9)), Some((3, 9)));
+        assert_eq!(parse_sync_monitor(&sync_packet_monitor(0, 9)), Some((0, 9)));
+        assert_eq!(sync_packet_monitor(0, 9), sync_packet(9));
+        assert_eq!(parse_sync_monitor(&[SYNC2, 1, 0]), None);
     }
 }
 

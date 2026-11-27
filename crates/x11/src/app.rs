@@ -386,6 +386,7 @@ pub fn main() -> Result<()> {
                     refresh: 60,
                     trust: Default::default(),
                     app: a.app,
+                    monitors: Vec::new(),
                 };
                 glidedesk_client::native::run(opts, sink, rx)
                     .await
