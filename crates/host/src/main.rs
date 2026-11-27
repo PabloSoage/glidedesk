@@ -12,6 +12,8 @@ mod capture;
 mod clipboard;
 mod color;
 mod csc;
+#[cfg(target_os = "linux")]
+mod daemon;
 mod encoder;
 mod ffenc;
 mod filecopy;
@@ -20,6 +22,8 @@ mod gamestream;
 #[cfg(feature = "gnome")]
 mod gnome;
 mod gpu;
+#[cfg(target_os = "linux")]
+mod handover;
 mod input;
 #[cfg(feature = "gnome")]
 mod mutter;
@@ -98,7 +102,7 @@ enum Command {
         #[arg(long)]
         no_web: bool,
         /// CUDA device index (NVENC).
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, env = "GLIDEDESK_GPU", default_value_t = 0)]
         gpu: usize,
         /// Video encoder: NVENC (NVIDIA), VA-API (AMD, Intel, others) or software (x264).
         #[arg(long, value_enum, env = "GLIDEDESK_ENCODER", default_value = "auto")]
@@ -167,6 +171,42 @@ enum Command {
         /// Moonlight as `address:port` when it is not the usual one.
         #[arg(long, default_value_t = gamestream::HTTP_PORT, value_parser = clap::value_parser!(u16).range(1024..65500))]
         gamestream_port: u16,
+        /// Run as a session of `glidedesk-host daemon`: take the native clients it logged
+        /// in, over $XDG_RUNTIME_DIR/glidedesk/handover.sock, and open no port of its own
+        /// (no RDP, web or GameStream). Started by glidedesk-session@.service.
+        #[cfg(target_os = "linux")]
+        #[arg(long, conflicts_with = "no_native")]
+        handover: bool,
+    },
+    /// Run as the system service (as root): log native clients in with their system
+    /// account (PAM) and give each user a headless GNOME session of their own, started
+    /// through systemd (scripts/systemd).
+    #[cfg(target_os = "linux")]
+    Daemon {
+        /// Native protocol address (TCP and UDP).
+        #[arg(long, default_value = "0.0.0.0:3391")]
+        native_bind: std::net::SocketAddr,
+        /// GPUs to spread sessions over, comma-separated: CUDA device indices (NVENC) or
+        /// VA-API render nodes, e.g. `0,1` or `/dev/dri/renderD128,/dev/dri/renderD129`.
+        /// A new session gets the one with the fewest sessions. Without it, every session
+        /// uses the encoder's default GPU.
+        #[arg(long, value_delimiter = ',', value_parser = daemon::parse_gpu)]
+        gpus: Vec<daemon::GpuSlot>,
+        /// Always give this user's sessions this GPU (an index into --gpus). Repeatable.
+        #[arg(long, value_name = "USER=INDEX", value_parser = daemon::parse_pin)]
+        pin_gpu: Vec<(String, usize)>,
+        /// Folder of the TLS identity.
+        #[arg(long, default_value = "/var/lib/glidedesk")]
+        state_dir: std::path::PathBuf,
+        /// TLS certificate (PEM chain) instead of the self-signed one.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<std::path::PathBuf>,
+        /// The certificate's private key (PEM).
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<std::path::PathBuf>,
+        /// The systemd template unit of a user's session (`NAME@USER.service`).
+        #[arg(long, default_value = "glidedesk-session")]
+        session_unit: String,
     },
     /// Run only the GameStream front end (pairing, server info, app list), for testing
     /// Moonlight clients without a session.
@@ -270,7 +310,13 @@ async fn main() -> Result<()> {
             auth,
             tls_cert,
             tls_key,
+            #[cfg(target_os = "linux")]
+            handover,
         } => {
+            #[cfg(target_os = "linux")]
+            let handover = handover.then(handover::own_socket);
+            #[cfg(not(target_os = "linux"))]
+            let handover: Option<std::path::PathBuf> = None;
             #[cfg(feature = "gnome")]
             capture::set_refresh_rate(refresh);
             #[cfg(feature = "x11")]
@@ -303,16 +349,26 @@ async fn main() -> Result<()> {
                 tracing::info!(user = username, "Logins are checked against the system account");
             }
             let rdp_password = password.clone();
-            if auth == AuthMode::System && rdp_password.is_none() {
+            if auth == AuthMode::System && rdp_password.is_none() && handover.is_none() {
                 tracing::warn!("No --password: RDP is off (its NLA needs the password itself)");
             }
             let password = match (auth, password) {
                 (_, Some(p)) => p,
+                // The daemon checks the password of the clients it hands over.
+                (_, None) if handover.is_some() => String::new(),
                 (AuthMode::System, None) => String::new(),
                 (AuthMode::Password, None) => {
                     anyhow::bail!("--password (or GLIDEDESK_PASSWORD) is needed, or --auth system")
                 }
             };
+            #[cfg(target_os = "linux")]
+            let native_listen = match handover.clone() {
+                Some(path) => native::Listen::Handover(path),
+                None => native::Listen::Tcp,
+            };
+            #[cfg(not(target_os = "linux"))]
+            let native_listen = native::Listen::Tcp;
+            let alone = handover.is_none();
             serve::serve(serve::ServeOptions {
                 session,
                 pipeline: pipeline::Options {
@@ -325,8 +381,9 @@ async fn main() -> Result<()> {
                 },
                 bind,
                 native_bind: (!no_native).then_some(native_bind),
+                native_listen,
                 #[cfg(feature = "web")]
-                web_bind: (!no_web).then_some(web_bind),
+                web_bind: (!no_web && alone).then_some(web_bind),
                 gpu,
                 encoder,
                 render_node,
@@ -336,14 +393,36 @@ async fn main() -> Result<()> {
                 height,
                 username,
                 password,
-                rdp: rdp_password.is_some() || auth == AuthMode::Password,
+                rdp: alone && (rdp_password.is_some() || auth == AuthMode::Password),
                 state_dir,
-                gamestream: gamestream.then(|| {
+                gamestream: (gamestream && alone).then(|| {
                     (
                         std::net::SocketAddr::new(bind.ip(), gamestream_port),
                         std::net::SocketAddr::new(bind.ip(), gamestream_port - 5),
                     )
                 }),
+            })
+            .await
+        }
+        #[cfg(target_os = "linux")]
+        Command::Daemon {
+            native_bind,
+            gpus,
+            pin_gpu,
+            state_dir,
+            tls_cert,
+            tls_key,
+            session_unit,
+        } => {
+            if let (Some(cert), Some(key)) = (&tls_cert, &tls_key) {
+                rdp::install_identity(&state_dir, cert, key)?;
+            }
+            daemon::run(daemon::Options {
+                bind: native_bind,
+                state_dir,
+                gpus,
+                pins: pin_gpu,
+                session_unit,
             })
             .await
         }

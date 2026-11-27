@@ -237,6 +237,36 @@ If the "Stop screen sharing" button in GNOME's top bar is pressed, the server st
 session by itself within about a second; clients stay connected. Windows that were full
 screen or maximized come back as normal windows (Mutter moves them off the closed monitor).
 
+### As a system service (preview, native protocol only)
+
+Instead of starting the server by hand in a session, `glidedesk-host daemon` can run as a
+systemd service: clients then log in with **their own Linux user name and password**, and
+each user gets a headless GNOME session of their own, started on their first login and kept
+when they disconnect (the next login takes it over). As root:
+
+```sh
+install glidedesk-host /usr/local/bin/
+install scripts/dev-session.sh /usr/local/bin/glidedesk-session.sh   # the release's glidedesk-session.sh
+cp scripts/systemd/glidedesk.service scripts/systemd/glidedesk-session@.service /etc/systemd/system/
+cp scripts/pam.d/glidedesk scripts/pam.d/glidedesk-session /etc/pam.d/   # Fedora, Arch: see the files
+systemctl daemon-reload && systemctl enable --now glidedesk
+```
+
+The daemon listens on 3391 (TCP and UDP) and checks passwords through PAM; system accounts
+(below uid 1000) and root cannot log in. A session runs as
+`glidedesk-session@USER.service` (`systemctl stop glidedesk-session@USER` ends it,
+`journalctl -u glidedesk-session@USER` shows its log). The certificate clients pin is in
+`/var/lib/glidedesk/`. With several GPUs, `--gpus 0,1` (CUDA devices) or
+`--gpus /dev/dri/renderD128,/dev/dri/renderD129` (VA-API) gives each new session the GPU
+with the fewest sessions, and `--pin-gpu USER=INDEX` keeps a user on one of them (add them
+with `systemctl edit glidedesk`). GNOME Shell itself still draws every session on its
+primary GPU; if a session on another GPU shows no picture, add `GLIDEDESK_NO_DMABUF=1` to
+the session unit (`systemctl edit glidedesk-session@`), which copies frames through memory.
+
+Not in this mode yet: RDP (its NLA has to check the password itself, which PAM does not
+allow), the web client and Moonlight; they keep working from a plain `serve` in a user
+session, with `--no-native` since the daemon holds 3391.
+
 ## Clients
 
 ### Windows: Remote Desktop (`mstsc`)

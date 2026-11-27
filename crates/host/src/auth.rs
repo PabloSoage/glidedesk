@@ -39,15 +39,7 @@ pub fn verify_credentials(
         if !user.is_empty() && user != account {
             return false;
         }
-        // PAM and LogonUser can take seconds (a failure is delayed on purpose): off the async
-        // workers where the runtime allows it.
-        let check = || system::verify(account, password);
-        return match tokio::runtime::Handle::try_current() {
-            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(check)
-            }
-            _ => check(),
-        };
+        return verify_system_password(account, password);
     }
     let h = |s: &str| digest(&SHA256, s.as_bytes());
     let u = h(expected_user).as_ref().ct_eq(h(user).as_ref());
@@ -55,11 +47,27 @@ pub fn verify_credentials(
     bool::from(u & p)
 }
 
+/// Whether `password` is the system password of `user` (PAM on Linux, `LogonUser` on
+/// Windows). Only root can check accounts other than its own on Linux, as
+/// `glidedesk-host daemon` does.
+pub fn verify_system_password(user: &str, password: &str) -> bool {
+    // PAM and LogonUser can take seconds (a failure is delayed on purpose): off the async
+    // workers where the runtime allows it.
+    let check = || system::verify(user, password);
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(check)
+        }
+        _ => check(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod system {
     //! PAM through libpam (`/etc/pam.d/glidedesk`, see `scripts/pam.d/glidedesk`). A
     //! process that is not root can check only its own user's password (pam_unix's
-    //! `unix_chkpwd` helper), which is what the host needs.
+    //! `unix_chkpwd` helper), which is what `serve --auth system` needs; the root daemon
+    //! checks any account.
 
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
