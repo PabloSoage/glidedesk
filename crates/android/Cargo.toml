@@ -1,6 +1,6 @@
 [package]
 name = "glidedesk-android"
-description = "JNI bridge of the glidedesk Android client: session, MediaCodec decoding into the app's Surface, input"
+description = "JNI bridge of the glidedesk Android app: client session with MediaCodec decoding into the app's Surface; server of the phone's screen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,8 +13,16 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 tracing = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 glidedesk-client = { path = "../client" }
+# The phone server (src/server): native protocol, TLS identity, login.
+glidedesk-proto = { path = "../proto" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = "0.14"
+sha2 = "0.10"
+subtle = "2.6"
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

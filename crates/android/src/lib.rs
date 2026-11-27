@@ -1,9 +1,16 @@
-//! JNI bridge of the Android client.
+//! JNI bridge of the Android app.
 //!
-//! Kotlin (`io.github.pablosoage.glidedesk.NativeSession`) opens a session, hands over the
-//! `Surface` of its view and forwards touch and keyboard input. Video never crosses JNI:
-//! each H.264 access unit from the session goes to an `AMediaCodec` decoder that renders
+//! Client: Kotlin (`io.github.pablosoage.glidedesk.NativeSession`) opens a session, hands
+//! over the `Surface` of its view and forwards touch and keyboard input. Video never crosses
+//! JNI: each H.264 access unit from the session goes to an `AMediaCodec` decoder that renders
 //! straight into that `Surface`.
+//!
+//! Server ([`server`], `server_jni.rs`): the phone's own screen, encoded by MediaCodec in
+//! Kotlin, served over the native protocol.
+
+pub mod server;
+#[cfg(target_os = "android")]
+mod server_jni;
 
 #[cfg(target_os = "android")]
 mod android {
