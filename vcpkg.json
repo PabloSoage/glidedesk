@@ -13,8 +13,9 @@
   ],
   "features": {
     "host": {
-      "description": "Encoders for the Windows host: AMF (AMD), Quick Sync (Intel), NVENC (NVIDIA), Media Foundation and x264",
+      "description": "Encoders for the Windows host: AMF (AMD), Quick Sync (Intel), NVENC (NVIDIA), Media Foundation and x264; OpenSSL for the web front end's WebRTC (DTLS)",
       "dependencies": [
+        "openssl",
         {
           "name": "ffmpeg",
           "default-features": false,

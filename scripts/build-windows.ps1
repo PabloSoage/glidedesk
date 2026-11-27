@@ -47,8 +47,11 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $env:FFMPEG_DIR = "$installRoot\$triplet"
 $cargoArgs = @(if ($rest -contains '--debug') { $rest | Where-Object { $_ -ne '--debug' } } else { @('--release') + $rest })
 if ($hostBuild) {
-    # No GNOME and no web front end on Windows yet.
-    cargo build -p glidedesk-host --no-default-features @cargoArgs
+    # No GNOME on Windows. The web front end's WebRTC (str0m) needs OpenSSL: vcpkg's, linked
+    # statically like FFmpeg. libopus is built from source by opusic-sys (CMake).
+    $env:OPENSSL_DIR = "$installRoot\$triplet"
+    $env:OPENSSL_STATIC = '1'
+    cargo build -p glidedesk-host --no-default-features --features web @cargoArgs
 } else {
     cargo build -p glidedesk-desktop @cargoArgs
 }

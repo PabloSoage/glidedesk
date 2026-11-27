@@ -324,6 +324,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     };
     #[cfg(feature = "web")]
     let web_limiter = Arc::clone(&auth_limiter);
+    #[cfg(feature = "web")]
     let web_apps = Arc::clone(&apps);
     #[cfg(feature = "web")]
     let web = async {
