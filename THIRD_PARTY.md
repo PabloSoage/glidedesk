@@ -13,6 +13,7 @@
 | [rusty_enet](https://github.com/jabuwu/rusty_enet) (ENet 1.3 in Rust) | host dependency (Moonlight control stream) | MIT |
 | [evdev](https://github.com/cmr/evdev) | host dependency on Linux (virtual gamepads through uinput) | Apache-2.0 OR MIT |
 | [vigem-client](https://github.com/CasualX/vigem-client) | host dependency on Windows (virtual gamepads through ViGEmBus) | MIT |
+| [SudoVDA](https://github.com/SudoMaker/SudoVDA) virtual display driver | installed separately for `--virtual-display` on Windows, not shipped; its control codes and structures (`Common/Include/sudovda-ioctl.h`, commit `a4b09fa`) are in `crates/host/src/winvdisplay.rs` | MIT |
 | [inputtino](https://github.com/games-on-whales/inputtino) DualSense report descriptor and feature reports | `crates/host/src/gamestream/dualsense.rs` | MIT (notice in the file) |
 | `crates/desktop/src/probe.hevc`: a 256×144 HEVC test frame made with FFmpeg's `testsrc2` | desktop client | generated, no license |
 
@@ -36,6 +37,7 @@ and commit, and marked in the file header.
 | `crates/host/src/gamestream/dualsense.rs` (virtual DualSense over UHID: report descriptor, feature and input reports, rumble) | [inputtino](https://github.com/games-on-whales/inputtino) `src/uhid/joypad_ps5.cpp`, `src/uhid/include/uhid/ps5.hpp` (MIT) | `d28ec79` |
 | `crates/host/src/winservice.rs` (service starting the host in the console session with its SYSTEM token, job object, restart on console session changes) | Sunshine `tools/sunshinesvc.cpp` | `224c6be` |
 | `crates/host/src/winsession.rs` (following the input desktop before duplication and SendInput; SeIncreaseBasePriorityPrivilege, realtime GPU priority and `SetGPUThreadPriority`) | Sunshine `src/platform/windows/misc.cpp` (`syncThreadDesktop`), `src/platform/windows/display_base.cpp` | `224c6be` |
+| `crates/host/src/winvdisplay.rs` (SudoVDA control: opening the device, watchdog ping, the new monitor's GDI name, its mode) | [Apollo](https://github.com/ClassicOldSong/Apollo) `third-party/sudovda/sudovda.h`, `src/platform/windows/virtual_display.cpp` (GPL-3.0) | `adc5c5a` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).

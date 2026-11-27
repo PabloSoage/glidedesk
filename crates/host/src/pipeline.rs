@@ -290,6 +290,7 @@ impl Pipeline {
             };
             if new_client {
                 self.generation = generation;
+                self.source.client_arrived();
                 for o in &mut self.outputs {
                     o.reset();
                 }
@@ -350,7 +351,10 @@ impl Pipeline {
         };
         let (avc444, codec) =
             match output.prepare(frame.width, frame.height, self.opts.max_in_flight)? {
-                Prepared::Absent => return Ok(()),
+                Prepared::Absent => {
+                    self.source.client_left();
+                    return Ok(());
+                }
                 Prepared::Busy => {
                     // Skip before encoding: a P-frame that is encoded but never sent would
                     // break the reference chain on the client. The run loop retries this
@@ -363,6 +367,7 @@ impl Pipeline {
                     avc444,
                     codec,
                 } => {
+                    self.source.client_arrived();
                     let lost = output.take_lost();
                     if new_surface {
                         self.need_full = true;

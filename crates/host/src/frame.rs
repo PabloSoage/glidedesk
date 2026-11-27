@@ -174,6 +174,14 @@ pub trait Source: Send {
     fn set_refresh(&self, _hz: u32) -> bool {
         false
     }
+
+    /// The session has a client: one took over, or the active front end takes a frame.
+    /// Called for every frame; sources keep only the changes.
+    fn client_arrived(&self) {}
+
+    /// The session has no client: the active front end had none for a frame. Sources that
+    /// make something for the client (a virtual monitor) may let it go after a while.
+    fn client_left(&self) {}
 }
 
 #[cfg(test)]

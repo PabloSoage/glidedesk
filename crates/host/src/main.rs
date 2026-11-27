@@ -44,6 +44,8 @@ mod wincuda;
 mod winservice;
 #[cfg(target_os = "windows")]
 mod winsession;
+#[cfg(target_os = "windows")]
+mod winvdisplay;
 #[cfg(feature = "x11")]
 mod x11session;
 
@@ -164,6 +166,12 @@ enum Command {
         /// Moonlight as `address:port` when it is not the usual one.
         #[arg(long, default_value_t = gamestream::HTTP_PORT, value_parser = clap::value_parser!(u16).range(1024..65500))]
         gamestream_port: u16,
+        /// Serve a virtual monitor that takes the client's size and refresh rate instead of
+        /// the physical monitors (also for a PC without one). Needs the SudoVDA driver;
+        /// without it the monitors are served.
+        #[cfg(target_os = "windows")]
+        #[arg(long)]
+        virtual_display: bool,
     },
     /// Run as a Windows service (as SYSTEM), so that the lock screen, the sign-in screen and
     /// UAC prompts are seen and used too.
@@ -307,6 +315,8 @@ async fn main() -> Result<()> {
             auth,
             tls_cert,
             tls_key,
+            #[cfg(target_os = "windows")]
+            virtual_display,
         } => {
             #[cfg(feature = "gnome")]
             capture::set_refresh_rate(refresh);
@@ -380,6 +390,8 @@ async fn main() -> Result<()> {
                         std::net::SocketAddr::new(bind.ip(), gamestream_port - 5),
                     )
                 }),
+                #[cfg(target_os = "windows")]
+                virtual_display,
             })
             .await
         }

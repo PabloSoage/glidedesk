@@ -1,11 +1,11 @@
 //! Windows session: the console desktop through DXGI Desktop Duplication, input through
 //! `SendInput`. Audio is in `winaudio`, the clipboard in `winclip`.
 //!
-//! The primary monitor is served at its own size (no virtual display yet). Duplication is
-//! lost on a mode change, a full-screen exclusive application or a desktop switch (UAC,
-//! lock screen); the capture thread moves to the input desktop and duplicates the output
-//! again until it works. A user program cannot capture or drive the secure desktop: the
-//! service can (`winservice`).
+//! The primary monitor is served at its own size, or with `--virtual-display` a virtual
+//! monitor that follows the client (`winvdisplay`). Duplication is lost on a mode change, a
+//! full-screen exclusive application or a desktop switch (UAC, lock screen); the capture
+//! thread moves to the input desktop and duplicates the output again until it works. A user
+//! program cannot capture or drive the secure desktop: the service can (`winservice`).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
-use windows::Win32::Foundation::{GENERIC_ALL, HANDLE, HMODULE, RECT};
+use windows::Win32::Foundation::{GENERIC_ALL, HANDLE, HMODULE, LUID, RECT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
@@ -25,8 +25,8 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
-    IDXGIOutputDuplication,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIDevice,
+    IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
 };
 use windows::Win32::Security::SE_INC_BASE_PRIORITY_NAME;
 use windows::Win32::System::StationsAndDesktops::{
@@ -55,6 +55,7 @@ use crate::frame::{
 };
 use crate::input::{Input, InputBackend};
 use crate::wincuda::D3dToCuda;
+use crate::winvdisplay::{self, Control};
 
 pub struct WinSession {
     pub size: (u32, u32),
@@ -62,29 +63,115 @@ pub struct WinSession {
     pub frames: FrameReceiver,
     pub cursor: watch::Receiver<Option<CursorEvent>>,
     pub input: WinInput,
+    /// The virtual display, with `--virtual-display` and the driver: removed at the end.
+    pub display: Option<Arc<Control>>,
 }
 
-/// The desktop has the monitor's size: requests to change it are ignored.
-pub struct WinSource;
+/// Without a virtual display the desktop has the monitor's size: requests to change it are
+/// ignored. With one, the virtual monitor follows the client.
+pub struct WinSource {
+    display: Option<Arc<Control>>,
+}
 
 impl Source for WinSource {
     fn resize(&self, width: u32, height: u32) {
-        debug!(
-            width,
-            height, "The Windows desktop keeps the monitor's size"
-        );
+        match &self.display {
+            Some(d) => d.resize(width, height),
+            None => debug!(
+                width,
+                height, "The Windows desktop keeps the monitor's size"
+            ),
+        }
+    }
+
+    fn set_refresh(&self, hz: u32) -> bool {
+        self.display.as_ref().is_some_and(|d| d.set_refresh(hz))
+    }
+
+    fn client_arrived(&self) {
+        if let Some(d) = &self.display {
+            d.arrived();
+        }
+    }
+
+    fn client_left(&self) {
+        if let Some(d) = &self.display {
+            d.left();
+        }
     }
 }
 
 /// The monitor being captured, in virtual desktop coordinates (input maps onto it).
 type Bounds = Arc<Mutex<RECT>>;
 
+/// Which display the capture follows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// The primary monitor.
+    #[default]
+    Primary,
+    /// A display by its GDI name (`\\.\DISPLAY3`): the virtual one.
+    Named(String),
+    /// None for now: the virtual display is being replaced, or was removed.
+    Nothing,
+}
+
+/// The display to capture, and a count of its changes (the capture duplicates again when it
+/// moves on).
+#[derive(Default)]
+pub(crate) struct Follow {
+    generation: u64,
+    target: Target,
+}
+
+pub(crate) type Followed = Arc<Mutex<Follow>>;
+
+/// Points the capture at another display.
+pub(crate) fn follow(f: &Followed, target: Target) {
+    let mut f = f.lock().unwrap();
+    if f.target != target {
+        f.target = target;
+        f.generation += 1;
+    }
+}
+
 /// The output of the primary monitor (the one at the desktop origin) and its adapter.
 fn primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
+    let mut first = None;
+    let found = each_output(|adapter, output, desc| {
+        let r = desc.DesktopCoordinates;
+        if r.left == 0 && r.top == 0 {
+            return true;
+        }
+        first.get_or_insert((adapter.clone(), output.clone()));
+        false
+    })?;
+    found.or(first).context(
+        "no monitor is attached to the desktop (a PC without one needs a virtual display: \
+         --virtual-display)",
+    )
+}
+
+/// The output whose GDI name is `name`, and its adapter.
+fn named_output(name: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
+    each_output(|_, _, desc| {
+        let len = desc
+            .DeviceName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.DeviceName.len());
+        String::from_utf16_lossy(&desc.DeviceName[..len]).eq_ignore_ascii_case(name)
+    })?
+    .with_context(|| format!("display {name} is not attached to the desktop (yet)"))
+}
+
+/// Calls `pick` on the outputs attached to the desktop until it returns true; that output.
+fn each_output(
+    mut pick: impl FnMut(&IDXGIAdapter1, &IDXGIOutput1, &DXGI_OUTPUT_DESC) -> bool,
+) -> Result<Option<(IDXGIAdapter1, IDXGIOutput1)>> {
     // SAFETY: DXGI enumeration; the interfaces returned are reference counted.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-        let mut first = None;
         for a in 0.. {
             let adapter = match factory.EnumAdapters1(a) {
                 Ok(adapter) => adapter,
@@ -99,41 +186,48 @@ fn primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
                 if !desc.AttachedToDesktop.as_bool() {
                     continue;
                 }
-                let r = desc.DesktopCoordinates;
                 let output: IDXGIOutput1 = output.cast()?;
-                if r.left == 0 && r.top == 0 {
-                    return Ok((adapter, output));
+                if pick(&adapter, &output, &desc) {
+                    return Ok(Some((adapter, output)));
                 }
-                first.get_or_insert((adapter.clone(), output));
             }
         }
-        first.context(
-            "no monitor is attached to the desktop (a PC without one needs a virtual display)",
-        )
+    }
+    Ok(None)
+}
+
+fn find_output(target: &Target) -> Result<(IDXGIAdapter1, IDXGIOutput1)> {
+    match target {
+        Target::Primary => primary_output(),
+        Target::Named(name) => named_output(name),
+        Target::Nothing => bail!("no display to capture yet"),
     }
 }
 
-/// `cuda` is the NVENC encoder's context, if NVENC encodes.
-pub fn start(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<WinSession> {
-    // Real pixels: a process that is not DPI aware sees the desktop scaled down (and its
-    // input would land scaled too).
-    // SAFETY: no preconditions; it fails harmlessly if the awareness was already set.
+/// The DXGI adapter of `ctx`'s GPU, where the virtual display should be drawn for the
+/// copy-free path.
+fn cuda_adapter(ctx: &Arc<cudarc::driver::CudaContext>) -> Option<LUID> {
+    // SAFETY: DXGI enumeration as above.
     unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        for a in 0.. {
+            let adapter = factory.EnumAdapters1(a).ok()?;
+            if D3dToCuda::new(Arc::clone(ctx), &adapter).is_ok() {
+                return adapter.GetDesc1().ok().map(|d| d.AdapterLuid);
+            }
+        }
     }
-    raise_gpu_priority();
-    let (adapter, output) = primary_output()?;
-    // SAFETY: plain DXGI call on a live interface.
-    if let Ok(d) = unsafe { adapter.GetDesc1() } {
-        let name = String::from_utf16_lossy(&d.Description);
-        debug!(adapter = name.trim_end_matches('\0'), "Display adapter");
-    }
+    None
+}
+
+/// A D3D11 device on `adapter` for duplication and the copies.
+fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None;
     let mut context = None;
     // SAFETY: creates a device on the adapter that owns the output.
     unsafe {
         D3D11CreateDevice(
-            &adapter,
+            adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -145,38 +239,108 @@ pub fn start(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<WinSessio
         )
         .context("creating the D3D11 device")?;
     }
-    let gpu = cuda.and_then(|ctx| {
-        D3dToCuda::new(ctx, &adapter)
-            .inspect(|_| info!("The desktop goes to NVENC without leaving the GPU"))
+    let device = device.context("no D3D11 device")?;
+    // The GPU thread of this device ahead of others (Sunshine does the same); needs
+    // administrator rights or SYSTEM.
+    // SAFETY: plain DXGI calls on a live device.
+    if let Err(e) = unsafe {
+        device
+            .cast::<IDXGIDevice>()
+            .and_then(|d| d.SetGPUThreadPriority(7))
+    } {
+        debug!(%e, "GPU thread priority not raised");
+    }
+    Ok((device, context.context("no D3D11 context")?))
+}
+
+/// `cuda` is the NVENC encoder's context, if NVENC encodes. `virtual_display` is the mode
+/// (width, height, Hz) of a virtual monitor to serve instead of the physical ones.
+pub fn start(
+    cuda: Option<Arc<cudarc::driver::CudaContext>>,
+    virtual_display: Option<(u32, u32, u32)>,
+) -> Result<WinSession> {
+    // Real pixels: a process that is not DPI aware sees the desktop scaled down (and its
+    // input would land scaled too).
+    // SAFETY: no preconditions; it fails harmlessly if the awareness was already set.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    raise_gpu_priority();
+    let follow = Followed::default();
+    let display = virtual_display.and_then(|mode| {
+        let driver = match winvdisplay::Driver::open() {
+            Ok(Some(driver)) => driver,
+            Ok(None) => {
+                warn!(
+                    "--virtual-display: the SudoVDA driver is not installed; serving the monitors"
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    "--virtual-display: cannot use the driver; serving the monitors"
+                );
+                return None;
+            }
+        };
+        if let Some(luid) = cuda.as_ref().and_then(cuda_adapter)
+            && let Err(e) = driver.set_render_adapter(luid)
+        {
+            warn!(
+                error = format!("{e:#}"),
+                "The virtual display is drawn on another GPU"
+            );
+        }
+        Control::start(driver, mode, Arc::clone(&follow))
             .map_err(|e| {
-                info!(
-                    reason = format!("{e:#}"),
-                    "The desktop goes to NVENC through system memory"
+                warn!(
+                    error = format!("{e:#}"),
+                    "No virtual display; serving the monitors"
                 )
             })
             .ok()
     });
-    let mut cap = Capture {
-        device: device.context("no D3D11 device")?,
-        context: context.context("no D3D11 context")?,
-        output,
-        dupl: None,
-        staging: None,
-        buffers: Recycler::default(),
-        gpu,
-        bounds: Arc::new(Mutex::new(RECT::default())),
-        shape: None,
-        visible: true,
+    // A new virtual monitor takes a moment to reach DXGI.
+    let patience = if display.is_some() {
+        Duration::from_secs(5)
+    } else {
+        Duration::ZERO
     };
+    let since = Instant::now();
+    let target = follow.lock().unwrap().target.clone();
+    let (adapter, _) = loop {
+        match find_output(&target) {
+            Ok(found) => break found,
+            Err(_) if since.elapsed() < patience => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let mut cap = Capture::new(&adapter, cuda, Arc::clone(&follow))?;
     // The first duplication here, so that a desktop that cannot be captured is an error
     // at start rather than a black stream.
-    cap.duplicate().context("duplicating the desktop")?;
+    loop {
+        match cap.duplicate() {
+            Ok(()) => break,
+            Err(_) if since.elapsed() < patience => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(e) => return Err(e.context("duplicating the desktop")),
+        }
+    }
     let r = *cap.bounds.lock().unwrap();
     let size = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
     info!(
         width = size.0,
         height = size.1,
-        "Capturing the primary monitor"
+        "Capturing the {}",
+        if display.is_some() {
+            "virtual display"
+        } else {
+            "primary monitor"
+        }
     );
 
     let (tx, rx) = crate::frame::latest_frame();
@@ -187,17 +351,21 @@ pub fn start(cuda: Option<Arc<cudarc::driver::CudaContext>>) -> Result<WinSessio
         .spawn(move || cap.run(&tx, &cursor_tx))?;
     Ok(WinSession {
         size,
-        source: WinSource,
+        source: WinSource {
+            display: display.clone(),
+        },
         frames: rx,
         cursor: cursor_rx,
         input: WinInput { bounds },
+        display,
     })
 }
 
 struct Capture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    output: IDXGIOutput1,
+    /// The adapter the device is on.
+    luid: LUID,
     dupl: Option<IDXGIOutputDuplication>,
     /// CPU-readable copy of the desktop, and its size.
     staging: Option<(ID3D11Texture2D, u32, u32)>,
@@ -205,6 +373,10 @@ struct Capture {
     buffers: Recycler,
     /// The GPU path, when the desktop is on the NVENC GPU.
     gpu: Option<D3dToCuda>,
+    cuda: Option<Arc<cudarc::driver::CudaContext>>,
+    /// The display to capture, and the generation of it duplicated last.
+    follow: Followed,
+    seen: u64,
     bounds: Bounds,
     shape: Option<CursorShape>,
     visible: bool,
@@ -216,15 +388,77 @@ const FRAME_WAIT_MS: u32 = 100;
 const RETRY: Duration = Duration::from_millis(250);
 
 impl Capture {
+    fn new(
+        adapter: &IDXGIAdapter1,
+        cuda: Option<Arc<cudarc::driver::CudaContext>>,
+        follow: Followed,
+    ) -> Result<Self> {
+        let (device, context) = create_device(adapter)?;
+        let mut cap = Self {
+            device,
+            context,
+            luid: LUID::default(),
+            dupl: None,
+            staging: None,
+            buffers: Recycler::default(),
+            gpu: None,
+            cuda,
+            follow,
+            seen: 0,
+            bounds: Arc::new(Mutex::new(RECT::default())),
+            shape: None,
+            visible: true,
+        };
+        cap.adapter_ready(adapter);
+        Ok(cap)
+    }
+
+    /// Notes the device's adapter and sets up the GPU path for it.
+    fn adapter_ready(&mut self, adapter: &IDXGIAdapter1) {
+        // SAFETY: plain DXGI call on a live interface.
+        if let Ok(d) = unsafe { adapter.GetDesc1() } {
+            let name = String::from_utf16_lossy(&d.Description);
+            debug!(adapter = name.trim_end_matches('\0'), "Display adapter");
+            self.luid = d.AdapterLuid;
+        }
+        self.staging = None;
+        self.gpu = self.cuda.clone().and_then(|ctx| {
+            D3dToCuda::new(ctx, adapter)
+                .inspect(|_| info!("The desktop goes to NVENC without leaving the GPU"))
+                .map_err(|e| {
+                    info!(
+                        reason = format!("{e:#}"),
+                        "The desktop goes to NVENC through system memory"
+                    )
+                })
+                .ok()
+        });
+    }
+
     fn duplicate(&mut self) -> Result<()> {
         self.dupl = None;
+        let target = {
+            let f = self.follow.lock().unwrap();
+            self.seen = f.generation;
+            f.target.clone()
+        };
+        // On the input desktop first: what is attached and what can be duplicated depends
+        // on it (Sunshine syncs the thread desktop before enumerating too).
         let desktop = follow_input_desktop();
+        let (adapter, output) = find_output(&target)?;
+        // SAFETY: plain DXGI call on a live interface.
+        let luid = unsafe { adapter.GetDesc1()? }.AdapterLuid;
+        if luid != self.luid {
+            // The display moved to another GPU (a virtual display drawn elsewhere).
+            info!("The display is on another adapter: new D3D11 device");
+            (self.device, self.context) = create_device(&adapter)?;
+            self.adapter_ready(&adapter);
+        }
         // SAFETY: plain DXGI calls on live interfaces.
         unsafe {
-            let desc = self.output.GetDesc()?;
+            let desc = output.GetDesc()?;
             *self.bounds.lock().unwrap() = desc.DesktopCoordinates;
-            let dupl = self
-                .output
+            let dupl = output
                 .DuplicateOutput(&self.device)
                 .with_context(|| format!("on the input desktop {desktop:?}"))?;
             self.dupl = Some(dupl);
@@ -235,6 +469,10 @@ impl Capture {
     fn run(mut self, frames: &FrameSender, cursor: &watch::Sender<Option<CursorEvent>>) {
         let mut failing_since: Option<Instant> = None;
         loop {
+            if self.dupl.is_some() && self.follow.lock().unwrap().generation != self.seen {
+                debug!("The display to capture changed");
+                self.dupl = None;
+            }
             if self.dupl.is_none() {
                 match self.duplicate() {
                     Ok(()) => {
@@ -249,6 +487,9 @@ impl Capture {
                                 "Cannot duplicate the desktop; retrying"
                             );
                             failing_since = Some(Instant::now());
+                        }
+                        if cursor.receiver_count() == 0 {
+                            return;
                         }
                         std::thread::sleep(RETRY);
                         continue;
@@ -798,6 +1039,17 @@ mod tests {
         assert_eq!(keysym_char(0x0100_20ac), Some('€'));
         assert_eq!(keysym_char(0x0101_f600), Some('😀'));
         assert_eq!(keysym_char(0xff0d), None);
+    }
+
+    #[test]
+    fn following_a_display() {
+        let f = Followed::default();
+        assert_eq!(f.lock().unwrap().target, Target::Primary);
+        follow(&f, Target::Named(r"\\.\DISPLAY3".into()));
+        follow(&f, Target::Named(r"\\.\DISPLAY3".into()));
+        assert_eq!(f.lock().unwrap().generation, 1, "the same display is no change");
+        follow(&f, Target::Nothing);
+        assert_eq!(f.lock().unwrap().generation, 2);
     }
 
     #[test]
