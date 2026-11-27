@@ -106,6 +106,12 @@ impl Rate {
         self.bps
     }
 
+    /// The least send-to-acknowledge delay of the last few seconds (the link's round trip
+    /// plus the client's decoding), once frames have been acknowledged.
+    pub fn floor(&self) -> Option<Duration> {
+        self.mins.iter().map(|(_, d)| *d).min()
+    }
+
     /// Takes acknowledged frames; returns the new ceiling when it changes.
     pub fn update(&mut self, acked: Vec<(Duration, usize)>) -> Option<u32> {
         self.update_at(acked, Instant::now())

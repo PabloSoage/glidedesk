@@ -52,6 +52,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
+/// What logins are checked against (`--auth`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AuthMode {
+    /// The password given to the host (`--password`).
+    Password,
+    /// The system's password of the account the host runs as.
+    System,
+}
+
 #[derive(Parser)]
 #[command(version, about = "glidedesk session host")]
 struct Cli {
@@ -112,9 +121,24 @@ enum Command {
         /// RDP user name (defaults to $USER).
         #[arg(long)]
         user: Option<String>,
-        /// RDP password; read from GLIDEDESK_PASSWORD when not given.
+        /// The password clients log in with; read from GLIDEDESK_PASSWORD when not given.
+        /// Needed unless `--auth system` (and even then for RDP, see there).
         #[arg(long, env = "GLIDEDESK_PASSWORD", hide_env_values = true)]
-        password: String,
+        password: Option<String>,
+        /// What a login is checked against: the password given to the host, or the system
+        /// account the host runs as (PAM on Linux, through /etc/pam.d/glidedesk as in
+        /// scripts/pam.d; Windows' own password check). RDP's NLA checks the password itself,
+        /// so with `system` RDP still needs `--password`, and is off without it.
+        #[arg(long, value_enum, default_value = "password")]
+        auth: AuthMode,
+        /// TLS certificate (PEM chain) for RDP, the native protocol and the web page instead
+        /// of the self-signed one (e.g. from Let's Encrypt: browsers then show no warning).
+        /// Copied into the state folder at start; restart after renewing it.
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<std::path::PathBuf>,
+        /// The certificate's private key (PEM).
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<std::path::PathBuf>,
         /// Send AVC444 (full chroma) to clients that support it. Off by default: mstsc shows
         /// our AVC444v2 stream blurred (to fix).
         #[arg(long)]
@@ -237,6 +261,9 @@ async fn main() -> Result<()> {
             max_in_flight,
             gamestream,
             gamestream_port,
+            auth,
+            tls_cert,
+            tls_key,
         } => {
             #[cfg(feature = "gnome")]
             capture::set_refresh_rate(refresh);
@@ -258,6 +285,28 @@ async fn main() -> Result<()> {
                     std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
                 });
             let state_dir = config.unwrap_or_else(|| ".".into()).join("glidedesk");
+            if let (Some(cert), Some(key)) = (&tls_cert, &tls_key) {
+                rdp::install_identity(&state_dir, cert, key)?;
+            }
+            let username = user
+                .or_else(|| std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).ok())
+                .unwrap_or_default();
+            if auth == AuthMode::System {
+                anyhow::ensure!(!username.is_empty(), "--auth system needs the account name (--user)");
+                auth::use_system_accounts(username.clone());
+                tracing::info!(user = username, "Logins are checked against the system account");
+            }
+            let rdp_password = password.clone();
+            if auth == AuthMode::System && rdp_password.is_none() {
+                tracing::warn!("No --password: RDP is off (its NLA needs the password itself)");
+            }
+            let password = match (auth, password) {
+                (_, Some(p)) => p,
+                (AuthMode::System, None) => String::new(),
+                (AuthMode::Password, None) => {
+                    anyhow::bail!("--password (or GLIDEDESK_PASSWORD) is needed, or --auth system")
+                }
+            };
             serve::serve(serve::ServeOptions {
                 session,
                 pipeline: pipeline::Options {
@@ -278,10 +327,9 @@ async fn main() -> Result<()> {
                 fps: fps.max(refresh),
                 width,
                 height,
-                username: user
-                    .or_else(|| std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).ok())
-                    .unwrap_or_default(),
+                username,
                 password,
+                rdp: rdp_password.is_some() || auth == AuthMode::Password,
                 state_dir,
                 gamestream: gamestream.then(|| {
                     (

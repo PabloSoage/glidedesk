@@ -10,6 +10,8 @@ repository.workspace = true
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 chacha20poly1305 = "0.10"
+# `--features ring`: ring's ChaCha20-Poly1305 for the UDP packets (see crypto.rs).
+ring = { version = "0.17", optional = true }
 reed-solomon-simd = "3"
 getrandom = "0.3"
 thiserror = "2"
@@ -17,3 +19,6 @@ tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt"] }
+
+[features]
+ring = ["dep:ring"]

@@ -360,6 +360,31 @@ pub fn ensure_identity(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Puts the given certificate chain and key in place of the self-signed identity (RDP, the
+/// native protocol and the web page all read `cert.pem` and `key.pem` from `dir`). Both are
+/// checked to parse first, so a wrong file does not replace a working identity.
+pub fn install_identity(dir: &Path, cert: &Path, key: &Path) -> Result<()> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let chain = CertificateDer::pem_file_iter(cert)
+        .with_context(|| format!("reading {}", cert.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("reading {}", cert.display()))?;
+    anyhow::ensure!(!chain.is_empty(), "{} has no certificate", cert.display());
+    PrivateKeyDer::from_pem_file(key).with_context(|| format!("reading {}", key.display()))?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::copy(cert, dir.join("cert.pem")).context("copying the certificate")?;
+    let key_dst = dir.join("key.pem");
+    std::fs::copy(key, &key_dst).context("copying the key")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_dst, std::fs::Permissions::from_mode(0o600))?;
+    }
+    info!(cert = %cert.display(), certificates = chain.len(), "Using the given TLS certificate");
+    Ok(())
+}
+
 fn tls_identity(dir: &Path) -> Result<TlsIdentityCtx> {
     ensure_identity(dir)?;
     let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));

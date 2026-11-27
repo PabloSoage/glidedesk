@@ -156,12 +156,34 @@ pub struct Pipeline {
     stats: Stats,
 }
 
+/// Per-stage times of the frames of one statistics period (see the "Stream" log line).
 struct Stats {
     at: Instant,
     frames: u32,
     encode_us: u128,
     bytes: usize,
     refines: u32,
+    /// New frames (not repeats or quality passes): capture to encoder start (the frame
+    /// waited in the mailbox or for a slot), and how many.
+    wait_us: u128,
+    fresh: u32,
+    /// Handing the encoded frame to the front end (packetising, encryption, pacing).
+    send_us: u128,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            at: Instant::now(),
+            frames: 0,
+            encode_us: 0,
+            bytes: 0,
+            refines: 0,
+            wait_us: 0,
+            fresh: 0,
+            send_us: 0,
+        }
+    }
 }
 
 impl Pipeline {
@@ -190,13 +212,7 @@ impl Pipeline {
             refine_left: 0,
             refine_qp: None,
             rate: Rate::new(max_bitrate),
-            stats: Stats {
-                at: Instant::now(),
-                frames: 0,
-                encode_us: 0,
-                bytes: 0,
-                refines: 0,
-            },
+            stats: Stats::new(),
         }
     }
 
@@ -371,6 +387,10 @@ impl Pipeline {
             mode
         };
         let t = Instant::now();
+        // A frame met for the first time, or retried after back pressure; not a quality pass
+        // or the old image again for a new client (those keep the old capture time).
+        let waited = t.duration_since(frame.captured);
+        let fresh = self.refine_qp.is_none() && waited < Duration::from_millis(500);
         let (main, aux) = self.backend.encode(
             frame,
             &encoder::Request {
@@ -393,9 +413,11 @@ impl Pipeline {
             ?damaged,
             "Frame"
         );
+        let t_send = Instant::now();
         if !output.send(mode, &main, &aux)? {
             return Ok(());
         }
+        let send_us = t_send.elapsed().as_micros();
         self.need_full = false;
         self.chroma_owed = avc444 && mode == Mode::LumaOnly;
         self.pending = false;
@@ -404,7 +426,12 @@ impl Pipeline {
         let s = &mut self.stats;
         s.frames += 1;
         s.encode_us += encode_us;
+        s.send_us += send_us;
         s.bytes += bytes;
+        if fresh {
+            s.fresh += 1;
+            s.wait_us += waited.as_micros();
+        }
         if let Some(qp) = self.refine_qp {
             debug!(bytes, qp, used_qp = main.qp, "Quality pass");
             s.refines += 1;
@@ -420,20 +447,26 @@ impl Pipeline {
                     "{:.2}",
                     s.encode_us as f64 / f64::from(s.frames.max(1)) / 1000.0
                 ),
-                capture_to_queue_ms =
-                    format!("{:.2}", frame.captured.elapsed().as_secs_f64() * 1000.0),
+                // Stages: captured -> encoder (wait), encoding, sending, and the least
+                // send-to-acknowledge delay (network both ways plus the client's decoding).
+                wait_ms = format!(
+                    "{:.2}",
+                    s.wait_us as f64 / f64::from(s.fresh.max(1)) / 1000.0
+                ),
+                send_ms = format!(
+                    "{:.2}",
+                    s.send_us as f64 / f64::from(s.frames.max(1)) / 1000.0
+                ),
+                ack_floor_ms = self
+                    .rate
+                    .floor()
+                    .map(|d| format!("{:.1}", d.as_secs_f64() * 1000.0)),
                 refines = s.refines,
                 ceiling_mbps = self.rate.bps() / 1_000_000,
                 ?codec,
                 "Stream"
             );
-            *s = Stats {
-                at: Instant::now(),
-                frames: 0,
-                encode_us: 0,
-                bytes: 0,
-                refines: 0,
-            };
+            *s = Stats::new();
         }
         Ok(())
     }

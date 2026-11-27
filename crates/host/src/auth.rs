@@ -9,18 +9,229 @@ use std::time::{Duration, Instant};
 use ring::digest::{SHA256, digest};
 use subtle::ConstantTimeEq;
 
+/// With `--auth system`: the account whose system password logs in (the user the host runs
+/// as), instead of the password given to the host.
+static SYSTEM_USER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Logins are checked against the system's own password of `user` from now on (PAM on
+/// Linux, `LogonUser` on Windows).
+pub fn use_system_accounts(user: String) {
+    let _ = SYSTEM_USER.set(user);
+}
+
+/// Logins are checked against the system's accounts.
+pub fn system_accounts() -> bool {
+    SYSTEM_USER.get().is_some()
+}
+
 /// Whether `user` and `password` are the expected ones, in time that does not depend on how
 /// much of them matches (both sides are hashed to the same length first).
+///
+/// With [`use_system_accounts`], the system checks the password of the host's own account
+/// instead (`user` must be that account, or empty); the expected values are then unused.
 pub fn verify_credentials(
     expected_user: &str,
     expected_pass: &str,
     user: &str,
     password: &str,
 ) -> bool {
+    if let Some(account) = SYSTEM_USER.get() {
+        if !user.is_empty() && user != account {
+            return false;
+        }
+        // PAM and LogonUser can take seconds (a failure is delayed on purpose): off the async
+        // workers where the runtime allows it.
+        let check = || system::verify(account, password);
+        return match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(check)
+            }
+            _ => check(),
+        };
+    }
     let h = |s: &str| digest(&SHA256, s.as_bytes());
     let u = h(expected_user).as_ref().ct_eq(h(user).as_ref());
     let p = h(expected_pass).as_ref().ct_eq(h(password).as_ref());
     bool::from(u & p)
+}
+
+#[cfg(target_os = "linux")]
+mod system {
+    //! PAM through libpam (`/etc/pam.d/glidedesk`, see `scripts/pam.d/glidedesk`). A
+    //! process that is not root can check only its own user's password (pam_unix's
+    //! `unix_chkpwd` helper), which is what the host needs.
+
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+
+    const PAM_SUCCESS: c_int = 0;
+    const PAM_PROMPT_ECHO_OFF: c_int = 1;
+    const PAM_PROMPT_ECHO_ON: c_int = 2;
+    const PAM_CONV_ERR: c_int = 19;
+    const PAM_BUF_ERR: c_int = 5;
+    /// The PAM service glidedesk logs in through.
+    const SERVICE: &str = "glidedesk";
+
+    #[repr(C)]
+    struct PamMessage {
+        msg_style: c_int,
+        msg: *const c_char,
+    }
+
+    #[repr(C)]
+    struct PamResponse {
+        resp: *mut c_char,
+        resp_retcode: c_int,
+    }
+
+    #[repr(C)]
+    struct PamConv {
+        conv: Option<
+            unsafe extern "C" fn(
+                c_int,
+                *mut *const PamMessage,
+                *mut *mut PamResponse,
+                *mut c_void,
+            ) -> c_int,
+        >,
+        appdata_ptr: *mut c_void,
+    }
+
+    #[link(name = "pam")]
+    unsafe extern "C" {
+        fn pam_start(
+            service: *const c_char,
+            user: *const c_char,
+            conv: *const PamConv,
+            handle: *mut *mut c_void,
+        ) -> c_int;
+        fn pam_authenticate(handle: *mut c_void, flags: c_int) -> c_int;
+        fn pam_acct_mgmt(handle: *mut c_void, flags: c_int) -> c_int;
+        fn pam_end(handle: *mut c_void, status: c_int) -> c_int;
+        fn pam_strerror(handle: *mut c_void, errnum: c_int) -> *const c_char;
+    }
+
+    /// Answers PAM's prompts: the password for hidden ones, nothing for the rest. PAM frees
+    /// the answers with `free`, so they are allocated with `calloc` and `strdup`.
+    unsafe extern "C" fn conversation(
+        n: c_int,
+        messages: *mut *const PamMessage,
+        responses: *mut *mut PamResponse,
+        password: *mut c_void,
+    ) -> c_int {
+        if n <= 0 || messages.is_null() || responses.is_null() {
+            return PAM_CONV_ERR;
+        }
+        // SAFETY: PAM passes `n` messages and a place for the answer array; `password` is
+        // the CString owned by `verify` for the length of pam_authenticate.
+        unsafe {
+            let out = libc::calloc(n as usize, std::mem::size_of::<PamResponse>()) as *mut PamResponse;
+            if out.is_null() {
+                return PAM_BUF_ERR;
+            }
+            for i in 0..n as usize {
+                // Linux-PAM passes an array of pointers (`messages[i]`).
+                let m = *messages.add(i);
+                if m.is_null() {
+                    continue;
+                }
+                match (*m).msg_style {
+                    PAM_PROMPT_ECHO_OFF | PAM_PROMPT_ECHO_ON => {
+                        (*out.add(i)).resp = libc::strdup(password as *const c_char);
+                    }
+                    _ => {}
+                }
+            }
+            *responses = out;
+        }
+        PAM_SUCCESS
+    }
+
+    pub fn verify(user: &str, password: &str) -> bool {
+        let (Ok(service), Ok(cuser), Ok(cpass)) = (
+            CString::new(SERVICE),
+            CString::new(user),
+            CString::new(password),
+        ) else {
+            return false;
+        };
+        let conv = PamConv {
+            conv: Some(conversation),
+            appdata_ptr: cpass.as_ptr() as *mut c_void,
+        };
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        // SAFETY: valid C strings and conversation that outlive the PAM transaction, which
+        // ends with pam_end on every path.
+        unsafe {
+            let r = pam_start(service.as_ptr(), cuser.as_ptr(), &conv, &mut handle);
+            if r != PAM_SUCCESS {
+                tracing::warn!(code = r, "pam_start failed (is /etc/pam.d/glidedesk there?)");
+                return false;
+            }
+            let mut r = pam_authenticate(handle, 0);
+            if r == PAM_SUCCESS {
+                r = pam_acct_mgmt(handle, 0);
+            }
+            if r != PAM_SUCCESS {
+                let why = pam_strerror(handle, r);
+                if !why.is_null() {
+                    tracing::debug!(error = %CStr::from_ptr(why).to_string_lossy(), "PAM refused");
+                }
+            }
+            pam_end(handle, r);
+            r == PAM_SUCCESS
+        }
+    }
+}
+
+#[cfg(windows)]
+mod system {
+    //! `LogonUserW` with a network logon: it checks the password and creates no session.
+
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW};
+    use windows::core::PCWSTR;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    pub fn verify(user: &str, password: &str) -> bool {
+        // DOMAIN\user or user@domain as given; a plain name is a local account.
+        let (domain, name) = match user.split_once('\\') {
+            Some((d, n)) => (d.to_owned(), n.to_owned()),
+            None if user.contains('@') => (String::new(), user.to_owned()),
+            None => (".".to_owned(), user.to_owned()),
+        };
+        let (name, password) = (wide(&name), wide(password));
+        let domain = (!domain.is_empty()).then(|| wide(&domain));
+        let mut token = HANDLE::default();
+        // SAFETY: NUL-terminated strings that outlive the call; the token is closed.
+        unsafe {
+            let ok = LogonUserW(
+                PCWSTR(name.as_ptr()),
+                domain
+                    .as_ref()
+                    .map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
+                PCWSTR(password.as_ptr()),
+                LOGON32_LOGON_NETWORK,
+                LOGON32_PROVIDER_DEFAULT,
+                &mut token,
+            )
+            .is_ok();
+            if ok {
+                let _ = CloseHandle(token);
+            }
+            ok
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+mod system {
+    pub fn verify(_user: &str, _password: &str) -> bool {
+        tracing::warn!("System accounts are not supported on this system");
+        false
+    }
 }
 
 /// Failures allowed before the first wait.

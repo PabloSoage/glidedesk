@@ -56,6 +56,8 @@ pub struct ServeOptions {
     pub height: u32,
     pub username: String,
     pub password: String,
+    /// Serve RDP (off with `--auth system` and no password: NLA needs one).
+    pub rdp: bool,
     pub state_dir: PathBuf,
     /// GameStream (Moonlight) HTTP and HTTPS addresses; `None` turns it off.
     pub gamestream: Option<(SocketAddr, SocketAddr)>,
@@ -278,7 +280,7 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     let auth_limiter = Arc::new(crate::auth::RateLimiter::new());
     let apps = crate::apps::Runner::new(opts.state_dir.clone());
     let input = InputForwarder::spawn(parts.input);
-    let rdp = rdp_server.run(crate::rdp::Front {
+    let rdp_front = crate::rdp::Front {
         bind: opts.bind,
         username: opts.username.clone(),
         password: opts.password.clone(),
@@ -288,7 +290,15 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
         input: input.clone(),
         clipboard: parts.clipboard,
         auth_limiter: Arc::clone(&auth_limiter),
-    });
+    };
+    let rdp_on = opts.rdp;
+    let rdp = async move {
+        if rdp_on {
+            rdp_server.run(rdp_front).await
+        } else {
+            std::future::pending().await
+        }
+    };
     let native_limiter = Arc::clone(&auth_limiter);
     let native = async {
         match native {

@@ -4,9 +4,79 @@
 //! A datagram is `seq (u64 LE) || ciphertext || tag`. The top bit of `seq` is the direction,
 //! so the two sides never use the same nonce with the shared key; the nonce is `seq` padded
 //! to 96 bits. The receiver drops packets it has already seen ([`ReplayWindow`]).
+//!
+//! Two implementations of the same AEAD, interchangeable on the wire: RustCrypto's
+//! `chacha20poly1305` (the default), or `ring`'s with the `ring` feature (assembly on x86-64
+//! and ARMv8, several times faster where it matters, phones and the Termux server). The
+//! `crypto_speed` test measures whichever is built.
 
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+#[cfg(not(feature = "ring"))]
+mod imp {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    pub const NAME: &str = "RustCrypto chacha20poly1305";
+
+    pub struct Cipher(ChaCha20Poly1305);
+
+    impl Cipher {
+        pub fn new(key: &[u8; 32]) -> Self {
+            Self(ChaCha20Poly1305::new(Key::from_slice(key)))
+        }
+
+        /// Ciphertext and tag.
+        pub fn seal(&self, nonce: [u8; 12], plaintext: &[u8]) -> Vec<u8> {
+            self.0
+                .encrypt(&Nonce::from(nonce), plaintext)
+                .expect("ChaCha20-Poly1305 encryption does not fail")
+        }
+
+        pub fn open(&self, nonce: [u8; 12], sealed: &[u8]) -> Option<Vec<u8>> {
+            self.0.decrypt(&Nonce::from(nonce), sealed).ok()
+        }
+    }
+}
+
+#[cfg(feature = "ring")]
+mod imp {
+    use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+
+    pub const NAME: &str = "ring CHACHA20_POLY1305";
+
+    pub struct Cipher(LessSafeKey);
+
+    impl Cipher {
+        pub fn new(key: &[u8; 32]) -> Self {
+            Self(LessSafeKey::new(
+                UnboundKey::new(&CHACHA20_POLY1305, key).expect("a 32-byte key"),
+            ))
+        }
+
+        /// Ciphertext and tag.
+        pub fn seal(&self, nonce: [u8; 12], plaintext: &[u8]) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(plaintext.len() + 16);
+            buf.extend_from_slice(plaintext);
+            self.0
+                .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
+                .expect("ChaCha20-Poly1305 encryption does not fail");
+            buf
+        }
+
+        pub fn open(&self, nonce: [u8; 12], sealed: &[u8]) -> Option<Vec<u8>> {
+            let mut buf = sealed.to_vec();
+            let len = self
+                .0
+                .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
+                .ok()?
+                .len();
+            buf.truncate(len);
+            Some(buf)
+        }
+    }
+}
+
+/// Which implementation is built.
+pub const IMPLEMENTATION: &str = imp::NAME;
 
 const DIR_BIT: u64 = 1 << 63;
 /// Bytes a sealed packet adds to its plaintext.
@@ -28,29 +98,26 @@ impl Direction {
 }
 
 pub struct PacketKey {
-    cipher: ChaCha20Poly1305,
+    cipher: imp::Cipher,
 }
 
-fn nonce(seq: u64) -> Nonce {
+fn nonce(seq: u64) -> [u8; 12] {
     let mut n = [0u8; 12];
     n[..8].copy_from_slice(&seq.to_le_bytes());
-    n.into()
+    n
 }
 
 impl PacketKey {
     pub fn new(key: &[u8; 32]) -> Self {
         Self {
-            cipher: ChaCha20Poly1305::new(Key::from_slice(key)),
+            cipher: imp::Cipher::new(key),
         }
     }
 
     /// Seals packet number `seq` (below 2^63) going in `dir`.
     pub fn seal(&self, dir: Direction, seq: u64, plaintext: &[u8]) -> Vec<u8> {
         let s = (seq & !DIR_BIT) | dir.bit();
-        let ct = self
-            .cipher
-            .encrypt(&nonce(s), plaintext)
-            .expect("ChaCha20-Poly1305 encryption does not fail");
+        let ct = self.cipher.seal(nonce(s), plaintext);
         let mut out = Vec::with_capacity(8 + ct.len());
         out.extend_from_slice(&s.to_le_bytes());
         out.extend_from_slice(&ct);
@@ -65,7 +132,7 @@ impl PacketKey {
         if s & DIR_BIT != dir.bit() {
             return None;
         }
-        let pt = self.cipher.decrypt(&nonce(s), ct).ok()?;
+        let pt = self.cipher.open(nonce(s), ct)?;
         Some((s & !DIR_BIT, pt))
     }
 }
@@ -121,6 +188,21 @@ mod tests {
         assert_eq!(PacketKey::new(&[8; 32]).open(Direction::ToClient, &p), None);
     }
 
+    /// ring's packets are RustCrypto's: peers built either way talk to each other.
+    #[cfg(feature = "ring")]
+    #[test]
+    fn ring_matches_rustcrypto() {
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        let key = [3u8; 32];
+        let rc = chacha20poly1305::ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&key));
+        let k = PacketKey::new(&key);
+        let p = k.seal(Direction::ToServer, 9, b"same bytes");
+        let s = u64::from_le_bytes(p[..8].try_into().unwrap());
+        let n = chacha20poly1305::Nonce::from(nonce(s));
+        assert_eq!(rc.decrypt(&n, &p[8..]).unwrap(), b"same bytes");
+        assert_eq!(rc.encrypt(&n, &b"same bytes"[..]).unwrap(), p[8..].to_vec());
+    }
+
     #[test]
     fn replay_window() {
         let mut w = ReplayWindow::default();
@@ -172,7 +254,7 @@ mod bench {
 
         assert_eq!(opened_count, count);
         println!(
-            "ChaCha20-Poly1305 (1200 B packets, {count} iters):\n  Seal: {seal_gbps:.2} GB/s ({seal_us:.2} \u{03bc}s/pkt)\n  Open: {open_gbps:.2} GB/s ({open_us:.2} \u{03bc}s/pkt)"
+            "{IMPLEMENTATION} (1200 B packets, {count} iters):\n  Seal: {seal_gbps:.2} GB/s ({seal_us:.2} \u{03bc}s/pkt)\n  Open: {open_gbps:.2} GB/s ({open_us:.2} \u{03bc}s/pkt)"
         );
     }
 }

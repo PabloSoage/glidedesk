@@ -108,6 +108,9 @@ pub enum Event {
         /// References only frames from before an invalidation (version 2).
         recovery: bool,
         data: Vec<u8>,
+        /// From its first packet to the one that completed it (how long the frame took to
+        /// cross the link, for the latency statistics).
+        spread: Duration,
     },
     /// The frame will not be completed (a later one was): its successors may not decode
     /// until the next keyframe.
@@ -128,7 +131,8 @@ struct Partial {
     recovery: bool,
     len: usize,
     blocks: Vec<Option<Block>>,
-    /// When its last packet arrived.
+    /// When its first and its last packet arrived.
+    first: Instant,
     seen: Instant,
 }
 
@@ -175,6 +179,7 @@ impl Reassembler {
             recovery: flags & FLAG_RECOVERY != 0,
             len: frame_len,
             blocks: (0..blocks).map(|_| None).collect(),
+            first: Instant::now(),
             seen: Instant::now(),
         });
         part.seen = Instant::now();
@@ -252,6 +257,7 @@ impl Reassembler {
                 keyframe: part.keyframe,
                 recovery: part.recovery,
                 data,
+                spread: part.first.elapsed(),
             });
         }
         // Bound memory if a frame never completes.

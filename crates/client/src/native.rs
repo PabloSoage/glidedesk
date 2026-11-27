@@ -356,6 +356,8 @@ async fn session(
                 .unwrap_or(0);
             let mut rng = 0x9e37_79b9_7f4a_7c15u64;
             let (mut got, mut lost, mut since) = (0u32, 0u32, Instant::now());
+            // Time the frames took to arrive (first packet to last), for the statistics.
+            let mut spread_total = Duration::ZERO;
             // Received frames not acknowledged yet, oldest first.
             let mut held = std::collections::VecDeque::new();
             loop {
@@ -409,8 +411,10 @@ async fn session(
                                     keyframe,
                                     recovery,
                                     data,
+                                    spread,
                                 } => {
                                     got += 1;
+                                    spread_total += spread;
                                     if keyframe || (recovery && wait == Wait::Recovery) {
                                         if wait != Wait::Nothing {
                                             debug!(frame_id, keyframe, "Recovered");
@@ -468,8 +472,17 @@ async fn session(
                 }
                 release_acks(&mut held, &sink, &ctl);
                 if since.elapsed() >= Duration::from_secs(5) {
-                    info!(frames = got, lost, "Media");
+                    info!(
+                        frames = got,
+                        lost,
+                        arrival_ms = format!(
+                            "{:.2}",
+                            spread_total.as_secs_f64() * 1000.0 / f64::from(got.max(1))
+                        ),
+                        "Media"
+                    );
                     (got, lost, since) = (0, 0, Instant::now());
+                    spread_total = Duration::ZERO;
                 }
             }
         })
