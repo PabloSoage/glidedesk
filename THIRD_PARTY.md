@@ -15,6 +15,8 @@
 | [vigem-client](https://github.com/CasualX/vigem-client) | host dependency on Windows (virtual gamepads through ViGEmBus) | MIT |
 | [inputtino](https://github.com/games-on-whales/inputtino) DualSense report descriptor and feature reports | `crates/host/src/gamestream/dualsense.rs` | MIT (notice in the file) |
 | `crates/desktop/src/probe.hevc`: a 256×144 HEVC test frame made with FFmpeg's `testsrc2` | desktop client | generated, no license |
+| [Shizuku API](https://github.com/RikkaApps/Shizuku-API) 13.1.5 (`dev.rikka.shizuku:api`, `:provider`) | Android app dependency (the phone server's privileged helper as a user service) | MIT |
+| [scrcpy](https://github.com/Genymobile/scrcpy) server: hidden API calls for displays and input, the encoder format | adapted into `android/app/src/main/java/io/github/pablosoage/glidedesk/shell/` and `server/VideoEncoder.kt` (see below) | Apache-2.0 (notice in the files) |
 
 Code adapted from [Sunshine](https://github.com/LizardByte/Sunshine) or
 [Moonlight](https://github.com/moonlight-stream) (GPL-3.0) is listed here with the source file
@@ -34,6 +36,10 @@ and commit, and marked in the file header.
 | `crates/host/src/gamestream/input.rs` (input message layouts) | moonlight-common-c `src/Input.h`, `src/InputStream.c`; Sunshine `src/input.cpp` | `b4ee1ce`; `224c6be` |
 | `crates/host/src/gamestream/gamepad.rs` (controller message, button bits, rumble message) | moonlight-common-c `src/Input.h`, `src/Limelight.h`, `src/ControlStream.c`; Sunshine `src/input.cpp`, `src/stream.cpp` | `b4ee1ce`; `224c6be` |
 | `crates/host/src/gamestream/dualsense.rs` (virtual DualSense over UHID: report descriptor, feature and input reports, rumble) | [inputtino](https://github.com/games-on-whales/inputtino) `src/uhid/joypad_ps5.cpp`, `src/uhid/include/uhid/ps5.hpp` (MIT) | `d28ec79` |
+| `android/.../shell/Hidden.kt` (shell context, mirror and new displays through `DisplayManager` and `SurfaceControl`) | [scrcpy](https://github.com/Genymobile/scrcpy) `server/.../FakeContext.java`, `wrappers/DisplayManager.java`, `wrappers/SurfaceControl.java`, `video/ScreenCapture.java`, `video/NewDisplayCapture.java` (Apache-2.0) | `c939183` |
+| `android/.../shell/ShellInput.kt` (touch, mouse, scroll and key injection) | scrcpy `server/.../control/Controller.java`, `device/Device.java`, `wrappers/InputManager.java` (Apache-2.0) | `c939183` |
+| `android/.../shell/ShellMain.kt` (content provider lookup and call from the shell user) | scrcpy `server/.../wrappers/ActivityManager.java`, `wrappers/ContentProvider.java` (Apache-2.0) | `c939183` |
+| `android/.../server/VideoEncoder.kt` (MediaCodec surface encoder format, output loop) | scrcpy `server/.../video/SurfaceEncoder.java` (Apache-2.0) | `c939183` |
 
 The native protocol's reference-frame invalidation follows Sunshine `src/nvenc/nvenc_base.cpp` and
 moonlight-common-c `src/ControlStream.c` (design, no code copied).
