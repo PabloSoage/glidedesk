@@ -24,6 +24,9 @@ pub enum FrameData {
     /// GPU, [`crate::vaimport`]).
     #[cfg(feature = "gnome")]
     Va(crate::vaimport::VaFrame),
+    /// A BGRA copy of the desktop in Direct3D 11, for AMF and QSV ([`crate::wind3d`]).
+    #[cfg(target_os = "windows")]
+    D3d(Arc<crate::wind3d::D3dTexture>),
 }
 
 /// One captured frame.

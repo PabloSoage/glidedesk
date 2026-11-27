@@ -232,6 +232,11 @@ pub async fn serve(opts: ServeOptions) -> Result<()> {
     if let Some(node) = backend.vaapi_import() {
         crate::capture::import_to_vaapi(node);
     }
+    // AMF and QSV on Windows: Desktop Duplication hands over D3D11 textures.
+    #[cfg(target_os = "windows")]
+    if backend.d3d11_input() {
+        crate::wind3d::enable();
+    }
 
     let parts = match &opts.session {
         #[cfg(feature = "gnome")]

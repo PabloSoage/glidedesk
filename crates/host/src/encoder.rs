@@ -4,7 +4,8 @@
 //! - FFmpeg: VA-API (AMD, Intel and other Mesa or Intel-media drivers) or x264 in
 //!   software, fed by the CPU colour conversion; the capture goes through system memory,
 //!   except VA-API with GNOME, which takes VA surfaces converted on the GPU
-//!   ([`crate::vaimport`]).
+//!   ([`crate::vaimport`]), and AMF and QSV on Windows, which take D3D11 textures converted
+//!   on the GPU ([`crate::wind3d`]).
 //!
 //! Each backend turns a captured frame into the H.264 pictures of one EGFX frame: the main
 //! view (AVC420, or the first stream of AVC444v2) and optionally the auxiliary view; or into
@@ -118,6 +119,10 @@ pub trait Backend: Send {
     fn vaapi_import(&self) -> Option<String> {
         None
     }
+    /// The encoder takes the desktop as Direct3D 11 textures (AMF, QSV on Windows).
+    fn d3d11_input(&self) -> bool {
+        false
+    }
 }
 
 fn config(codec: Codec, w: u32, h: u32, avc444: bool, fps: u32, bitrate: u32) -> EncoderConfig {
@@ -220,6 +225,8 @@ impl Backend for Nvenc {
             }
             #[cfg(feature = "gnome")]
             FrameData::Va(_) => bail!("NVENC takes CUDA or system-memory frames"),
+            #[cfg(target_os = "windows")]
+            FrameData::D3d(_) => bail!("NVENC takes CUDA or system-memory frames"),
         };
         let size = color::coded_size(w, h);
         let yuv444 =
@@ -285,6 +292,9 @@ pub struct Ffmpeg {
     /// The encoder and what it was opened for: codec, AVC444, and the frames context of the
     /// capture's VA surfaces (its address; 0 for frames from system memory).
     encoder: Option<(FfEncoder, (Codec, bool, usize))>,
+    /// The encoder's D3D11 or QSV frames on the capture's device (AMF and QSV, Windows).
+    #[cfg(target_os = "windows")]
+    d3d: Option<crate::wind3d::D3dFrames>,
     fps: u32,
     bitrate: u32,
     hevc: bool,
@@ -317,6 +327,8 @@ impl Ffmpeg {
             main: None,
             aux: None,
             encoder: None,
+            #[cfg(target_os = "windows")]
+            d3d: None,
             fps,
             bitrate,
         })
@@ -381,6 +393,10 @@ impl Backend for Ffmpeg {
         (self.kind == Kind::Vaapi).then(|| self.device.clone())
     }
 
+    fn d3d11_input(&self) -> bool {
+        cfg!(target_os = "windows") && matches!(self.kind, Kind::Amf | Kind::Qsv)
+    }
+
     fn request_keyframe(&mut self) {
         match self.encoder.as_mut() {
             Some((e, _)) if e.idr_on_request() => e.request_keyframe(),
@@ -411,6 +427,13 @@ impl Backend for Ffmpeg {
         #[cfg(feature = "gnome")]
         if let FrameData::Va(va) = &frame.data {
             return self.encode_va(frame.width, frame.height, va, req);
+        }
+        #[cfg(target_os = "windows")]
+        if let FrameData::D3d(texture) = &frame.data {
+            return self.encode_d3d(texture, req).inspect_err(|e| {
+                warn!(error = format!("{e:#}"), "Encoding from D3D11 failed");
+                crate::wind3d::give_up();
+            });
         }
         let FrameData::Cpu { data, stride } = &frame.data else {
             bail!("the FFmpeg backend takes frames in system memory");
@@ -488,6 +511,58 @@ impl Ffmpeg {
             Default::default()
         };
         tracing::debug!(encode_us = t.elapsed().as_micros(), "VA-API frame");
+        Ok((main, Default::default()))
+    }
+
+    /// Converts the desktop texture into an encoder frame on the GPU and encodes it (AMF,
+    /// QSV). An error sends the capture back to system memory (the caller gives up).
+    #[cfg(target_os = "windows")]
+    fn encode_d3d(
+        &mut self,
+        texture: &crate::wind3d::D3dTexture,
+        req: &Request,
+    ) -> Result<(EncodedFrame, EncodedFrame)> {
+        if !matches!(self.kind, Kind::Amf | Kind::Qsv) || req.avc444 {
+            bail!("D3D11 textures go to AMF or QSV, 4:2:0 only");
+        }
+        let (cw, ch) = color::coded_size(texture.width, texture.height);
+        if self
+            .d3d
+            .as_ref()
+            .is_none_or(|d| !d.fits(&texture.texture, cw, ch))
+        {
+            self.encoder = None;
+            self.d3d = None;
+            self.d3d = Some(crate::wind3d::D3dFrames::new(
+                self.kind == Kind::Qsv,
+                &texture.texture,
+                cw,
+                ch,
+            )?);
+        }
+        let d3d = self.d3d.as_mut().expect("made above");
+        let key = (req.codec, false, d3d.frames_data() as usize);
+        if self.encoder.as_ref().is_none_or(|(_, k)| *k != key) {
+            let cfg = config(req.codec, cw, ch, false, self.fps, self.bitrate);
+            self.encoder = None;
+            let encoder = FfEncoder::new_on(self.kind, &self.device, cfg, Some(d3d.frames_ctx()))?;
+            self.encoder = Some((encoder, key));
+        }
+        let t = std::time::Instant::now();
+        let picture = d3d.convert(texture)?;
+        let convert_us = t.elapsed().as_micros();
+        let (encoder, _) = self.encoder.as_mut().expect("created above");
+        let main = if req.main {
+            // SAFETY: a frame of the context the encoder was opened on, alive until after.
+            unsafe { encoder.encode_hw(picture.as_ptr())? }
+        } else {
+            Default::default()
+        };
+        tracing::debug!(
+            convert_us,
+            encode_us = t.elapsed().as_micros() - convert_us,
+            "D3D11 frame"
+        );
         Ok((main, Default::default()))
     }
 }

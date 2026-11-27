@@ -85,8 +85,9 @@ impl FfEncoder {
         Self::new_on(kind, device, cfg, None)
     }
 
-    /// With `frames` (VA-API only), the encoder takes surfaces of that frames context
-    /// ([`FfEncoder::encode_va`]) instead of uploading its own.
+    /// With `frames`, the encoder takes hardware frames of that context
+    /// ([`FfEncoder::encode_hw`]) instead of frames from system memory: VA surfaces for
+    /// VA-API, D3D11 textures for AMF, QSV surfaces for QSV.
     pub fn new_on(
         kind: Kind,
         device: &str,
@@ -236,6 +237,18 @@ impl FfEncoder {
                     );
                 }
             }
+            if let Some(frames) = frames
+                && kind != Kind::Vaapi
+            {
+                // D3D11 (AMF) or QSV frames converted on the GPU (wind3d.rs).
+                this.hw_frames = ff::av_buffer_ref(frames);
+                if this.hw_frames.is_null() {
+                    bail!("out of memory");
+                }
+                let fc = &*((*frames).data as *const ff::AVHWFramesContext);
+                c.pix_fmt = fc.format;
+                c.hw_frames_ctx = ff::av_buffer_ref(frames);
+            }
             let r = ff::avcodec_open2(this.ctx, codec, &mut opts);
             ff::av_dict_free(&mut opts);
             check(r, &format!("opening {name}"))?;
@@ -245,7 +258,7 @@ impl FfEncoder {
             f.width = cfg.width as i32;
             f.height = cfg.height as i32;
             check(ff::av_frame_get_buffer(this.sw_frame, 0), "frame buffer")?;
-            if kind == Kind::Vaapi {
+            if kind == Kind::Vaapi || frames.is_some() {
                 this.hw_frame = ff::av_frame_alloc();
             }
             info!(encoder = name, ?cfg, "FFmpeg encoder ready");
@@ -331,14 +344,28 @@ impl FfEncoder {
     /// frames context ([`FfEncoder::new_on`]).
     #[cfg(feature = "gnome")]
     pub fn encode_va(&mut self, frame: &crate::vaimport::VaFrame) -> Result<EncodedFrame> {
-        if self.kind != Kind::Vaapi || self.frames_data() != frame.frames_data() {
-            bail!("the surface is not from this encoder's frames context");
-        }
-        // SAFETY: `frame` is a valid VA-API frame; the new reference is released before the
-        // next frame (or in Drop).
+        // SAFETY: a VaFrame is a valid hardware frame for its life.
+        unsafe { self.encode_hw(frame.as_ptr()) }
+    }
+
+    /// Encodes a hardware frame of the frames context this encoder was opened on
+    /// ([`FfEncoder::new_on`]).
+    ///
+    /// # Safety
+    /// `frame` is a valid hardware frame (it is checked to be of that context).
+    pub unsafe fn encode_hw(&mut self, frame: *const ff::AVFrame) -> Result<EncodedFrame> {
+        // SAFETY: see the function's contract; the new reference is released right after
+        // the frame is sent.
         unsafe {
+            let frames = (*frame).hw_frames_ctx;
+            if self.hw_frame.is_null()
+                || frames.is_null()
+                || self.frames_data() != (*frames).data.cast_const()
+            {
+                bail!("the frame is not from this encoder's frames context");
+            }
             ff::av_frame_unref(self.hw_frame);
-            check(ff::av_frame_ref(self.hw_frame, frame.as_ptr()), "VA surface")?;
+            check(ff::av_frame_ref(self.hw_frame, frame), "hardware frame")?;
             (*self.hw_frame).pts = self.pts;
             (*self.hw_frame).pict_type = if self.force_idr {
                 ff::AVPictureType::AV_PICTURE_TYPE_I

@@ -48,6 +48,8 @@ mod winclip;
 #[cfg(target_os = "windows")]
 mod wincuda;
 #[cfg(target_os = "windows")]
+mod wind3d;
+#[cfg(target_os = "windows")]
 mod winservice;
 #[cfg(target_os = "windows")]
 mod winsession;
