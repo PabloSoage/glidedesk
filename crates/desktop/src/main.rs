@@ -12,6 +12,8 @@ mod clip;
 mod decode;
 mod keymap;
 mod launcher;
+#[cfg(not(windows))]
+mod linux;
 mod platform;
 mod profile;
 mod render;
@@ -85,6 +87,10 @@ struct Args {
     /// session ends when the app does. Native protocol only.
     #[arg(long)]
     app: Option<String>,
+    /// Make this program open .glidedesk files (double click) for the current user, and
+    /// exit.
+    #[arg(long)]
+    register_files: bool,
 }
 
 #[derive(
@@ -726,6 +732,19 @@ fn main() -> Result<()> {
         }
     };
     let mut args = args;
+    if args.register_files {
+        match platform::register_files() {
+            Ok(msg) => {
+                info!("{msg}");
+                #[cfg(windows)]
+                platform::show_message(&msg);
+                #[cfg(not(windows))]
+                println!("{msg}");
+            }
+            Err(e) => platform::show_error(&format!("Registering .glidedesk files: {e:#}")),
+        }
+        return Ok(());
+    }
     let is_launcher = args.host.is_none();
     // A profile given as the host (double-clicked, or on the command line).
     if let Some(h) = args.host.clone()

@@ -1,7 +1,9 @@
-//! Desktop integration: the log file, error dialogs and, on Windows, the window menu.
+//! Desktop integration: the log file, dialogs, saved passwords, the `.glidedesk` file type
+//! and, on Windows, the window menu.
 //!
 //! The Windows build is a GUI program (no console window), so the log goes to a file and
-//! the window's system menu (right click on the title bar, or Alt+Space) opens it.
+//! the window's system menu (right click on the title bar, or Alt+Space) opens it. Other
+//! systems go through the desktop's tools ([`crate::linux`]).
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -59,7 +61,7 @@ pub fn show_error(text: &str) {
     #[cfg(windows)]
     win::message_box(text, true);
     #[cfg(not(windows))]
-    eprintln!("{text}");
+    crate::linux::show_error(text);
 }
 
 /// Plain information (help, version) in a dialog.
@@ -68,16 +70,12 @@ pub fn show_message(text: &str) {
     win::message_box(text, false);
 }
 
-/// Asks the user a yes/no question: a dialog on Windows. Other systems have no dialog yet:
-/// the answer is yes, and the question goes to the log.
+/// Asks the user a yes/no question (a dialog, or the terminal); no unless they say yes.
 pub fn confirm(text: &str) -> bool {
     #[cfg(windows)]
     return win::confirm(text);
     #[cfg(not(windows))]
-    {
-        tracing::warn!("{text} (yes: no dialog on this system)");
-        true
-    }
+    return crate::linux::confirm(text);
 }
 
 /// Opens the log file with the system's text viewer.
@@ -91,16 +89,14 @@ pub fn open_log() {
     }
 }
 
-/// User and password for `host`: saved ones from the Windows Credential Manager, else the
-/// Windows sign-in dialog (which can save them). `None` when cancelled or unavailable.
+/// User and password for `host`: saved ones (the Windows Credential Manager, the Secret
+/// Service keyring elsewhere), else a sign-in dialog that can save them. `None` when
+/// cancelled or unavailable.
 pub fn credentials(host: &str, user: Option<&str>) -> Option<(String, String)> {
     #[cfg(windows)]
     return win::credentials(host, user);
     #[cfg(not(windows))]
-    {
-        let _ = (host, user);
-        None
-    }
+    return crate::linux::credentials(host, user);
 }
 
 /// The saved password for `host` was refused: forget it so the next start asks again.
@@ -108,7 +104,15 @@ pub fn forget_credentials(host: &str) {
     #[cfg(windows)]
     win::forget(host);
     #[cfg(not(windows))]
-    let _ = host;
+    crate::linux::forget(host);
+}
+
+/// Makes this program open `.glidedesk` files (double click), for the current user.
+pub fn register_files() -> anyhow::Result<String> {
+    #[cfg(windows)]
+    return win::register_files();
+    #[cfg(not(windows))]
+    return crate::linux::register_files();
 }
 
 /// Adds the glidedesk entries to the window menu (Windows); they come back as events.
@@ -309,6 +313,67 @@ mod win {
         let target = target(host);
         // SAFETY: `target` is NUL-terminated.
         unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+    }
+
+    /// `.glidedesk` → `glidedesk.profile` → this program, under HKEY_CURRENT_USER (no
+    /// administrator needed), through `reg.exe`.
+    pub fn register_files() -> anyhow::Result<String> {
+        use anyhow::{Context as _, bail};
+        use std::os::windows::process::CommandExt;
+        // No console window flashing up for each reg.exe.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let exe = std::env::current_exe().context("finding this program")?;
+        let exe = exe.display().to_string();
+        let classes = r"HKCU\Software\Classes";
+        let keys: [(String, Option<&str>, String); 5] = [
+            (format!(r"{classes}\.glidedesk"), None, "glidedesk.profile".into()),
+            (
+                format!(r"{classes}\.glidedesk"),
+                Some("Content Type"),
+                "application/x-glidedesk".into(),
+            ),
+            (
+                format!(r"{classes}\glidedesk.profile"),
+                None,
+                "glidedesk connection".into(),
+            ),
+            (
+                format!(r"{classes}\glidedesk.profile\DefaultIcon"),
+                None,
+                format!("\"{exe}\",0"),
+            ),
+            (
+                format!(r"{classes}\glidedesk.profile\shell\open\command"),
+                None,
+                format!("\"{exe}\" \"%1\""),
+            ),
+        ];
+        for (key, name, value) in &keys {
+            let mut cmd = std::process::Command::new("reg");
+            cmd.arg("add").arg(key);
+            match name {
+                Some(n) => cmd.arg("/v").arg(n),
+                None => cmd.arg("/ve"),
+            };
+            cmd.args(["/t", "REG_SZ", "/d"]).arg(value).arg("/f");
+            let status = cmd
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .context("running reg.exe")?;
+            if !status.success() {
+                bail!("reg add {key} failed");
+            }
+        }
+        // SAFETY: SHCNE_ASSOCCHANGED takes no items.
+        unsafe {
+            windows_sys::Win32::UI::Shell::SHChangeNotify(
+                windows_sys::Win32::UI::Shell::SHCNE_ASSOCCHANGED,
+                windows_sys::Win32::UI::Shell::SHCNF_IDLIST,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+        }
+        Ok("glidedesk now opens .glidedesk files.".into())
     }
 
     pub fn add_menu(window: &Window, proxy: EventLoopProxy<Event>) {
